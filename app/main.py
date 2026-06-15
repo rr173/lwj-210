@@ -1,0 +1,145 @@
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+from typing import List, Optional
+
+from app.database import get_db, Base, engine
+from app import models, schemas, crud
+from app.seed_data import init_db, seed_data
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title="外贸信用证单据审核与不符点检测服务",
+        description="银行信用证单据自动审核系统，支持7大类校验规则与不符点检测",
+        version="1.0.0"
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.on_event("startup")
+    async def startup_event():
+        init_db()
+        seed_data()
+
+    @app.get("/", tags=["系统"])
+    async def root():
+        return {
+            "service": "外贸信用证单据审核与不符点检测服务",
+            "version": "1.0.0",
+            "status": "running",
+            "docs": "/docs",
+            "redoc": "/redoc"
+        }
+
+    @app.get("/health", tags=["系统"])
+    async def health_check():
+        return {"status": "healthy"}
+
+    @app.post("/api/lc", response_model=schemas.LetterOfCreditResponse, tags=["信用证管理"], status_code=status.HTTP_201_CREATED)
+    async def create_lc(lc_data: schemas.LetterOfCreditCreate, db: Session = Depends(get_db)):
+        existing = crud.get_letter_of_credit_by_number(db, lc_data.lc_number)
+        if existing:
+            raise HTTPException(status_code=400, detail=f"信用证编号 {lc_data.lc_number} 已存在")
+        try:
+            lc = crud.create_letter_of_credit(db, lc_data)
+            return lc
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"创建信用证失败: {str(e)}")
+
+    @app.get("/api/lc", response_model=List[schemas.LetterOfCreditResponse], tags=["信用证管理"])
+    async def list_lc(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+        return crud.get_all_letter_of_credits(db, skip, limit)
+
+    @app.get("/api/lc/{lc_number}", response_model=schemas.LetterOfCreditResponse, tags=["信用证管理"])
+    async def get_lc(lc_number: str, db: Session = Depends(get_db)):
+        lc = crud.get_letter_of_credit_by_number(db, lc_number)
+        if not lc:
+            raise HTTPException(status_code=404, detail=f"信用证 {lc_number} 不存在")
+        return lc
+
+    @app.put("/api/lc/{lc_number}", response_model=schemas.LetterOfCreditResponse, tags=["信用证管理"])
+    async def update_lc(lc_number: str, lc_data: schemas.LetterOfCreditCreate, db: Session = Depends(get_db)):
+        lc = crud.get_letter_of_credit_by_number(db, lc_number)
+        if not lc:
+            raise HTTPException(status_code=404, detail=f"信用证 {lc_number} 不存在")
+        if lc_data.lc_number != lc_number:
+            other = crud.get_letter_of_credit_by_number(db, lc_data.lc_number)
+            if other and other.id != lc.id:
+                raise HTTPException(status_code=400, detail=f"新信用证编号 {lc_data.lc_number} 已被其他信用证使用")
+        updated = crud.update_letter_of_credit(db, lc.id, lc_data)
+        return updated
+
+    @app.delete("/api/lc/{lc_number}", tags=["信用证管理"])
+    async def delete_lc(lc_number: str, db: Session = Depends(get_db)):
+        lc = crud.get_letter_of_credit_by_number(db, lc_number)
+        if not lc:
+            raise HTTPException(status_code=404, detail=f"信用证 {lc_number} 不存在")
+        crud.delete_letter_of_credit(db, lc.id)
+        return {"message": f"信用证 {lc_number} 已删除"}
+
+    @app.post("/api/submission", response_model=schemas.AuditRecordResponse, tags=["单据提交与审核"], status_code=status.HTTP_201_CREATED)
+    async def submit_and_audit(submission: schemas.SubmissionSubmit, db: Session = Depends(get_db)):
+        try:
+            audit_record = crud.submit_documents_and_audit(db, submission)
+            return audit_record
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"审核失败: {str(e)}")
+
+    @app.get("/api/submission/{submission_id}", response_model=schemas.AuditRecordDetailResponse, tags=["单据提交与审核"])
+    async def get_submission_detail(submission_id: str, db: Session = Depends(get_db)):
+        audit_record = crud.get_audit_record_by_submission(db, submission_id)
+        if not audit_record:
+            raise HTTPException(status_code=404, detail=f"提交记录 {submission_id} 不存在")
+
+        lc = crud.get_letter_of_credit_by_id(db, audit_record.lc_id)
+        documents = crud.get_documents_by_submission(db, submission_id)
+
+        return {
+            "id": audit_record.id,
+            "lc_id": audit_record.lc_id,
+            "submission_id": audit_record.submission_id,
+            "conclusion": audit_record.conclusion,
+            "total_discrepancies": audit_record.total_discrepancies,
+            "critical_count": audit_record.critical_count,
+            "minor_count": audit_record.minor_count,
+            "presentation_date": audit_record.presentation_date,
+            "discrepancies": audit_record.discrepancies,
+            "created_at": audit_record.created_at,
+            "lc": lc,
+            "documents": documents
+        }
+
+    @app.get("/api/audit/lc/{lc_number}", response_model=List[schemas.AuditRecordResponse], tags=["查询"])
+    async def get_audit_history_by_lc(lc_number: str, db: Session = Depends(get_db)):
+        records = crud.get_audit_records_by_lc(db, lc_number)
+        if not records:
+            lc = crud.get_letter_of_credit_by_number(db, lc_number)
+            if not lc:
+                raise HTTPException(status_code=404, detail=f"信用证 {lc_number} 不存在")
+        return records
+
+    @app.get("/api/audit/all", response_model=List[schemas.AuditRecordResponse], tags=["查询"])
+    async def list_all_audits(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+        return crud.get_all_audit_records(db, skip, limit)
+
+    @app.get("/api/stats/discrepancies", response_model=List[schemas.DiscrepancyStatsResponse], tags=["查询统计"])
+    async def get_discrepancy_stats(db: Session = Depends(get_db)):
+        return crud.get_discrepancy_statistics(db)
+
+    @app.get("/api/stats/beneficiary/{beneficiary_name}", response_model=schemas.BeneficiaryDiscrepancyRateResponse, tags=["查询统计"])
+    async def get_beneficiary_rate(beneficiary_name: str, db: Session = Depends(get_db)):
+        return crud.get_beneficiary_discrepancy_rate(db, beneficiary_name)
+
+    return app
+
+
+app = create_app()
