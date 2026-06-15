@@ -1,9 +1,19 @@
 from sqlalchemy.orm import Session
-from typing import List, Optional
-from datetime import date
+from typing import List, Optional, Dict, Any
+from datetime import date, datetime, timedelta
+import copy
 
 from app import models, schemas
 from app.audit_engine import AuditEngine
+from app.models import (
+    AMENDMENT_STATUS_PENDING,
+    AMENDMENT_STATUS_ACCEPTED,
+    AMENDMENT_STATUS_REJECTED,
+    AMENDMENT_STATUS_EXPIRED,
+    AMENDMENT_EXPIRY_DAYS,
+    AMENDABLE_FIELDS,
+    MAX_FIELDS_PER_AMENDMENT
+)
 
 
 def create_letter_of_credit(db: Session, lc_data: schemas.LetterOfCreditCreate) -> models.LetterOfCredit:
@@ -342,3 +352,320 @@ def get_beneficiary_discrepancy_rate(db: Session, beneficiary_name: str) -> dict
 
 def get_all_audit_records(db: Session, skip: int = 0, limit: int = 100) -> List[models.AuditRecord]:
     return db.query(models.AuditRecord).order_by(models.AuditRecord.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def lc_to_snapshot_dict(lc: models.LetterOfCredit) -> Dict[str, Any]:
+    return {
+        "id": lc.id,
+        "lc_number": lc.lc_number,
+        "issuing_bank": lc.issuing_bank,
+        "beneficiary_name": lc.beneficiary_name,
+        "applicant_name": lc.applicant_name,
+        "currency": lc.currency,
+        "amount": lc.amount,
+        "latest_shipment_date": lc.latest_shipment_date.isoformat() if lc.latest_shipment_date else None,
+        "latest_presentation_date": lc.latest_presentation_date.isoformat() if lc.latest_presentation_date else None,
+        "expiry_date": lc.expiry_date.isoformat() if lc.expiry_date else None,
+        "transport_mode": lc.transport_mode,
+        "port_of_loading": lc.port_of_loading,
+        "port_of_discharge": lc.port_of_discharge,
+        "partial_shipment_allowed": lc.partial_shipment_allowed,
+        "transshipment_allowed": lc.transshipment_allowed,
+        "goods_description": lc.goods_description,
+        "additional_terms": copy.deepcopy(lc.additional_terms) if lc.additional_terms else [],
+        "created_at": lc.created_at.isoformat() if lc.created_at else None
+    }
+
+
+def has_pending_amendment(db: Session, lc_id: int) -> bool:
+    pending = db.query(models.LCAmendment).filter(
+        models.LCAmendment.lc_id == lc_id,
+        models.LCAmendment.status == AMENDMENT_STATUS_PENDING
+    ).first()
+    return pending is not None
+
+
+def get_next_amendment_sequence(db: Session, lc_id: int) -> int:
+    from sqlalchemy import func
+    max_seq = db.query(func.max(models.LCAmendment.sequence_number)).filter(
+        models.LCAmendment.lc_id == lc_id
+    ).scalar()
+    return (max_seq or 0) + 1
+
+
+def validate_field_changes(field_changes: List[Dict[str, Any]], lc: models.LetterOfCredit) -> None:
+    if len(field_changes) > MAX_FIELDS_PER_AMENDMENT:
+        raise ValueError(f"每次修改最多允许修改 {MAX_FIELDS_PER_AMENDMENT} 个字段，当前提交了 {len(field_changes)} 个")
+
+    if len(field_changes) == 0:
+        raise ValueError("修改内容不能为空")
+
+    field_names = set()
+    for change in field_changes:
+        field_name = change.get("field_name")
+        if not field_name:
+            raise ValueError("每个字段变更必须指定 field_name")
+        if field_name not in AMENDABLE_FIELDS:
+            raise ValueError(f"字段 '{field_name}' 不允许修改，允许修改的字段: {', '.join(AMENDABLE_FIELDS)}")
+        if field_name in field_names:
+            raise ValueError(f"字段 '{field_name}' 在修改列表中重复出现")
+        field_names.add(field_name)
+
+        old_value = change.get("old_value")
+        new_value = change.get("new_value")
+
+        if field_name == "amount":
+            if not isinstance(new_value, (int, float)):
+                raise ValueError(f"字段 'amount' 的新值必须是数字类型")
+            if float(new_value) <= 0:
+                raise ValueError(f"字段 'amount' 的值必须大于 0")
+
+        if field_name in ["latest_shipment_date", "latest_presentation_date", "expiry_date"]:
+            if not new_value:
+                raise ValueError(f"字段 '{field_name}' 的新值不能为空")
+            try:
+                if isinstance(new_value, str):
+                    date.fromisoformat(new_value)
+                elif not isinstance(new_value, date):
+                    raise ValueError("日期格式不正确")
+            except (ValueError, TypeError):
+                raise ValueError(f"字段 '{field_name}' 的日期格式不正确，应为 YYYY-MM-DD 格式")
+
+
+def create_amendment(db: Session, amendment_data: schemas.AmendmentCreate) -> models.LCAmendment:
+    lc = get_letter_of_credit_by_number(db, amendment_data.lc_number)
+    if not lc:
+        raise ValueError(f"信用证 {amendment_data.lc_number} 不存在")
+
+    check_and_expire_amendments(db, lc.id)
+
+    if has_pending_amendment(db, lc.id):
+        raise ValueError(f"信用证 {amendment_data.lc_number} 已有一个待处理的修改，请先处理后再发起新修改")
+
+    field_changes_dict = [change.model_dump() for change in amendment_data.field_changes]
+    validate_field_changes(field_changes_dict, lc)
+
+    snapshot_before = lc_to_snapshot_dict(lc)
+
+    sequence_number = get_next_amendment_sequence(db, lc.id)
+    amendment_number = f"{lc.lc_number}-AMD-{sequence_number:03d}"
+
+    expiry_time = datetime.utcnow() + timedelta(days=AMENDMENT_EXPIRY_DAYS)
+
+    amendment = models.LCAmendment(
+        lc_id=lc.id,
+        amendment_number=amendment_number,
+        sequence_number=sequence_number,
+        status=AMENDMENT_STATUS_PENDING,
+        field_changes=field_changes_dict,
+        snapshot_before=snapshot_before,
+        snapshot_after=None,
+        expiry_time=expiry_time
+    )
+
+    db.add(amendment)
+    db.commit()
+    db.refresh(amendment)
+    return amendment
+
+
+def get_amendment_by_number(db: Session, amendment_number: str) -> Optional[models.LCAmendment]:
+    return db.query(models.LCAmendment).filter(models.LCAmendment.amendment_number == amendment_number).first()
+
+
+def get_amendments_by_lc(db: Session, lc_number: str) -> List[models.LCAmendment]:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        return []
+    return db.query(models.LCAmendment).filter(
+        models.LCAmendment.lc_id == lc.id
+    ).order_by(models.LCAmendment.sequence_number.desc()).all()
+
+
+def apply_amendment_to_lc(db: Session, lc: models.LetterOfCredit, field_changes: List[Dict[str, Any]]) -> None:
+    for change in field_changes:
+        field_name = change["field_name"]
+        new_value = change["new_value"]
+
+        if field_name == "amount":
+            lc.amount = float(new_value)
+        elif field_name == "latest_shipment_date":
+            if isinstance(new_value, str):
+                lc.latest_shipment_date = date.fromisoformat(new_value)
+            else:
+                lc.latest_shipment_date = new_value
+        elif field_name == "latest_presentation_date":
+            if isinstance(new_value, str):
+                lc.latest_presentation_date = date.fromisoformat(new_value)
+            else:
+                lc.latest_presentation_date = new_value
+        elif field_name == "expiry_date":
+            if isinstance(new_value, str):
+                lc.expiry_date = date.fromisoformat(new_value)
+            else:
+                lc.expiry_date = new_value
+        elif field_name == "port_of_loading":
+            lc.port_of_loading = str(new_value)
+        elif field_name == "port_of_discharge":
+            lc.port_of_discharge = str(new_value)
+        elif field_name == "partial_shipment_allowed":
+            lc.partial_shipment_allowed = bool(new_value)
+        elif field_name == "transshipment_allowed":
+            lc.transshipment_allowed = bool(new_value)
+        elif field_name == "goods_description":
+            lc.goods_description = str(new_value)
+        elif field_name == "additional_terms":
+            lc.additional_terms = list(new_value) if new_value else []
+
+
+def re_audit_pending_submissions(db: Session, lc_id: int) -> List[models.AuditRecord]:
+    audit_records = db.query(models.AuditRecord).filter(
+        models.AuditRecord.lc_id == lc_id,
+        models.AuditRecord.conclusion == "discrepant"
+    ).all()
+
+    re_audited = []
+    for record in audit_records:
+        documents = get_documents_by_submission(db, record.submission_id)
+        if not documents:
+            continue
+
+        lc = get_letter_of_credit_by_id(db, lc_id)
+        if not lc:
+            continue
+
+        engine = AuditEngine(lc, documents, record.presentation_date)
+        conclusion, discrepancies = engine.run_audit()
+
+        critical_count = sum(1 for d in discrepancies if d["severity"] == "critical")
+        minor_count = sum(1 for d in discrepancies if d["severity"] == "minor")
+
+        record.conclusion = conclusion
+        record.total_discrepancies = len(discrepancies)
+        record.critical_count = critical_count
+        record.minor_count = minor_count
+
+        db.query(models.Discrepancy).filter(
+            models.Discrepancy.audit_record_id == record.id
+        ).delete()
+
+        for disc in discrepancies:
+            db_disc = models.Discrepancy(
+                audit_record_id=record.id,
+                discrepancy_type=disc["discrepancy_type"],
+                severity=disc["severity"],
+                document_type=disc["document_type"],
+                description=disc["description"],
+                lc_clause_reference=disc["lc_clause_reference"]
+            )
+            db.add(db_disc)
+
+        re_audited.append(record)
+
+    return re_audited
+
+
+def accept_amendment(db: Session, amendment_number: str) -> models.LCAmendment:
+    amendment = get_amendment_by_number(db, amendment_number)
+    if not amendment:
+        raise ValueError(f"修改编号 {amendment_number} 不存在")
+
+    check_and_expire_amendments(db, amendment.lc_id)
+
+    if amendment.status == AMENDMENT_STATUS_EXPIRED:
+        raise ValueError(f"修改 {amendment_number} 已过期，无法接受")
+
+    if amendment.status != AMENDMENT_STATUS_PENDING:
+        raise ValueError(f"修改 {amendment_number} 当前状态为 {amendment.status}，只有 pending 状态的修改可以接受")
+
+    lc = get_letter_of_credit_by_id(db, amendment.lc_id)
+    if not lc:
+        raise ValueError("关联信用证不存在")
+
+    apply_amendment_to_lc(db, lc, amendment.field_changes)
+
+    snapshot_after = lc_to_snapshot_dict(lc)
+    amendment.snapshot_after = snapshot_after
+    amendment.status = AMENDMENT_STATUS_ACCEPTED
+    amendment.acceptance_time = datetime.utcnow()
+
+    re_audited = re_audit_pending_submissions(db, amendment.lc_id)
+
+    db.commit()
+    db.refresh(amendment)
+    return amendment
+
+
+def reject_amendment(db: Session, amendment_number: str) -> models.LCAmendment:
+    amendment = get_amendment_by_number(db, amendment_number)
+    if not amendment:
+        raise ValueError(f"修改编号 {amendment_number} 不存在")
+
+    check_and_expire_amendments(db, amendment.lc_id)
+
+    if amendment.status == AMENDMENT_STATUS_EXPIRED:
+        raise ValueError(f"修改 {amendment_number} 已过期，无需拒绝")
+
+    if amendment.status != AMENDMENT_STATUS_PENDING:
+        raise ValueError(f"修改 {amendment_number} 当前状态为 {amendment.status}，只有 pending 状态的修改可以拒绝")
+
+    amendment.status = AMENDMENT_STATUS_REJECTED
+    amendment.acceptance_time = datetime.utcnow()
+
+    db.commit()
+    db.refresh(amendment)
+    return amendment
+
+
+def check_and_expire_amendments(db: Session, lc_id: int) -> int:
+    now = datetime.utcnow()
+    expired_count = 0
+
+    pending_amendments = db.query(models.LCAmendment).filter(
+        models.LCAmendment.lc_id == lc_id,
+        models.LCAmendment.status == AMENDMENT_STATUS_PENDING
+    ).all()
+
+    for amendment in pending_amendments:
+        if amendment.expiry_time < now:
+            amendment.status = AMENDMENT_STATUS_EXPIRED
+            expired_count += 1
+
+    if expired_count > 0:
+        db.commit()
+
+    return expired_count
+
+
+def get_amendment_snapshot(db: Session, amendment_number: str) -> Dict[str, Any]:
+    amendment = get_amendment_by_number(db, amendment_number)
+    if not amendment:
+        raise ValueError(f"修改编号 {amendment_number} 不存在")
+
+    check_and_expire_amendments(db, amendment.lc_id)
+    db.refresh(amendment)
+
+    return {
+        "amendment_number": amendment.amendment_number,
+        "status": amendment.status,
+        "before": amendment.snapshot_before,
+        "after": amendment.snapshot_after
+    }
+
+
+def get_all_pending_amendments(db: Session) -> List[models.LCAmendment]:
+    return db.query(models.LCAmendment).filter(
+        models.LCAmendment.status == AMENDMENT_STATUS_PENDING
+    ).all()
+
+
+def expire_all_overdue_amendments(db: Session) -> int:
+    total_expired = 0
+    pending = get_all_pending_amendments(db)
+    for amendment in pending:
+        if amendment.is_expired():
+            amendment.status = AMENDMENT_STATUS_EXPIRED
+            total_expired += 1
+    if total_expired > 0:
+        db.commit()
+    return total_expired

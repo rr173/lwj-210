@@ -1,8 +1,31 @@
 from sqlalchemy import Column, Integer, String, Float, Date, Boolean, ForeignKey, Text, JSON, DateTime
 from sqlalchemy.orm import relationship
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from app.database import Base
+
+
+AMENDMENT_STATUS_PENDING = "pending"
+AMENDMENT_STATUS_ACCEPTED = "accepted"
+AMENDMENT_STATUS_REJECTED = "rejected"
+AMENDMENT_STATUS_EXPIRED = "expired"
+
+AMENDMENT_EXPIRY_DAYS = 7
+
+AMENDABLE_FIELDS = [
+    "amount",
+    "latest_shipment_date",
+    "latest_presentation_date",
+    "expiry_date",
+    "port_of_loading",
+    "port_of_discharge",
+    "partial_shipment_allowed",
+    "transshipment_allowed",
+    "goods_description",
+    "additional_terms"
+]
+
+MAX_FIELDS_PER_AMENDMENT = 5
 
 
 class LetterOfCredit(Base):
@@ -28,7 +51,28 @@ class LetterOfCredit(Base):
     document_requirements = relationship("DocumentRequirement", back_populates="lc", cascade="all, delete-orphan")
     documents = relationship("Document", back_populates="lc", cascade="all, delete-orphan")
     audit_records = relationship("AuditRecord", back_populates="lc", cascade="all, delete-orphan")
+    amendments = relationship("LCAmendment", back_populates="lc", cascade="all, delete-orphan", order_by="LCAmendment.sequence_number")
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class LCAmendment(Base):
+    __tablename__ = "lc_amendments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    lc_id = Column(Integer, ForeignKey("letter_of_credits.id"), nullable=False)
+    amendment_number = Column(String(150), unique=True, index=True, nullable=False)
+    sequence_number = Column(Integer, nullable=False)
+    status = Column(String(20), default=AMENDMENT_STATUS_PENDING, nullable=False)
+    field_changes = Column(JSON, nullable=False)
+    snapshot_before = Column(JSON, nullable=False)
+    snapshot_after = Column(JSON, nullable=True)
+    acceptance_time = Column(DateTime, nullable=True)
+    expiry_time = Column(DateTime, nullable=False)
+    lc = relationship("LetterOfCredit", back_populates="amendments")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def is_expired(self) -> bool:
+        return datetime.utcnow() > self.expiry_time
 
 
 class DocumentRequirement(Base):

@@ -170,6 +170,105 @@ def create_app() -> FastAPI:
     async def get_beneficiary_rate(beneficiary_name: str, db: Session = Depends(get_db)):
         return crud.get_beneficiary_discrepancy_rate(db, beneficiary_name)
 
+    @app.post("/api/amendment", response_model=schemas.AmendmentResponse, tags=["信用证修改"], status_code=status.HTTP_201_CREATED)
+    async def create_amendment(amendment_data: schemas.AmendmentCreate, db: Session = Depends(get_db)):
+        try:
+            amendment = crud.create_amendment(db, amendment_data)
+            return amendment
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"创建修改请求失败: {str(e)}")
+
+    @app.get("/api/amendment/{amendment_number}", response_model=schemas.AmendmentResponse, tags=["信用证修改"])
+    async def get_amendment(amendment_number: str, db: Session = Depends(get_db)):
+        amendment = crud.get_amendment_by_number(db, amendment_number)
+        if not amendment:
+            raise HTTPException(status_code=404, detail=f"修改 {amendment_number} 不存在")
+        crud.check_and_expire_amendments(db, amendment.lc_id)
+        db.refresh(amendment)
+        return amendment
+
+    @app.post("/api/amendment/{amendment_number}/action", response_model=schemas.AmendmentResponse, tags=["信用证修改"])
+    async def amendment_action(amendment_number: str, action_req: schemas.AmendmentActionRequest, db: Session = Depends(get_db)):
+        action = action_req.action.lower()
+        if action not in ["accept", "reject"]:
+            raise HTTPException(status_code=400, detail=f"无效的操作: {action}，仅支持 accept 或 reject")
+        try:
+            if action == "accept":
+                amendment = crud.accept_amendment(db, amendment_number)
+            else:
+                amendment = crud.reject_amendment(db, amendment_number)
+            return amendment
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"修改操作失败: {str(e)}")
+
+    @app.get("/api/lc/{lc_number}/amendments", response_model=List[schemas.AmendmentResponse], tags=["信用证修改"])
+    async def get_lc_amendments(lc_number: str, db: Session = Depends(get_db)):
+        lc = crud.get_letter_of_credit_by_number(db, lc_number)
+        if not lc:
+            raise HTTPException(status_code=404, detail=f"信用证 {lc_number} 不存在")
+        crud.check_and_expire_amendments(db, lc.id)
+        return crud.get_amendments_by_lc(db, lc_number)
+
+    @app.get("/api/amendment/{amendment_number}/snapshot", response_model=schemas.AmendmentSnapshotResponse, tags=["信用证修改"])
+    async def get_amendment_snapshot(amendment_number: str, db: Session = Depends(get_db)):
+        try:
+            snapshot = crud.get_amendment_snapshot(db, amendment_number)
+            return snapshot
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @app.get("/api/amendments/pending", response_model=List[schemas.AmendmentResponse], tags=["信用证修改"])
+    async def list_pending_amendments(db: Session = Depends(get_db)):
+        from app.models import AMENDMENT_STATUS_PENDING
+        amendments = crud.get_all_pending_amendments(db)
+        result = []
+        for a in amendments:
+            crud.check_and_expire_amendments(db, a.lc_id)
+            db.refresh(a)
+            if a.status == AMENDMENT_STATUS_PENDING:
+                result.append(a)
+        return result
+
+    @app.post("/api/amendments/expire-check", tags=["信用证修改"])
+    async def expire_overdue_amendments(db: Session = Depends(get_db)):
+        count = crud.expire_all_overdue_amendments(db)
+        return {"expired_count": count, "message": f"已将 {count} 个过期修改标记为 expired"}
+
+    @app.get("/api/lc/{lc_number}/with-amendments", response_model=schemas.LcWithAmendmentsResponse, tags=["信用证管理"])
+    async def get_lc_with_amendments(lc_number: str, db: Session = Depends(get_db)):
+        lc = crud.get_letter_of_credit_by_number(db, lc_number)
+        if not lc:
+            raise HTTPException(status_code=404, detail=f"信用证 {lc_number} 不存在")
+        crud.check_and_expire_amendments(db, lc.id)
+        amendments = crud.get_amendments_by_lc(db, lc_number)
+        result = {
+            "id": lc.id,
+            "lc_number": lc.lc_number,
+            "issuing_bank": lc.issuing_bank,
+            "beneficiary_name": lc.beneficiary_name,
+            "applicant_name": lc.applicant_name,
+            "currency": lc.currency,
+            "amount": lc.amount,
+            "latest_shipment_date": lc.latest_shipment_date,
+            "latest_presentation_date": lc.latest_presentation_date,
+            "expiry_date": lc.expiry_date,
+            "transport_mode": lc.transport_mode,
+            "port_of_loading": lc.port_of_loading,
+            "port_of_discharge": lc.port_of_discharge,
+            "partial_shipment_allowed": lc.partial_shipment_allowed,
+            "transshipment_allowed": lc.transshipment_allowed,
+            "goods_description": lc.goods_description,
+            "additional_terms": lc.additional_terms,
+            "document_requirements": lc.document_requirements,
+            "created_at": lc.created_at,
+            "amendments": amendments
+        }
+        return result
+
     return app
 
 

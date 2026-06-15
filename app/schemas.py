@@ -211,3 +211,64 @@ class SubmissionHistoryResponse(BaseModel):
     max_allowed_rounds: int
     current_conclusion: str
     history: List[AuditRecordResponse]
+
+
+class AmendmentStatus(str, Enum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+
+
+class AmendableField(str, Enum):
+    AMOUNT = "amount"
+    LATEST_SHIPMENT_DATE = "latest_shipment_date"
+    LATEST_PRESENTATION_DATE = "latest_presentation_date"
+    EXPIRY_DATE = "expiry_date"
+    PORT_OF_LOADING = "port_of_loading"
+    PORT_OF_DISCHARGE = "port_of_discharge"
+    PARTIAL_SHIPMENT_ALLOWED = "partial_shipment_allowed"
+    TRANSSHIPMENT_ALLOWED = "transshipment_allowed"
+    GOODS_DESCRIPTION = "goods_description"
+    ADDITIONAL_TERMS = "additional_terms"
+
+
+class FieldChange(BaseModel):
+    field_name: str
+    old_value: Any
+    new_value: Any
+
+
+class AmendmentCreate(BaseModel):
+    lc_number: str
+    field_changes: List[FieldChange]
+
+
+class AmendmentResponse(BaseModel):
+    id: int
+    lc_id: int
+    amendment_number: str
+    sequence_number: int
+    status: str
+    field_changes: List[FieldChange]
+    acceptance_time: Optional[datetime] = None
+    expiry_time: datetime
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AmendmentSnapshotResponse(BaseModel):
+    amendment_number: str
+    status: str
+    before: dict
+    after: Optional[dict] = None
+
+
+class AmendmentActionRequest(BaseModel):
+    action: str
+
+
+class LcWithAmendmentsResponse(LetterOfCreditResponse):
+    amendments: List[AmendmentResponse] = []
