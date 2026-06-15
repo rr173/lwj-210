@@ -44,6 +44,7 @@ def seed_data():
                 "提单显示运费预付(FREIGHT PREPAID)",
                 "提交清洁已装船提单"
             ],
+            fee_tier=schemas.FeeTier.STANDARD,
             document_requirements=[
                 schemas.DocumentRequirementCreate(document_type="invoice", original_copies=3, copy_copies=2),
                 schemas.DocumentRequirementCreate(document_type="bill_of_lading", original_copies=3, copy_copies=3),
@@ -75,6 +76,7 @@ def seed_data():
                 "空运单显示运费到付(FREIGHT COLLECT)",
                 "原产地证由中国国际贸易促进委员会签发"
             ],
+            fee_tier=schemas.FeeTier.PREFERRED,
             document_requirements=[
                 schemas.DocumentRequirementCreate(document_type="invoice", original_copies=3, copy_copies=2),
                 schemas.DocumentRequirementCreate(document_type="bill_of_lading", original_copies=1, copy_copies=2),

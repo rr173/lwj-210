@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from typing import List, Optional
+from datetime import date
 
 from app.database import get_db, Base, engine
 from app import models, schemas, crud
@@ -265,9 +266,40 @@ def create_app() -> FastAPI:
             "additional_terms": lc.additional_terms,
             "document_requirements": lc.document_requirements,
             "created_at": lc.created_at,
+            "fee_tier": lc.fee_tier,
             "amendments": amendments
         }
         return result
+
+    @app.get("/api/fees/lc/{lc_number}", response_model=schemas.LcFeeSummaryResponse, tags=["收费管理"])
+    async def get_lc_fee_summary(lc_number: str, db: Session = Depends(get_db)):
+        try:
+            result = crud.get_fee_records_by_lc(db, lc_number)
+            return result
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询费用失败: {str(e)}")
+
+    @app.get("/api/fees/summary", response_model=schemas.FeeSummaryResponse, tags=["收费管理"])
+    async def get_fee_summary(
+        start_date: date,
+        end_date: date,
+        db: Session = Depends(get_db)
+    ):
+        try:
+            if start_date > end_date:
+                raise HTTPException(status_code=400, detail="开始日期不能大于结束日期")
+            result = crud.get_fee_records_by_time_range(db, start_date, end_date)
+            return result
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询费用汇总失败: {str(e)}")
+
+    @app.get("/api/fees/all", response_model=List[schemas.FeeRecordResponse], tags=["收费管理"])
+    async def list_all_fees(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+        return crud.get_all_fee_records(db, skip, limit)
 
     return app
 

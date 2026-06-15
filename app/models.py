@@ -5,6 +5,36 @@ from datetime import datetime, timedelta
 from app.database import Base
 
 
+FEE_TIER_STANDARD = "standard"
+FEE_TIER_PREFERRED = "preferred"
+FEE_TIER_VIP = "vip"
+VALID_FEE_TIERS = [FEE_TIER_STANDARD, FEE_TIER_PREFERRED, FEE_TIER_VIP]
+
+FEE_RULES = {
+    FEE_TIER_STANDARD: {
+        "first_submission_base": 200,
+        "first_submission_per_doc": 30,
+        "resubmission_fixed": 150,
+    },
+    FEE_TIER_PREFERRED: {
+        "first_submission_base": 150,
+        "first_submission_per_doc": 20,
+        "resubmission_fixed": 100,
+    },
+    FEE_TIER_VIP: {
+        "first_submission_base": 100,
+        "first_submission_per_doc": 10,
+        "resubmission_fixed": 0,
+    },
+}
+
+FEE_TYPE_FIRST_SUBMISSION = "first_submission"
+FEE_TYPE_RESUBMISSION = "resubmission"
+
+FEE_STATUS_CONFIRMED = "confirmed"
+FEE_STATUS_PENDING = "pending"
+
+
 AMENDMENT_STATUS_PENDING = "pending"
 AMENDMENT_STATUS_ACCEPTED = "accepted"
 AMENDMENT_STATUS_REJECTED = "rejected"
@@ -48,10 +78,12 @@ class LetterOfCredit(Base):
     transshipment_allowed = Column(Boolean, default=False)
     goods_description = Column(Text, nullable=False)
     additional_terms = Column(JSON, default=list)
+    fee_tier = Column(String(20), default=FEE_TIER_STANDARD, nullable=False)
     document_requirements = relationship("DocumentRequirement", back_populates="lc", cascade="all, delete-orphan")
     documents = relationship("Document", back_populates="lc", cascade="all, delete-orphan")
     audit_records = relationship("AuditRecord", back_populates="lc", cascade="all, delete-orphan")
     amendments = relationship("LCAmendment", back_populates="lc", cascade="all, delete-orphan", order_by="LCAmendment.sequence_number")
+    fee_records = relationship("FeeRecord", back_populates="lc", cascade="all, delete-orphan")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -131,3 +163,25 @@ class Discrepancy(Base):
     description = Column(Text, nullable=False)
     lc_clause_reference = Column(String(255))
     audit_record = relationship("AuditRecord", back_populates="discrepancies")
+
+
+class FeeRecord(Base):
+    __tablename__ = "fee_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    fee_number = Column(String(100), unique=True, index=True, nullable=False)
+    lc_id = Column(Integer, ForeignKey("letter_of_credits.id"), nullable=False)
+    submission_id = Column(String(100), index=True, nullable=False)
+    audit_record_id = Column(Integer, ForeignKey("audit_records.id"), nullable=False)
+    fee_type = Column(String(30), nullable=False)
+    fee_tier = Column(String(20), nullable=False)
+    base_fee = Column(Float, default=0, nullable=False)
+    per_doc_fee = Column(Float, default=0, nullable=False)
+    document_count = Column(Integer, default=0, nullable=False)
+    document_fee_total = Column(Float, default=0, nullable=False)
+    total_amount = Column(Float, nullable=False)
+    status = Column(String(20), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    lc = relationship("LetterOfCredit", back_populates="fee_records")
+    audit_record = relationship("AuditRecord")

@@ -12,11 +12,22 @@ from app.models import (
     AMENDMENT_STATUS_EXPIRED,
     AMENDMENT_EXPIRY_DAYS,
     AMENDABLE_FIELDS,
-    MAX_FIELDS_PER_AMENDMENT
+    MAX_FIELDS_PER_AMENDMENT,
+    FEE_RULES,
+    FEE_TYPE_FIRST_SUBMISSION,
+    FEE_TYPE_RESUBMISSION,
+    FEE_STATUS_CONFIRMED,
+    FEE_STATUS_PENDING,
+    VALID_FEE_TIERS,
+    FEE_TIER_STANDARD,
 )
 
 
 def create_letter_of_credit(db: Session, lc_data: schemas.LetterOfCreditCreate) -> models.LetterOfCredit:
+    fee_tier_value = lc_data.fee_tier.value if hasattr(lc_data.fee_tier, 'value') else lc_data.fee_tier
+    if fee_tier_value not in VALID_FEE_TIERS:
+        raise ValueError(f"无效的费率档位: {fee_tier_value}，允许的值: {', '.join(VALID_FEE_TIERS)}")
+
     db_lc = models.LetterOfCredit(
         lc_number=lc_data.lc_number,
         issuing_bank=lc_data.issuing_bank,
@@ -33,7 +44,8 @@ def create_letter_of_credit(db: Session, lc_data: schemas.LetterOfCreditCreate) 
         partial_shipment_allowed=lc_data.partial_shipment_allowed,
         transshipment_allowed=lc_data.transshipment_allowed,
         goods_description=lc_data.goods_description,
-        additional_terms=lc_data.additional_terms
+        additional_terms=lc_data.additional_terms,
+        fee_tier=fee_tier_value
     )
     db.add(db_lc)
     db.flush()
@@ -68,6 +80,10 @@ def update_letter_of_credit(db: Session, lc_id: int, lc_data: schemas.LetterOfCr
     db_lc = get_letter_of_credit_by_id(db, lc_id)
     if not db_lc:
         return None
+
+    new_fee_tier = lc_data.fee_tier.value if hasattr(lc_data.fee_tier, 'value') else lc_data.fee_tier
+    if new_fee_tier != db_lc.fee_tier:
+        raise ValueError(f"费率档位创建后不可修改，当前档位: {db_lc.fee_tier}，提交的档位: {new_fee_tier}")
 
     db_lc.lc_number = lc_data.lc_number
     db_lc.issuing_bank = lc_data.issuing_bank
@@ -114,6 +130,80 @@ def get_latest_audit_by_lc(db: Session, lc_id: int) -> Optional[models.AuditReco
     return db.query(models.AuditRecord).filter(
         models.AuditRecord.lc_id == lc_id
     ).order_by(models.AuditRecord.created_at.desc()).first()
+
+
+def generate_fee_number(db: Session, lc_number: str) -> str:
+    from sqlalchemy import func
+    date_str = datetime.utcnow().strftime("%Y%m%d")
+    prefix = f"FEE-{lc_number}-{date_str}-"
+    count = db.query(func.count(models.FeeRecord.id)).filter(
+        models.FeeRecord.fee_number.like(f"{prefix}%")
+    ).scalar() or 0
+    return f"{prefix}{count + 1:04d}"
+
+
+def calculate_fee(fee_tier: str, fee_type: str, document_count: int) -> Dict[str, Any]:
+    if fee_tier not in FEE_RULES:
+        raise ValueError(f"无效的费率档位: {fee_tier}")
+    rules = FEE_RULES[fee_tier]
+
+    if fee_type == FEE_TYPE_FIRST_SUBMISSION:
+        base_fee = rules["first_submission_base"]
+        per_doc_fee = rules["first_submission_per_doc"]
+        document_fee_total = per_doc_fee * document_count
+        total_amount = base_fee + document_fee_total
+    elif fee_type == FEE_TYPE_RESUBMISSION:
+        base_fee = rules["resubmission_fixed"]
+        per_doc_fee = 0
+        document_fee_total = 0
+        total_amount = base_fee
+    else:
+        raise ValueError(f"无效的费用类型: {fee_type}")
+
+    return {
+        "base_fee": float(base_fee),
+        "per_doc_fee": float(per_doc_fee),
+        "document_count": document_count,
+        "document_fee_total": float(document_fee_total),
+        "total_amount": float(total_amount),
+    }
+
+
+def determine_fee_status(conclusion: str) -> str:
+    if conclusion == "compliant" or conclusion == "minor_discrepancy":
+        return FEE_STATUS_CONFIRMED
+    else:
+        return FEE_STATUS_PENDING
+
+
+def create_fee_record(
+    db: Session,
+    lc: models.LetterOfCredit,
+    audit_record: models.AuditRecord,
+    fee_type: str,
+    document_count: int,
+) -> models.FeeRecord:
+    fee_details = calculate_fee(lc.fee_tier, fee_type, document_count)
+    fee_status = determine_fee_status(audit_record.conclusion)
+    fee_number = generate_fee_number(db, lc.lc_number)
+
+    fee_record = models.FeeRecord(
+        fee_number=fee_number,
+        lc_id=lc.id,
+        submission_id=audit_record.submission_id,
+        audit_record_id=audit_record.id,
+        fee_type=fee_type,
+        fee_tier=lc.fee_tier,
+        base_fee=fee_details["base_fee"],
+        per_doc_fee=fee_details["per_doc_fee"],
+        document_count=fee_details["document_count"],
+        document_fee_total=fee_details["document_fee_total"],
+        total_amount=fee_details["total_amount"],
+        status=fee_status,
+    )
+    db.add(fee_record)
+    db.flush()
+    return fee_record
 
 
 def submit_documents_and_audit(db: Session, submission: schemas.SubmissionSubmit):
@@ -184,6 +274,8 @@ def submit_documents_and_audit(db: Session, submission: schemas.SubmissionSubmit
             lc_clause_reference=disc["lc_clause_reference"]
         )
         db.add(db_disc)
+
+    create_fee_record(db, lc, audit_record, FEE_TYPE_FIRST_SUBMISSION, len(documents))
 
     db.commit()
     db.refresh(audit_record)
@@ -295,6 +387,8 @@ def resubmit_documents_and_audit(db: Session, original_submission_id: str, resub
             lc_clause_reference=disc["lc_clause_reference"]
         )
         db.add(db_disc)
+
+    create_fee_record(db, lc, audit_record, FEE_TYPE_RESUBMISSION, len(documents))
 
     db.commit()
     db.refresh(audit_record)
@@ -744,3 +838,99 @@ def expire_all_overdue_amendments(db: Session) -> int:
     if total_expired > 0:
         db.commit()
     return total_expired
+
+
+def get_fee_records_by_lc(db: Session, lc_number: str) -> Dict[str, Any]:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        raise ValueError(f"信用证 {lc_number} 不存在")
+
+    fee_records = db.query(models.FeeRecord).filter(
+        models.FeeRecord.lc_id == lc.id
+    ).order_by(models.FeeRecord.created_at.desc()).all()
+
+    total_amount = sum(r.total_amount for r in fee_records)
+    confirmed_amount = sum(r.total_amount for r in fee_records if r.status == FEE_STATUS_CONFIRMED)
+    pending_amount = sum(r.total_amount for r in fee_records if r.status == FEE_STATUS_PENDING)
+
+    return {
+        "lc_number": lc.lc_number,
+        "fee_tier": lc.fee_tier,
+        "fee_records": fee_records,
+        "total_amount": round(float(total_amount), 2),
+        "confirmed_amount": round(float(confirmed_amount), 2),
+        "pending_amount": round(float(pending_amount), 2),
+    }
+
+
+def get_fee_records_by_time_range(
+    db: Session,
+    start_date: date,
+    end_date: date,
+) -> Dict[str, Any]:
+    from sqlalchemy import func
+
+    start_dt = datetime.combine(start_date, datetime.min.time())
+    end_dt = datetime.combine(end_date, datetime.max.time())
+
+    query = db.query(models.FeeRecord).filter(
+        models.FeeRecord.created_at >= start_dt,
+        models.FeeRecord.created_at <= end_dt,
+    )
+    all_records = query.order_by(models.FeeRecord.created_at.desc()).all()
+
+    grand_total = sum(r.total_amount for r in all_records)
+
+    tier_stats = db.query(
+        models.FeeRecord.fee_tier,
+        models.FeeRecord.status,
+        func.count(models.FeeRecord.id).label("count"),
+        func.sum(models.FeeRecord.total_amount).label("total"),
+    ).filter(
+        models.FeeRecord.created_at >= start_dt,
+        models.FeeRecord.created_at <= end_dt,
+    ).group_by(models.FeeRecord.fee_tier, models.FeeRecord.status).all()
+
+    tier_agg = {}
+    for tier in VALID_FEE_TIERS:
+        tier_agg[tier] = {
+            "record_count": 0,
+            "total_amount": 0.0,
+            "confirmed_amount": 0.0,
+            "pending_amount": 0.0,
+        }
+
+    for tier, status, count, total in tier_stats:
+        if tier not in tier_agg:
+            continue
+        total = float(total or 0)
+        count = int(count or 0)
+        tier_agg[tier]["record_count"] += count
+        tier_agg[tier]["total_amount"] += total
+        if status == FEE_STATUS_CONFIRMED:
+            tier_agg[tier]["confirmed_amount"] += total
+        elif status == FEE_STATUS_PENDING:
+            tier_agg[tier]["pending_amount"] += total
+
+    by_tier = []
+    for tier in VALID_FEE_TIERS:
+        data = tier_agg[tier]
+        by_tier.append({
+            "fee_tier": tier,
+            "record_count": data["record_count"],
+            "total_amount": round(data["total_amount"], 2),
+            "confirmed_amount": round(data["confirmed_amount"], 2),
+            "pending_amount": round(data["pending_amount"], 2),
+        })
+
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "total_records": len(all_records),
+        "grand_total": round(float(grand_total), 2),
+        "by_tier": by_tier,
+    }
+
+
+def get_all_fee_records(db: Session, skip: int = 0, limit: int = 100) -> List[models.FeeRecord]:
+    return db.query(models.FeeRecord).order_by(models.FeeRecord.created_at.desc()).offset(skip).limit(limit).all()

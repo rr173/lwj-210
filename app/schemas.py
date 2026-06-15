@@ -16,6 +16,22 @@ class Currency(str, Enum):
     CNY = "CNY"
 
 
+class FeeTier(str, Enum):
+    STANDARD = "standard"
+    PREFERRED = "preferred"
+    VIP = "vip"
+
+
+class FeeType(str, Enum):
+    FIRST_SUBMISSION = "first_submission"
+    RESUBMISSION = "resubmission"
+
+
+class FeeStatus(str, Enum):
+    CONFIRMED = "confirmed"
+    PENDING = "pending"
+
+
 class DocumentType(str, Enum):
     INVOICE = "invoice"
     BILL_OF_LADING = "bill_of_lading"
@@ -79,6 +95,7 @@ class LetterOfCreditCreate(BaseModel):
     transshipment_allowed: bool = False
     goods_description: str
     additional_terms: List[str] = []
+    fee_tier: FeeTier = FeeTier.STANDARD
     document_requirements: List[DocumentRequirementCreate]
 
 
@@ -100,6 +117,7 @@ class LetterOfCreditResponse(BaseModel):
     transshipment_allowed: bool
     goods_description: str
     additional_terms: List[str]
+    fee_tier: str
     document_requirements: List[DocumentRequirementResponse]
     created_at: datetime
 
@@ -272,3 +290,48 @@ class AmendmentActionRequest(BaseModel):
 
 class LcWithAmendmentsResponse(LetterOfCreditResponse):
     amendments: List[AmendmentResponse] = []
+
+
+class FeeRecordResponse(BaseModel):
+    id: int
+    fee_number: str
+    lc_id: int
+    submission_id: str
+    audit_record_id: int
+    fee_type: str
+    fee_tier: str
+    base_fee: float
+    per_doc_fee: float
+    document_count: int
+    document_fee_total: float
+    total_amount: float
+    status: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class LcFeeSummaryResponse(BaseModel):
+    lc_number: str
+    fee_tier: str
+    fee_records: List[FeeRecordResponse]
+    total_amount: float
+    confirmed_amount: float
+    pending_amount: float
+
+
+class FeeTierSummary(BaseModel):
+    fee_tier: str
+    record_count: int
+    total_amount: float
+    confirmed_amount: float
+    pending_amount: float
+
+
+class FeeSummaryResponse(BaseModel):
+    start_date: date
+    end_date: date
+    total_records: int
+    grand_total: float
+    by_tier: List[FeeTierSummary]
