@@ -729,6 +729,14 @@ def re_audit_pending_submissions(db: Session, lc_id: int) -> List[models.AuditRe
             )
             db.add(db_disc)
 
+        fee_record = db.query(models.FeeRecord).filter(
+            models.FeeRecord.audit_record_id == record.id
+        ).first()
+        if fee_record:
+            new_status = determine_fee_status(conclusion)
+            if fee_record.status != new_status:
+                fee_record.status = new_status
+
         re_audited.append(record)
 
     return re_audited

@@ -74,8 +74,13 @@ def create_app() -> FastAPI:
             other = crud.get_letter_of_credit_by_number(db, lc_data.lc_number)
             if other and other.id != lc.id:
                 raise HTTPException(status_code=400, detail=f"新信用证编号 {lc_data.lc_number} 已被其他信用证使用")
-        updated = crud.update_letter_of_credit(db, lc.id, lc_data)
-        return updated
+        try:
+            updated = crud.update_letter_of_credit(db, lc.id, lc_data)
+            return updated
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"更新信用证失败: {str(e)}")
 
     @app.delete("/api/lc/{lc_number}", tags=["信用证管理"])
     async def delete_lc(lc_number: str, db: Session = Depends(get_db)):

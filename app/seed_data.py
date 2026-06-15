@@ -7,6 +7,7 @@ from datetime import date, timedelta
 from app.database import Base, engine, SessionLocal
 from app import models, schemas, crud
 from app.audit_engine import AuditEngine
+from app.models import FEE_TYPE_FIRST_SUBMISSION
 
 
 def init_db():
@@ -205,6 +206,9 @@ def seed_data():
             db.add(models.Discrepancy(audit_record_id=audit1.id, **d))
         print(f"创建审核记录1: 结论={conclusion1}, 不符点数量={len(discrepancies1)}")
 
+        crud.create_fee_record(db, lc1, audit1, FEE_TYPE_FIRST_SUBMISSION, len(docs1))
+        print(f"创建收费记录1: 费用编号 FEE-{lc1.lc_number}-...")
+
         submission2_id = "SUB-LC2-20240420-DISCREPANT"
         presentation_date2 = date(2024, 4, 25)
 
@@ -320,6 +324,9 @@ def seed_data():
         print(f"创建审核记录2: 结论={conclusion2}, 不符点数量={len(discrepancies2)} (critical={critical2}, minor={minor2})")
         for d in discrepancies2:
             print(f"  - [{d['severity']}] {d['description']}")
+
+        crud.create_fee_record(db, lc2, audit2, FEE_TYPE_FIRST_SUBMISSION, len(docs2))
+        print(f"创建收费记录2: 费用编号 FEE-{lc2.lc_number}-...")
 
         db.commit()
         print("预置数据初始化完成！")
