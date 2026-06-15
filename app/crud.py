@@ -110,12 +110,10 @@ def delete_letter_of_credit(db: Session, lc_id: int) -> bool:
     return True
 
 
-def has_active_audit(db: Session, lc_id: int) -> bool:
-    active = db.query(models.AuditRecord).filter(
-        models.AuditRecord.lc_id == lc_id,
-        models.AuditRecord.resubmission_round == 0
-    ).first()
-    return active is not None
+def get_latest_audit_by_lc(db: Session, lc_id: int) -> Optional[models.AuditRecord]:
+    return db.query(models.AuditRecord).filter(
+        models.AuditRecord.lc_id == lc_id
+    ).order_by(models.AuditRecord.created_at.desc()).first()
 
 
 def submit_documents_and_audit(db: Session, submission: schemas.SubmissionSubmit):
@@ -129,14 +127,14 @@ def submit_documents_and_audit(db: Session, submission: schemas.SubmissionSubmit
     if existing_submission:
         raise ValueError(f"提交编号 {submission.submission_id} 已存在")
 
-    existing_audit = db.query(models.AuditRecord).filter(
-        models.AuditRecord.lc_id == lc.id
-    ).first()
-    if existing_audit:
-        raise ValueError(
-            f"信用证 {submission.lc_number} 已有一次交单记录 (提交编号: {existing_audit.submission_id})，"
-            f"同一份信用证同一时间只允许一次有效的交单在审核中"
-        )
+    latest_audit = get_latest_audit_by_lc(db, lc.id)
+    if latest_audit:
+        if latest_audit.conclusion == "discrepant" and latest_audit.resubmission_round < MAX_RESUBMISSION_ROUNDS:
+            raise ValueError(
+                f"信用证 {submission.lc_number} 已有一笔不符交单 (提交编号: {latest_audit.submission_id}) 等待修改，"
+                f"请使用修改重提接口 /api/submission/{latest_audit.submission_id}/resubmit 提交修改后的单据，"
+                f"或先完成当前交单的全部修改后再提交新交单"
+            )
 
     documents = []
     for doc_data in submission.documents:
@@ -393,6 +391,72 @@ def get_next_amendment_sequence(db: Session, lc_id: int) -> int:
     return (max_seq or 0) + 1
 
 
+def _get_field_actual_value(lc: models.LetterOfCredit, field_name: str) -> Any:
+    if field_name == "amount":
+        return lc.amount
+    elif field_name == "latest_shipment_date":
+        return lc.latest_shipment_date
+    elif field_name == "latest_presentation_date":
+        return lc.latest_presentation_date
+    elif field_name == "expiry_date":
+        return lc.expiry_date
+    elif field_name == "port_of_loading":
+        return lc.port_of_loading
+    elif field_name == "port_of_discharge":
+        return lc.port_of_discharge
+    elif field_name == "partial_shipment_allowed":
+        return lc.partial_shipment_allowed
+    elif field_name == "transshipment_allowed":
+        return lc.transshipment_allowed
+    elif field_name == "goods_description":
+        return lc.goods_description
+    elif field_name == "additional_terms":
+        return lc.additional_terms
+    return None
+
+
+def _values_match(field_name: str, submitted_old: Any, actual: Any) -> bool:
+    if submitted_old is None:
+        return False
+
+    if field_name in ["latest_shipment_date", "latest_presentation_date", "expiry_date"]:
+        if isinstance(submitted_old, str) and isinstance(actual, date):
+            try:
+                submitted_date = date.fromisoformat(submitted_old)
+                return submitted_date == actual
+            except (ValueError, TypeError):
+                return False
+        return submitted_old == actual
+
+    if field_name == "amount":
+        try:
+            return abs(float(submitted_old) - float(actual)) < 0.01
+        except (ValueError, TypeError):
+            return False
+
+    if field_name == "additional_terms":
+        if isinstance(submitted_old, list) and isinstance(actual, list):
+            return submitted_old == actual
+        return False
+
+    if field_name in ["partial_shipment_allowed", "transshipment_allowed"]:
+        return bool(submitted_old) == bool(actual)
+
+    return str(submitted_old).strip() == str(actual).strip()
+
+
+def _format_value(field_name: str, value: Any) -> str:
+    if field_name in ["latest_shipment_date", "latest_presentation_date", "expiry_date"]:
+        if isinstance(value, date):
+            return value.isoformat()
+        return str(value)
+    if field_name == "amount":
+        return f"{value:.2f}"
+    if field_name == "additional_terms":
+        return str(value)
+    return str(value)
+
+
 def validate_field_changes(field_changes: List[Dict[str, Any]], lc: models.LetterOfCredit) -> None:
     if len(field_changes) > MAX_FIELDS_PER_AMENDMENT:
         raise ValueError(f"每次修改最多允许修改 {MAX_FIELDS_PER_AMENDMENT} 个字段，当前提交了 {len(field_changes)} 个")
@@ -413,6 +477,17 @@ def validate_field_changes(field_changes: List[Dict[str, Any]], lc: models.Lette
 
         old_value = change.get("old_value")
         new_value = change.get("new_value")
+
+        if old_value is None:
+            raise ValueError(f"字段 '{field_name}' 必须提供旧值 old_value")
+
+        actual_value = _get_field_actual_value(lc, field_name)
+        if not _values_match(field_name, old_value, actual_value):
+            raise ValueError(
+                f"字段 '{field_name}' 的旧值与实际值不匹配。"
+                f"提交的旧值: {_format_value(field_name, old_value)}，"
+                f"实际值: {_format_value(field_name, actual_value)}"
+            )
 
         if field_name == "amount":
             if not isinstance(new_value, (int, float)):
