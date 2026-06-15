@@ -107,6 +107,9 @@ def create_app() -> FastAPI:
             "id": audit_record.id,
             "lc_id": audit_record.lc_id,
             "submission_id": audit_record.submission_id,
+            "original_submission_id": audit_record.original_submission_id,
+            "resubmission_round": audit_record.resubmission_round,
+            "modification_remark": audit_record.modification_remark,
             "conclusion": audit_record.conclusion,
             "total_discrepancies": audit_record.total_discrepancies,
             "critical_count": audit_record.critical_count,
@@ -116,6 +119,34 @@ def create_app() -> FastAPI:
             "created_at": audit_record.created_at,
             "lc": lc,
             "documents": documents
+        }
+
+    @app.post("/api/submission/{submission_id}/resubmit", response_model=schemas.AuditRecordResponse, tags=["修改重提"], status_code=status.HTTP_201_CREATED)
+    async def resubmit_submission(submission_id: str, resubmit: schemas.SubmissionResubmitRequest, db: Session = Depends(get_db)):
+        try:
+            audit_record = crud.resubmit_documents_and_audit(db, submission_id, resubmit)
+            return audit_record
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"修改重提审核失败: {str(e)}")
+
+    @app.get("/api/submission/{submission_id}/history", response_model=schemas.SubmissionHistoryResponse, tags=["修改重提"])
+    async def get_submission_history(submission_id: str, db: Session = Depends(get_db)):
+        records = crud.get_audit_records_by_original_submission(db, submission_id)
+        if not records:
+            raise HTTPException(status_code=404, detail=f"交单 {submission_id} 不存在")
+
+        lc = crud.get_letter_of_credit_by_id(db, records[0].lc_id)
+        latest_record = records[-1]
+
+        return {
+            "original_submission_id": submission_id,
+            "lc_number": lc.lc_number if lc else "",
+            "total_rounds": len(records),
+            "max_allowed_rounds": crud.MAX_RESUBMISSION_ROUNDS + 1,
+            "current_conclusion": latest_record.conclusion,
+            "history": records
         }
 
     @app.get("/api/audit/lc/{lc_number}", response_model=List[schemas.AuditRecordResponse], tags=["查询"])

@@ -91,7 +91,9 @@ def seed_data():
 
         docs1 = [
             models.Document(
-                lc_id=lc1.id, submission_id=submission1_id, document_type="invoice",
+                lc_id=lc1.id, submission_id=submission1_id,
+                original_submission_id=submission1_id, resubmission_round=0,
+                document_type="invoice",
                 original_copies_submitted=3, copy_copies_submitted=2,
                 content={
                     "invoice_number": "INV-2024-0308-001",
@@ -107,7 +109,9 @@ def seed_data():
                 }
             ),
             models.Document(
-                lc_id=lc1.id, submission_id=submission1_id, document_type="bill_of_lading",
+                lc_id=lc1.id, submission_id=submission1_id,
+                original_submission_id=submission1_id, resubmission_round=0,
+                document_type="bill_of_lading",
                 original_copies_submitted=3, copy_copies_submitted=3,
                 content={
                     "bl_number": "MAEU-2024-0305-8899",
@@ -129,7 +133,9 @@ def seed_data():
                 }
             ),
             models.Document(
-                lc_id=lc1.id, submission_id=submission1_id, document_type="packing_list",
+                lc_id=lc1.id, submission_id=submission1_id,
+                original_submission_id=submission1_id, resubmission_round=0,
+                document_type="packing_list",
                 original_copies_submitted=2, copy_copies_submitted=2,
                 content={
                     "packing_number": "PL-2024-0308-001",
@@ -142,7 +148,9 @@ def seed_data():
                 }
             ),
             models.Document(
-                lc_id=lc1.id, submission_id=submission1_id, document_type="insurance",
+                lc_id=lc1.id, submission_id=submission1_id,
+                original_submission_id=submission1_id, resubmission_round=0,
+                document_type="insurance",
                 original_copies_submitted=2, copy_copies_submitted=1,
                 content={
                     "policy_number": "PICC-2024-SEA-00088",
@@ -156,7 +164,9 @@ def seed_data():
                 }
             ),
             models.Document(
-                lc_id=lc1.id, submission_id=submission1_id, document_type="origin_cert",
+                lc_id=lc1.id, submission_id=submission1_id,
+                original_submission_id=submission1_id, resubmission_round=0,
+                document_type="origin_cert",
                 original_copies_submitted=1, copy_copies_submitted=1,
                 content={
                     "cert_number": "CCO-2024-0305-012",
@@ -179,7 +189,10 @@ def seed_data():
         minor1 = sum(1 for d in discrepancies1 if d["severity"] == "minor")
 
         audit1 = models.AuditRecord(
-            lc_id=lc1.id, submission_id=submission1_id, conclusion=conclusion1,
+            lc_id=lc1.id, submission_id=submission1_id,
+            original_submission_id=submission1_id, resubmission_round=0,
+            modification_remark=None,
+            conclusion=conclusion1,
             total_discrepancies=len(discrepancies1), critical_count=critical1,
             minor_count=minor1, presentation_date=presentation_date1
         )
@@ -195,7 +208,9 @@ def seed_data():
 
         docs2 = [
             models.Document(
-                lc_id=lc2.id, submission_id=submission2_id, document_type="invoice",
+                lc_id=lc2.id, submission_id=submission2_id,
+                original_submission_id=submission2_id, resubmission_round=0,
+                document_type="invoice",
                 original_copies_submitted=3, copy_copies_submitted=2,
                 content={
                     "invoice_number": "INV-2024-0420-007",
@@ -211,7 +226,9 @@ def seed_data():
                 }
             ),
             models.Document(
-                lc_id=lc2.id, submission_id=submission2_id, document_type="bill_of_lading",
+                lc_id=lc2.id, submission_id=submission2_id,
+                original_submission_id=submission2_id, resubmission_round=0,
+                document_type="bill_of_lading",
                 original_copies_submitted=1, copy_copies_submitted=2,
                 content={
                     "bl_number": "CAW-2024-0420-7788",
@@ -231,7 +248,9 @@ def seed_data():
                 }
             ),
             models.Document(
-                lc_id=lc2.id, submission_id=submission2_id, document_type="packing_list",
+                lc_id=lc2.id, submission_id=submission2_id,
+                original_submission_id=submission2_id, resubmission_round=0,
+                document_type="packing_list",
                 original_copies_submitted=2, copy_copies_submitted=2,
                 content={
                     "packing_number": "PL-2024-0420-007",
@@ -244,7 +263,9 @@ def seed_data():
                 }
             ),
             models.Document(
-                lc_id=lc2.id, submission_id=submission2_id, document_type="origin_cert",
+                lc_id=lc2.id, submission_id=submission2_id,
+                original_submission_id=submission2_id, resubmission_round=0,
+                document_type="origin_cert",
                 original_copies_submitted=1, copy_copies_submitted=1,
                 content={
                     "cert_number": "CCO-2024-0418-033",
@@ -256,7 +277,9 @@ def seed_data():
                 }
             ),
             models.Document(
-                lc_id=lc2.id, submission_id=submission2_id, document_type="inspection_cert",
+                lc_id=lc2.id, submission_id=submission2_id,
+                original_submission_id=submission2_id, resubmission_round=0,
+                document_type="inspection_cert",
                 original_copies_submitted=1, copy_copies_submitted=1,
                 content={
                     "cert_number": "SGS-2024-0419-088",
@@ -280,7 +303,10 @@ def seed_data():
         minor2 = sum(1 for d in discrepancies2 if d["severity"] == "minor")
 
         audit2 = models.AuditRecord(
-            lc_id=lc2.id, submission_id=submission2_id, conclusion=conclusion2,
+            lc_id=lc2.id, submission_id=submission2_id,
+            original_submission_id=submission2_id, resubmission_round=0,
+            modification_remark=None,
+            conclusion=conclusion2,
             total_discrepancies=len(discrepancies2), critical_count=critical2,
             minor_count=minor2, presentation_date=presentation_date2
         )

@@ -102,7 +102,8 @@ def delete_letter_of_credit(db: Session, lc_id: int) -> bool:
 
 def has_active_audit(db: Session, lc_id: int) -> bool:
     active = db.query(models.AuditRecord).filter(
-        models.AuditRecord.lc_id == lc_id
+        models.AuditRecord.lc_id == lc_id,
+        models.AuditRecord.resubmission_round == 0
     ).first()
     return active is not None
 
@@ -132,6 +133,8 @@ def submit_documents_and_audit(db: Session, submission: schemas.SubmissionSubmit
         db_doc = models.Document(
             lc_id=lc.id,
             submission_id=submission.submission_id,
+            original_submission_id=submission.submission_id,
+            resubmission_round=0,
             document_type=doc_data.document_type,
             original_copies_submitted=doc_data.original_copies_submitted,
             copy_copies_submitted=doc_data.copy_copies_submitted,
@@ -151,6 +154,9 @@ def submit_documents_and_audit(db: Session, submission: schemas.SubmissionSubmit
     audit_record = models.AuditRecord(
         lc_id=lc.id,
         submission_id=submission.submission_id,
+        original_submission_id=submission.submission_id,
+        resubmission_round=0,
+        modification_remark=None,
         conclusion=conclusion,
         total_discrepancies=len(discrepancies),
         critical_count=critical_count,
@@ -189,6 +195,102 @@ def get_audit_record_by_submission(db: Session, submission_id: str) -> Optional[
 
 def get_documents_by_submission(db: Session, submission_id: str) -> List[models.Document]:
     return db.query(models.Document).filter(models.Document.submission_id == submission_id).all()
+
+
+def get_audit_records_by_original_submission(db: Session, original_submission_id: str) -> List[models.AuditRecord]:
+    return db.query(models.AuditRecord).filter(
+        models.AuditRecord.original_submission_id == original_submission_id
+    ).order_by(models.AuditRecord.resubmission_round.asc()).all()
+
+
+def get_latest_audit_record_by_original_submission(db: Session, original_submission_id: str) -> Optional[models.AuditRecord]:
+    return db.query(models.AuditRecord).filter(
+        models.AuditRecord.original_submission_id == original_submission_id
+    ).order_by(models.AuditRecord.resubmission_round.desc()).first()
+
+
+MAX_RESUBMISSION_ROUNDS = 3
+
+
+def resubmit_documents_and_audit(db: Session, original_submission_id: str, resubmit: schemas.SubmissionResubmitRequest):
+    latest_record = get_latest_audit_record_by_original_submission(db, original_submission_id)
+    if not latest_record:
+        raise ValueError(f"交单编号 {original_submission_id} 不存在")
+
+    if latest_record.conclusion != "discrepant":
+        raise ValueError(
+            f"当前交单结论为 '{latest_record.conclusion}'，只有结论为 discrepant 的交单才允许修改重提"
+        )
+
+    if latest_record.resubmission_round >= MAX_RESUBMISSION_ROUNDS:
+        raise ValueError(
+            f"交单 {original_submission_id} 已修改重提 {MAX_RESUBMISSION_ROUNDS} 次，达到上限，不再允许修改"
+        )
+
+    new_round = latest_record.resubmission_round + 1
+
+    existing_new_submission = db.query(models.AuditRecord).filter(
+        models.AuditRecord.submission_id == resubmit.new_submission_id
+    ).first()
+    if existing_new_submission:
+        raise ValueError(f"提交编号 {resubmit.new_submission_id} 已存在")
+
+    lc = get_letter_of_credit_by_id(db, latest_record.lc_id)
+    if not lc:
+        raise ValueError("关联信用证不存在")
+
+    documents = []
+    for doc_data in resubmit.documents:
+        db_doc = models.Document(
+            lc_id=lc.id,
+            submission_id=resubmit.new_submission_id,
+            original_submission_id=original_submission_id,
+            resubmission_round=new_round,
+            document_type=doc_data.document_type,
+            original_copies_submitted=doc_data.original_copies_submitted,
+            copy_copies_submitted=doc_data.copy_copies_submitted,
+            content=doc_data.content
+        )
+        db.add(db_doc)
+        documents.append(db_doc)
+
+    db.flush()
+
+    engine = AuditEngine(lc, documents, resubmit.presentation_date)
+    conclusion, discrepancies = engine.run_audit()
+
+    critical_count = sum(1 for d in discrepancies if d["severity"] == "critical")
+    minor_count = sum(1 for d in discrepancies if d["severity"] == "minor")
+
+    audit_record = models.AuditRecord(
+        lc_id=lc.id,
+        submission_id=resubmit.new_submission_id,
+        original_submission_id=original_submission_id,
+        resubmission_round=new_round,
+        modification_remark=resubmit.modification_remark,
+        conclusion=conclusion,
+        total_discrepancies=len(discrepancies),
+        critical_count=critical_count,
+        minor_count=minor_count,
+        presentation_date=resubmit.presentation_date
+    )
+    db.add(audit_record)
+    db.flush()
+
+    for disc in discrepancies:
+        db_disc = models.Discrepancy(
+            audit_record_id=audit_record.id,
+            discrepancy_type=disc["discrepancy_type"],
+            severity=disc["severity"],
+            document_type=disc["document_type"],
+            description=disc["description"],
+            lc_clause_reference=disc["lc_clause_reference"]
+        )
+        db.add(db_disc)
+
+    db.commit()
+    db.refresh(audit_record)
+    return audit_record
 
 
 def get_discrepancy_statistics(db: Session) -> List[dict]:

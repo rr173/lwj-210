@@ -48,12 +48,13 @@ class Document(Base):
     id = Column(Integer, primary_key=True, index=True)
     lc_id = Column(Integer, ForeignKey("letter_of_credits.id"), nullable=False)
     submission_id = Column(String(100), index=True, nullable=False)
+    original_submission_id = Column(String(100), index=True, nullable=False)
+    resubmission_round = Column(Integer, default=0)
     document_type = Column(String(50), nullable=False)
     original_copies_submitted = Column(Integer, default=0)
     copy_copies_submitted = Column(Integer, default=0)
     content = Column(JSON, nullable=False)
     lc = relationship("LetterOfCredit", back_populates="documents")
-    audit_records = relationship("AuditRecord", back_populates="submission", foreign_keys="AuditRecord.submission_id", primaryjoin="Document.submission_id==AuditRecord.submission_id")
 
 
 class AuditRecord(Base):
@@ -62,6 +63,9 @@ class AuditRecord(Base):
     id = Column(Integer, primary_key=True, index=True)
     lc_id = Column(Integer, ForeignKey("letter_of_credits.id"), nullable=False)
     submission_id = Column(String(100), index=True, nullable=False)
+    original_submission_id = Column(String(100), index=True, nullable=False)
+    resubmission_round = Column(Integer, default=0)
+    modification_remark = Column(Text, nullable=True)
     conclusion = Column(String(50), nullable=False)
     total_discrepancies = Column(Integer, default=0)
     critical_count = Column(Integer, default=0)
@@ -69,7 +73,6 @@ class AuditRecord(Base):
     presentation_date = Column(Date, nullable=False)
     discrepancies = relationship("Discrepancy", back_populates="audit_record", cascade="all, delete-orphan")
     lc = relationship("LetterOfCredit", back_populates="audit_records")
-    submission = relationship("Document", back_populates="audit_records", foreign_keys=[submission_id], primaryjoin="Document.submission_id==AuditRecord.submission_id", overlaps="audit_records")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 

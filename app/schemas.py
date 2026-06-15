@@ -152,6 +152,9 @@ class AuditRecordResponse(BaseModel):
     id: int
     lc_id: int
     submission_id: str
+    original_submission_id: str
+    resubmission_round: int
+    modification_remark: Optional[str] = None
     conclusion: str
     total_discrepancies: int
     critical_count: int
@@ -168,6 +171,9 @@ class AuditRecordDetailResponse(BaseModel):
     id: int
     lc_id: int
     submission_id: str
+    original_submission_id: str
+    resubmission_round: int
+    modification_remark: Optional[str] = None
     conclusion: str
     total_discrepancies: int
     critical_count: int
@@ -189,3 +195,19 @@ class BeneficiaryDiscrepancyRateResponse(BaseModel):
     total_audits: int
     total_discrepancies: int
     discrepancy_rate: float
+
+
+class SubmissionResubmitRequest(BaseModel):
+    new_submission_id: str
+    modification_remark: str = Field(..., min_length=1, description="修改说明，必须说明本次修改了哪些内容")
+    presentation_date: date
+    documents: List[DocumentSubmit]
+
+
+class SubmissionHistoryResponse(BaseModel):
+    original_submission_id: str
+    lc_number: str
+    total_rounds: int
+    max_allowed_rounds: int
+    current_conclusion: str
+    history: List[AuditRecordResponse]
