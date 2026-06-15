@@ -190,85 +190,82 @@ def seed_data():
             db.add(models.Discrepancy(audit_record_id=audit1.id, **d))
         print(f"创建审核记录1: 结论={conclusion1}, 不符点数量={len(discrepancies1)}")
 
-        submission2_id = "SUB-LC1-20240315-DISCREPANT"
-        presentation_date2 = date(2024, 3, 20)
+        submission2_id = "SUB-LC2-20240420-DISCREPANT"
+        presentation_date2 = date(2024, 4, 25)
 
         docs2 = [
             models.Document(
-                lc_id=lc1.id, submission_id=submission2_id, document_type="invoice",
+                lc_id=lc2.id, submission_id=submission2_id, document_type="invoice",
                 original_copies_submitted=3, copy_copies_submitted=2,
                 content={
-                    "invoice_number": "INV-2024-0315-002",
-                    "invoice_date": "2024-03-12",
-                    "beneficiary": "上海国际贸易有限公司 shanghai international trading co., ltd.",
-                    "applicant": "ABC Importing Company S.A.",
-                    "currency": "USD",
+                    "invoice_number": "INV-2024-0420-007",
+                    "invoice_date": "2024-04-18",
+                    "beneficiary": "深圳电子科技有限公司 shenzhen electronics technology co., ltd.",
+                    "applicant": "XYZ Electronics Distributor Inc.",
+                    "currency": "EUR",
                     "goods": [
-                        {"name": "100% COTTON MEN'S T-SHIRTS", "specification": "WHITE COLOR, SIZE M/L/XL", "quantity": 5000, "unit": "PCS", "unit_price": 10.00}
+                        {"name": "WIRELESS BLUETOOTH EARPHONES", "specification": "MODEL X200", "quantity": 7000, "unit": "SETS", "unit_price": 5.00}
                     ],
-                    "goods_description": "100% COTTON MEN'S T-SHIRTS, WHITE COLOR, SIZE M/L/XL, 5000PCS AT USD10.00 PER PC CIF ROTTERDAM",
-                    "total_amount": 50000.00
+                    "goods_description": "WIRELESS BLUETOOTH EARPHONES MODEL X200, 7000SETS AT EUR5.00 PER SET CFR FRANKFURT",
+                    "total_amount": 35000.00
                 }
             ),
             models.Document(
-                lc_id=lc1.id, submission_id=submission2_id, document_type="bill_of_lading",
-                original_copies_submitted=3, copy_copies_submitted=3,
+                lc_id=lc2.id, submission_id=submission2_id, document_type="bill_of_lading",
+                original_copies_submitted=1, copy_copies_submitted=2,
                 content={
-                    "bl_number": "MAEU-2024-0315-9900",
-                    "shipper": "上海国际贸易有限公司 SHANGHAI INTERNATIONAL TRADING CO., LTD.",
-                    "consignee": "TO ORDER",
-                    "notify_party": "ABC IMPORTING COMPANY S.A. ROTTERDAM, NETHERLANDS",
-                    "vessel_voyage": "MAERSK EMDEN V.125E",
-                    "port_of_loading": "SHANGHAI PORT",
-                    "port_of_discharge": "ROTTERDAM PORT",
-                    "shipment_date": "2024-03-15",
-                    "packages": 5000,
-                    "package_unit": "PCS",
-                    "freight_term": "FREIGHT PREPAID",
+                    "bl_number": "CAW-2024-0420-7788",
+                    "shipper": "深圳电子科技有限公司 SHENZHEN ELECTRONICS TECHNOLOGY CO., LTD.",
+                    "consignee": "XYZ ELECTRONICS DISTRIBUTOR INC.",
+                    "notify_party": "XYZ ELECTRONICS DISTRIBUTOR INC. FRANKFURT, GERMANY",
+                    "flight_number": "CA1234 / LH5678",
+                    "port_of_loading": "SHENZHEN BAO'AN INTERNATIONAL AIRPORT",
+                    "port_of_discharge": "FRANKFURT AM MAIN AIRPORT",
+                    "shipment_date": "2024-04-20",
+                    "packages": 7000,
+                    "package_unit": "SETS",
+                    "freight_term": "FREIGHT COLLECT",
                     "clean": True,
-                    "transshipment": False,
-                    "endorsement": "BLANK ENDORSED",
-                    "remarks": "CLEAN ON BOARD",
-                    "goods_description": "100% COTTON MEN'S T-SHIRTS"
+                    "transshipment": True,
+                    "goods_description": "WIRELESS BLUETOOTH EARPHONES"
                 }
             ),
             models.Document(
-                lc_id=lc1.id, submission_id=submission2_id, document_type="packing_list",
+                lc_id=lc2.id, submission_id=submission2_id, document_type="packing_list",
                 original_copies_submitted=2, copy_copies_submitted=2,
                 content={
-                    "packing_number": "PL-2024-0315-002",
-                    "date": "2024-03-12",
-                    "total_packages": 250,
+                    "packing_number": "PL-2024-0420-007",
+                    "date": "2024-04-18",
+                    "total_packages": 350,
                     "package_type": "CTNS",
-                    "gross_weight": 5250.00,
-                    "net_weight": 5000.00,
-                    "goods_description": "COTTON MEN'S T-SHIRTS"
+                    "gross_weight": 1050.00,
+                    "net_weight": 980.00,
+                    "goods_description": "BLUETOOTH EARPHONES"
                 }
             ),
             models.Document(
-                lc_id=lc1.id, submission_id=submission2_id, document_type="insurance",
-                original_copies_submitted=2, copy_copies_submitted=1,
-                content={
-                    "policy_number": "PICC-2024-SEA-00099",
-                    "issue_date": "2024-03-14",
-                    "insured": "上海国际贸易有限公司 shanghai international trading co., ltd.",
-                    "insurance_amount": 55000.00,
-                    "currency": "USD",
-                    "risks": "COVERING ALL RISKS AND WAR RISKS AS PER CIC 1/1/1981",
-                    "voyage": "FROM SHANGHAI TO ROTTERDAM",
-                    "goods_description": "COTTON T-SHIRTS"
-                }
-            ),
-            models.Document(
-                lc_id=lc1.id, submission_id=submission2_id, document_type="origin_cert",
+                lc_id=lc2.id, submission_id=submission2_id, document_type="origin_cert",
                 original_copies_submitted=1, copy_copies_submitted=1,
                 content={
-                    "cert_number": "CCO-2024-0312-015",
-                    "issue_date": "2024-03-13",
-                    "issuing_authority": "CCPIT SHANGHAI",
+                    "cert_number": "CCO-2024-0418-033",
+                    "issue_date": "2024-04-19",
+                    "issuing_authority": "CCPIT SHENZHEN",
                     "origin_country": "CHINA",
-                    "goods_description": "MEN'S COTTON T-SHIRTS",
-                    "exporter": "SHANGHAI INTERNATIONAL TRADING CO., LTD."
+                    "goods_description": "WIRELESS EARPHONES",
+                    "exporter": "SHENZHEN ELECTRONICS TECHNOLOGY CO., LTD."
+                }
+            ),
+            models.Document(
+                lc_id=lc2.id, submission_id=submission2_id, document_type="inspection_cert",
+                original_copies_submitted=1, copy_copies_submitted=1,
+                content={
+                    "cert_number": "SGS-2024-0419-088",
+                    "issue_date": "2024-04-19",
+                    "issuing_authority": "SGS SHENZHEN",
+                    "inspection_date": "2024-04-18",
+                    "result": "PASSED",
+                    "goods_description": "WIRELESS BLUETOOTH EARPHONES MODEL X200",
+                    "quantity": 7000
                 }
             ),
         ]
@@ -277,13 +274,13 @@ def seed_data():
             db.add(d)
         db.flush()
 
-        engine2 = AuditEngine(lc1, docs2, presentation_date2)
+        engine2 = AuditEngine(lc2, docs2, presentation_date2)
         conclusion2, discrepancies2 = engine2.run_audit()
         critical2 = sum(1 for d in discrepancies2 if d["severity"] == "critical")
         minor2 = sum(1 for d in discrepancies2 if d["severity"] == "minor")
 
         audit2 = models.AuditRecord(
-            lc_id=lc1.id, submission_id=submission2_id, conclusion=conclusion2,
+            lc_id=lc2.id, submission_id=submission2_id, conclusion=conclusion2,
             total_discrepancies=len(discrepancies2), critical_count=critical2,
             minor_count=minor2, presentation_date=presentation_date2
         )

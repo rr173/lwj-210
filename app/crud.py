@@ -112,11 +112,20 @@ def submit_documents_and_audit(db: Session, submission: schemas.SubmissionSubmit
     if not lc:
         raise ValueError(f"信用证 {submission.lc_number} 不存在")
 
-    existing = db.query(models.AuditRecord).filter(
+    existing_submission = db.query(models.AuditRecord).filter(
         models.AuditRecord.submission_id == submission.submission_id
     ).first()
-    if existing:
+    if existing_submission:
         raise ValueError(f"提交编号 {submission.submission_id} 已存在")
+
+    existing_audit = db.query(models.AuditRecord).filter(
+        models.AuditRecord.lc_id == lc.id
+    ).first()
+    if existing_audit:
+        raise ValueError(
+            f"信用证 {submission.lc_number} 已有一次交单记录 (提交编号: {existing_audit.submission_id})，"
+            f"同一份信用证同一时间只允许一次有效的交单在审核中"
+        )
 
     documents = []
     for doc_data in submission.documents:
