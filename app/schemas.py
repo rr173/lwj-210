@@ -720,3 +720,4 @@ class SwiftParseResponse(BaseModel):
     fields: List[SwiftParsedField]
     created_resource_id: Optional[int] = None
     created_resource_type: Optional[str] = None
+    missing_fields: List[str] = []

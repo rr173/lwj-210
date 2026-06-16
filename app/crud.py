@@ -5,6 +5,7 @@ import copy
 
 from app import models, schemas
 from app.audit_engine import AuditEngine
+from app.swift import LC_REQUIRED_FIELDS_FOR_CREATE
 from app.models import (
     AMENDMENT_STATUS_PENDING,
     AMENDMENT_STATUS_ACCEPTED,
@@ -2536,13 +2537,14 @@ def parse_and_process_swift_message(db: Session, raw_message: str) -> Dict[str, 
 
     created_resource_id = None
     created_resource_type = None
+    missing_fields = []
 
     if message_type == models.SWIFT_MSG_TYPE_MT700:
-        lc_data = extract_lc_data_from_mt700(tags)
+        lc_data, missing_fields = extract_lc_data_from_mt700(tags)
         existing = get_letter_of_credit_by_number(db, lc_data.get("lc_number", ""))
         if existing:
             raise ValueError(f"信用证编号 {lc_data.get('lc_number')} 已存在，无法通过MT700报文自动创建")
-        lc = _create_lc_from_swift_mt700(db, lc_data)
+        lc = _create_lc_from_swift_mt700(db, lc_data, missing_fields)
         created_resource_id = lc.id
         created_resource_type = "letter_of_credit"
 
@@ -2562,20 +2564,35 @@ def parse_and_process_swift_message(db: Session, raw_message: str) -> Dict[str, 
         "fields": fields,
         "created_resource_id": created_resource_id,
         "created_resource_type": created_resource_type,
+        "missing_fields": missing_fields,
     }
 
 
-def _create_lc_from_swift_mt700(db: Session, lc_data: Dict[str, Any]) -> models.LetterOfCredit:
+def _create_lc_from_swift_mt700(
+    db: Session,
+    lc_data: Dict[str, Any],
+    missing_fields: List[str],
+) -> models.LetterOfCredit:
+    critical_missing = []
+    for field in LC_REQUIRED_FIELDS_FOR_CREATE:
+        if field not in lc_data:
+            critical_missing.append(field)
+    if critical_missing:
+        raise ValueError(
+            f"报文中缺少创建信用证的必要字段，无法自动创建: {', '.join(critical_missing)}。"
+            f"完整缺失字段列表: {', '.join(missing_fields)}"
+        )
+
     lc = models.LetterOfCredit(
-        lc_number=lc_data.get("lc_number", ""),
-        issuing_bank=lc_data.get("issuing_bank", "UNKNOWN"),
-        beneficiary_name=lc_data.get("beneficiary_name", ""),
-        applicant_name=lc_data.get("applicant_name", ""),
+        lc_number=lc_data["lc_number"],
+        issuing_bank=lc_data.get("issuing_bank", ""),
+        beneficiary_name=lc_data["beneficiary_name"],
+        applicant_name=lc_data["applicant_name"],
         currency=lc_data.get("currency", "USD"),
-        amount=lc_data.get("amount", 0),
-        latest_shipment_date=lc_data.get("latest_shipment_date", date.today()),
-        latest_presentation_date=lc_data.get("latest_presentation_date", date.today()),
-        expiry_date=lc_data.get("expiry_date", date.today()),
+        amount=lc_data["amount"],
+        latest_shipment_date=lc_data["latest_shipment_date"],
+        latest_presentation_date=lc_data["latest_presentation_date"],
+        expiry_date=lc_data["expiry_date"],
         transport_mode=lc_data.get("transport_mode", "海运"),
         port_of_loading=lc_data.get("port_of_loading", ""),
         port_of_discharge=lc_data.get("port_of_discharge", ""),
@@ -2588,12 +2605,17 @@ def _create_lc_from_swift_mt700(db: Session, lc_data: Dict[str, Any]) -> models.
     db.add(lc)
     db.flush()
 
-    db.add(models.DocumentRequirement(
-        lc_id=lc.id,
-        document_type="bill_of_lading",
-        original_copies=1,
-        copy_copies=0,
-    ))
+    doc_reqs = lc_data.get("document_requirements", [])
+    if doc_reqs:
+        for req in doc_reqs:
+            db.add(models.DocumentRequirement(
+                lc_id=lc.id,
+                document_type=req.get("document_type", ""),
+                original_copies=req.get("original_copies", 0),
+                copy_copies=req.get("copy_copies", 0),
+            ))
+    else:
+        missing_fields.append("document_requirements (标签:46A)")
 
     db.commit()
     db.refresh(lc)

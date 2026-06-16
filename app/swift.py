@@ -15,6 +15,7 @@ MT700_TAG_MAP = {
     "40A": "信用证类型",
     "20": "信用证编号",
     "31D": "到期日期地点",
+    "51D": "开证行",
     "50": "申请人",
     "59": "受益人",
     "32B": "金额币种",
@@ -23,17 +24,46 @@ MT700_TAG_MAP = {
     "44A": "装运港",
     "44B": "卸货港",
     "44C": "最迟装运日期",
+    "44D": "最迟交单日期",
     "45A": "货物描述",
+    "46A": "单据要求",
     "47A": "附加条款",
 }
 
-MT700_REQUIRED_TAGS = ["40A", "20", "31D", "50", "59", "32B"]
+MT700_REQUIRED_TAGS = ["40A", "20", "31D", "51D", "50", "59", "32B", "44D"]
 
 MT700_TAG_ORDER = [
-    "40A", "20", "31D", "50", "59", "32B",
-    "43P", "43T", "44A", "44B", "44C",
-    "45A", "47A",
+    "40A", "20", "31D", "51D", "50", "59", "32B",
+    "43P", "43T", "44A", "44B", "44C", "44D",
+    "45A", "46A", "47A",
 ]
+
+LC_REQUIRED_FIELDS_FOR_CREATE = [
+    "lc_number", "issuing_bank", "beneficiary_name", "applicant_name",
+    "currency", "amount", "latest_shipment_date", "latest_presentation_date",
+    "expiry_date", "transport_mode", "port_of_loading", "port_of_discharge",
+    "goods_description",
+]
+
+LC_FIELDS_FROM_MT700 = {
+    "20": "lc_number",
+    "51D": "issuing_bank",
+    "50": "applicant_name",
+    "59": "beneficiary_name",
+    "32B": "currency",
+    "32B_amount": "amount",
+    "31D": "expiry_date",
+    "44C": "latest_shipment_date",
+    "44D": "latest_presentation_date",
+    "44A": "port_of_loading",
+    "44B": "port_of_discharge",
+    "43P": "partial_shipment_allowed",
+    "43T": "transshipment_allowed",
+    "45A": "goods_description",
+    "46A": "document_requirements",
+    "47A": "additional_terms",
+    "40A": "transport_mode",
+}
 
 MT707_TAG_MAP = {
     "20": "信用证编号",
@@ -105,6 +135,7 @@ def generate_mt700(lc: LetterOfCredit) -> str:
     lines.append(f":20:{lc.lc_number}")
     expiry_place = lc.port_of_discharge if lc.port_of_discharge else ""
     lines.append(f":31D:{_format_date(lc.expiry_date)} {expiry_place}")
+    lines.append(f":51D:{lc.issuing_bank}")
     lines.append(f":50:{lc.applicant_name}")
     lines.append(f":59:{lc.beneficiary_name}")
     lines.append(f":32B:{_format_amount(lc.currency, lc.amount)}")
@@ -113,7 +144,14 @@ def generate_mt700(lc: LetterOfCredit) -> str:
     lines.append(f":44A:{lc.port_of_loading}")
     lines.append(f":44B:{lc.port_of_discharge}")
     lines.append(f":44C:{_format_date(lc.latest_shipment_date)}")
+    lines.append(f":44D:{_format_date(lc.latest_presentation_date)}")
     lines.append(f":45A:{lc.goods_description}")
+    doc_reqs = lc.document_requirements if hasattr(lc, 'document_requirements') else []
+    if doc_reqs:
+        doc_parts = []
+        for req in doc_reqs:
+            doc_parts.append(f"{req.document_type}/{req.original_copies}/{req.copy_copies}")
+        lines.append(f":46A:{','.join(doc_parts)}")
     if lc.additional_terms:
         terms = "//".join(lc.additional_terms) if isinstance(lc.additional_terms, list) else str(lc.additional_terms)
         lines.append(f":47A:{terms}")
@@ -308,53 +346,141 @@ def extract_lc_number_from_tags(message_type: str, tags: Dict[str, str]) -> Opti
     return None
 
 
-def extract_lc_data_from_mt700(tags: Dict[str, str]) -> Dict[str, Any]:
+def extract_lc_data_from_mt700(tags: Dict[str, str]) -> Tuple[Dict[str, Any], List[str]]:
     data = {}
+    missing_fields = []
+
     if "20" in tags:
         data["lc_number"] = tags["20"]
+    else:
+        missing_fields.append("lc_number (标签:20)")
+
+    if "51D" in tags:
+        data["issuing_bank"] = tags["51D"]
+    else:
+        missing_fields.append("issuing_bank (标签:51D)")
+
     if "50" in tags:
         data["applicant_name"] = tags["50"]
+    else:
+        missing_fields.append("applicant_name (标签:50)")
+
     if "59" in tags:
         data["beneficiary_name"] = tags["59"]
+    else:
+        missing_fields.append("beneficiary_name (标签:59)")
+
     if "32B" in tags:
         amount_str = tags["32B"]
         currency_match = re.match(r"^([A-Z]{3})", amount_str)
         if currency_match:
             data["currency"] = currency_match.group(1)
+        else:
+            missing_fields.append("currency (标签:32B中无币种)")
         amount_part = re.sub(r"^[A-Z]{3}", "", amount_str).replace(",", "").strip()
         if amount_part:
             try:
                 data["amount"] = float(amount_part)
             except ValueError:
-                pass
+                missing_fields.append("amount (标签:32B金额解析失败)")
+        else:
+            missing_fields.append("amount (标签:32B中无金额)")
+    else:
+        missing_fields.append("currency (标签:32B)")
+        missing_fields.append("amount (标签:32B)")
+
     if "31D" in tags:
         date_str = tags["31D"].strip().split()[0] if tags["31D"].strip() else ""
         if len(date_str) == 6:
             try:
                 data["expiry_date"] = _parse_swift_date(date_str)
             except ValueError:
-                pass
+                missing_fields.append("expiry_date (标签:31D日期解析失败)")
+        else:
+            missing_fields.append("expiry_date (标签:31D日期格式错误)")
+    else:
+        missing_fields.append("expiry_date (标签:31D)")
+
     if "44C" in tags:
         try:
             data["latest_shipment_date"] = _parse_swift_date(tags["44C"].strip())
         except ValueError:
-            pass
+            missing_fields.append("latest_shipment_date (标签:44C日期解析失败)")
+    else:
+        missing_fields.append("latest_shipment_date (标签:44C)")
+
+    if "44D" in tags:
+        try:
+            data["latest_presentation_date"] = _parse_swift_date(tags["44D"].strip())
+        except ValueError:
+            missing_fields.append("latest_presentation_date (标签:44D日期解析失败)")
+    else:
+        missing_fields.append("latest_presentation_date (标签:44D)")
+
     if "44A" in tags:
         data["port_of_loading"] = tags["44A"]
+    else:
+        missing_fields.append("port_of_loading (标签:44A)")
+
     if "44B" in tags:
         data["port_of_discharge"] = tags["44B"]
+    else:
+        missing_fields.append("port_of_discharge (标签:44B)")
+
     if "43P" in tags:
         data["partial_shipment_allowed"] = tags["43P"].strip().upper() == "ALLOWED"
+    else:
+        missing_fields.append("partial_shipment_allowed (标签:43P)")
+
     if "43T" in tags:
         data["transshipment_allowed"] = tags["43T"].strip().upper() == "ALLOWED"
+    else:
+        missing_fields.append("transshipment_allowed (标签:43T)")
+
     if "45A" in tags:
         data["goods_description"] = tags["45A"]
+    else:
+        missing_fields.append("goods_description (标签:45A)")
+
+    if "46A" in tags:
+        data["document_requirements"] = _parse_document_requirements(tags["46A"])
+    else:
+        missing_fields.append("document_requirements (标签:46A)")
+
     if "47A" in tags:
         terms = tags["47A"]
         data["additional_terms"] = [t.strip() for t in terms.split("//") if t.strip()]
+    else:
+        missing_fields.append("additional_terms (标签:47A)")
+
     if "40A" in tags:
         data["transport_mode"] = "海运"
-    return data
+    else:
+        missing_fields.append("transport_mode (标签:40A)")
+
+    return data, missing_fields
+
+
+def _parse_document_requirements(raw: str) -> List[Dict[str, Any]]:
+    result = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        parts = item.split("/")
+        if len(parts) >= 3:
+            result.append({
+                "document_type": parts[0].strip(),
+                "original_copies": int(parts[1].strip()) if parts[1].strip().isdigit() else 0,
+                "copy_copies": int(parts[2].strip()) if parts[2].strip().isdigit() else 0,
+            })
+        elif len(parts) == 1:
+            result.append({
+                "document_type": parts[0].strip(),
+                "original_copies": 0,
+                "copy_copies": 0,
+            })
+    return result
 
 
 def extract_amendment_data_from_mt707(tags: Dict[str, str]) -> Dict[str, Any]:
