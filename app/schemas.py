@@ -597,3 +597,75 @@ class LcTransferBackToBackSummaryResponse(BaseModel):
     lc_number: str
     transfers: List[TransferResponse]
     back_to_back_lcs: List[BackToBackLCResponse]
+
+
+class AlertType(str, Enum):
+    SHIPMENT = "shipment"
+    PRESENTATION = "presentation"
+    EXPIRY = "expiry"
+
+
+class AlertStatus(str, Enum):
+    ACTIVE = "active"
+    ACKNOWLEDGED = "acknowledged"
+    EXPIRED = "expired"
+
+
+class AlertResponse(BaseModel):
+    id: int
+    alert_number: str
+    lc_id: int
+    alert_type: str
+    trigger_date: date
+    target_date: date
+    remaining_days: int
+    status: str
+    acknowledged_at: Optional[datetime] = None
+    acknowledged_by: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AlertAcknowledgeRequest(BaseModel):
+    acknowledged_by: str
+
+
+class AlertStatsResponse(BaseModel):
+    alert_type: str
+    count: int
+
+
+class FreezeType(str, Enum):
+    SHIPMENT_EXPIRED = "shipment_expired"
+    PRESENTATION_EXPIRED = "presentation_expired"
+    EXPIRY_EXPIRED = "expiry_expired"
+    MANUAL = "manual"
+
+
+class FreezeStatus(str, Enum):
+    ACTIVE = "active"
+    RELEASED = "released"
+
+
+class FreezeRecordResponse(BaseModel):
+    id: int
+    freeze_number: str
+    lc_id: int
+    freeze_type: str
+    reason: str
+    status: str
+    frozen_at: datetime
+    released_at: Optional[datetime] = None
+    released_by: Optional[str] = None
+    release_reason: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class FreezeReleaseRequest(BaseModel):
+    released_by: str
+    release_reason: str

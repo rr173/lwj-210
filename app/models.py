@@ -102,6 +102,8 @@ class LetterOfCredit(Base):
     fee_records = relationship("FeeRecord", back_populates="lc", cascade="all, delete-orphan")
     transfers = relationship("LCTransfer", back_populates="lc", cascade="all, delete-orphan", order_by="LCTransfer.sequence_number")
     back_to_back_lcs = relationship("BackToBackLC", back_populates="original_lc", cascade="all, delete-orphan")
+    alerts = relationship("LCAlert", back_populates="lc", cascade="all, delete-orphan", order_by="LCAlert.created_at.desc()")
+    freeze_records = relationship("LCFreezeRecord", back_populates="lc", cascade="all, delete-orphan", order_by="LCFreezeRecord.created_at.desc()")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -342,4 +344,69 @@ class ReviewOpinion(Base):
     review_duration_seconds = Column(Integer, nullable=True)
     audit_record = relationship("AuditRecord", back_populates="review_opinions")
     reviewer = relationship("Reviewer", back_populates="review_opinions")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+ALERT_TYPE_SHIPMENT = "shipment"
+ALERT_TYPE_PRESENTATION = "presentation"
+ALERT_TYPE_EXPIRY = "expiry"
+VALID_ALERT_TYPES = [ALERT_TYPE_SHIPMENT, ALERT_TYPE_PRESENTATION, ALERT_TYPE_EXPIRY]
+
+ALERT_STATUS_ACTIVE = "active"
+ALERT_STATUS_ACKNOWLEDGED = "acknowledged"
+ALERT_STATUS_EXPIRED = "expired"
+VALID_ALERT_STATUSES = [ALERT_STATUS_ACTIVE, ALERT_STATUS_ACKNOWLEDGED, ALERT_STATUS_EXPIRED]
+
+ALERT_SHIPMENT_DAYS_BEFORE = 7
+ALERT_PRESENTATION_DAYS_BEFORE = 5
+ALERT_EXPIRY_DAYS_BEFORE = 10
+
+
+class LCAlert(Base):
+    __tablename__ = "lc_alerts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    alert_number = Column(String(150), unique=True, index=True, nullable=False)
+    lc_id = Column(Integer, ForeignKey("letter_of_credits.id"), nullable=False)
+    alert_type = Column(String(20), nullable=False)
+    trigger_date = Column(Date, nullable=False)
+    target_date = Column(Date, nullable=False)
+    remaining_days = Column(Integer, nullable=False)
+    status = Column(String(20), default=ALERT_STATUS_ACTIVE, nullable=False)
+    acknowledged_at = Column(DateTime, nullable=True)
+    acknowledged_by = Column(String(100), nullable=True)
+    lc = relationship("LetterOfCredit", back_populates="alerts")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+FREEZE_TYPE_SHIPMENT_EXPIRED = "shipment_expired"
+FREEZE_TYPE_PRESENTATION_EXPIRED = "presentation_expired"
+FREEZE_TYPE_EXPIRY_EXPIRED = "expiry_expired"
+FREEZE_TYPE_MANUAL = "manual"
+VALID_FREEZE_TYPES = [
+    FREEZE_TYPE_SHIPMENT_EXPIRED,
+    FREEZE_TYPE_PRESENTATION_EXPIRED,
+    FREEZE_TYPE_EXPIRY_EXPIRED,
+    FREEZE_TYPE_MANUAL
+]
+
+FREEZE_STATUS_ACTIVE = "active"
+FREEZE_STATUS_RELEASED = "released"
+VALID_FREEZE_STATUSES = [FREEZE_STATUS_ACTIVE, FREEZE_STATUS_RELEASED]
+
+
+class LCFreezeRecord(Base):
+    __tablename__ = "lc_freeze_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    freeze_number = Column(String(150), unique=True, index=True, nullable=False)
+    lc_id = Column(Integer, ForeignKey("letter_of_credits.id"), nullable=False)
+    freeze_type = Column(String(30), nullable=False)
+    reason = Column(Text, nullable=False)
+    status = Column(String(20), default=FREEZE_STATUS_ACTIVE, nullable=False)
+    frozen_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    released_at = Column(DateTime, nullable=True)
+    released_by = Column(String(100), nullable=True)
+    release_reason = Column(Text, nullable=True)
+    lc = relationship("LetterOfCredit", back_populates="freeze_records")
     created_at = Column(DateTime, default=datetime.utcnow)

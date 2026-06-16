@@ -294,6 +294,12 @@ def submit_documents_and_audit(db: Session, submission: schemas.SubmissionSubmit
     if not lc:
         raise ValueError(f"信用证 {submission.lc_number} 不存在")
 
+    check_and_process_expired_alerts(db)
+
+    freeze_reason = check_lc_frozen_for_submission(db, lc.id)
+    if freeze_reason:
+        raise ValueError(f"信用证已被冻结，无法提交新交单：{freeze_reason}")
+
     existing_submission = db.query(models.AuditRecord).filter(
         models.AuditRecord.submission_id == submission.submission_id
     ).first()
@@ -424,6 +430,12 @@ def resubmit_documents_and_audit(db: Session, original_submission_id: str, resub
     lc = get_letter_of_credit_by_id(db, latest_record.lc_id)
     if not lc:
         raise ValueError("关联信用证不存在")
+
+    check_and_process_expired_alerts(db)
+
+    freeze_reason = check_lc_frozen_for_resubmission(db, lc.id)
+    if freeze_reason:
+        raise ValueError(f"信用证已被冻结，无法修改重提：{freeze_reason}")
 
     documents = []
     for doc_data in resubmit.documents:
@@ -694,6 +706,12 @@ def create_amendment(db: Session, amendment_data: schemas.AmendmentCreate) -> mo
     lc = get_letter_of_credit_by_number(db, amendment_data.lc_number)
     if not lc:
         raise ValueError(f"信用证 {amendment_data.lc_number} 不存在")
+
+    check_and_process_expired_alerts(db)
+
+    freeze_reason = check_lc_frozen_for_amendment(db, lc.id)
+    if freeze_reason:
+        raise ValueError(f"信用证已被冻结，无法发起修改：{freeze_reason}")
 
     check_and_expire_amendments(db, lc.id)
 
@@ -1868,3 +1886,408 @@ def get_lc_transfer_and_back_to_back_summary(db: Session, lc_number: str) -> Dic
         "transfers": transfers,
         "back_to_back_lcs": btb_lcs,
     }
+
+
+def generate_alert_number(db: Session, lc_number: str, alert_type: str) -> str:
+    from sqlalchemy import func
+    date_str = date.today().strftime("%Y%m%d")
+    prefix = f"ALT-{lc_number}-{alert_type}-{date_str}-"
+    count = db.query(func.count(models.LCAlert.id)).filter(
+        models.LCAlert.alert_number.like(f"{prefix}%")
+    ).scalar() or 0
+    return f"{prefix}{count + 1:04d}"
+
+
+def generate_freeze_number(db: Session, lc_number: str, freeze_type: str) -> str:
+    from sqlalchemy import func
+    date_str = date.today().strftime("%Y%m%d")
+    prefix = f"FRZ-{lc_number}-{freeze_type}-{date_str}-"
+    count = db.query(func.count(models.LCFreezeRecord.id)).filter(
+        models.LCFreezeRecord.freeze_number.like(f"{prefix}%")
+    ).scalar() or 0
+    return f"{prefix}{count + 1:04d}"
+
+
+def has_active_alert(db: Session, lc_id: int, alert_type: str) -> bool:
+    existing = db.query(models.LCAlert).filter(
+        models.LCAlert.lc_id == lc_id,
+        models.LCAlert.alert_type == alert_type,
+        models.LCAlert.status.in_([models.ALERT_STATUS_ACTIVE, models.ALERT_STATUS_ACKNOWLEDGED])
+    ).first()
+    return existing is not None
+
+
+def create_alert_if_needed(
+    db: Session,
+    lc: models.LetterOfCredit,
+    alert_type: str,
+    target_date: date,
+    days_before: int,
+    today: date
+) -> Optional[models.LCAlert]:
+    remaining_days = (target_date - today).days
+
+    if remaining_days > days_before:
+        return None
+
+    if has_active_alert(db, lc.id, alert_type):
+        return None
+
+    existing_expired = db.query(models.LCAlert).filter(
+        models.LCAlert.lc_id == lc.id,
+        models.LCAlert.alert_type == alert_type,
+        models.LCAlert.status == models.ALERT_STATUS_EXPIRED
+    ).first()
+    if existing_expired:
+        return None
+
+    alert_number = generate_alert_number(db, lc.lc_number, alert_type)
+
+    if remaining_days < 0:
+        status = models.ALERT_STATUS_EXPIRED
+    else:
+        status = models.ALERT_STATUS_ACTIVE
+
+    alert = models.LCAlert(
+        alert_number=alert_number,
+        lc_id=lc.id,
+        alert_type=alert_type,
+        trigger_date=today,
+        target_date=target_date,
+        remaining_days=remaining_days,
+        status=status
+    )
+
+    db.add(alert)
+    db.flush()
+
+    if status == models.ALERT_STATUS_EXPIRED:
+        freeze_type_map = {
+            models.ALERT_TYPE_SHIPMENT: models.FREEZE_TYPE_SHIPMENT_EXPIRED,
+            models.ALERT_TYPE_PRESENTATION: models.FREEZE_TYPE_PRESENTATION_EXPIRED,
+            models.ALERT_TYPE_EXPIRY: models.FREEZE_TYPE_EXPIRY_EXPIRED,
+        }
+        reason_map = {
+            models.ALERT_TYPE_SHIPMENT: f"最迟装运日 {target_date} 已过期，禁止新交单提交",
+            models.ALERT_TYPE_PRESENTATION: f"最迟交单日 {target_date} 已过期，禁止修改重提",
+            models.ALERT_TYPE_EXPIRY: f"信用证到期日 {target_date} 已过期，信用证完全冻结",
+        }
+        freeze_type = freeze_type_map.get(alert_type)
+        reason = reason_map.get(alert_type, "")
+        if freeze_type and not has_active_freeze(db, lc.id, freeze_type):
+            create_freeze_record(db, lc, freeze_type, reason)
+
+    return alert
+
+
+def scan_and_generate_alerts(db: Session) -> Dict[str, Any]:
+    today = date.today()
+    all_lcs = get_all_letter_of_credits(db)
+
+    shipment_alerts = []
+    presentation_alerts = []
+    expiry_alerts = []
+
+    for lc in all_lcs:
+        shipment_alert = create_alert_if_needed(
+            db, lc,
+            models.ALERT_TYPE_SHIPMENT,
+            lc.latest_shipment_date,
+            models.ALERT_SHIPMENT_DAYS_BEFORE,
+            today
+        )
+        if shipment_alert:
+            shipment_alerts.append(shipment_alert)
+
+        presentation_alert = create_alert_if_needed(
+            db, lc,
+            models.ALERT_TYPE_PRESENTATION,
+            lc.latest_presentation_date,
+            models.ALERT_PRESENTATION_DAYS_BEFORE,
+            today
+        )
+        if presentation_alert:
+            presentation_alerts.append(presentation_alert)
+
+        expiry_alert = create_alert_if_needed(
+            db, lc,
+            models.ALERT_TYPE_EXPIRY,
+            lc.expiry_date,
+            models.ALERT_EXPIRY_DAYS_BEFORE,
+            today
+        )
+        if expiry_alert:
+            expiry_alerts.append(expiry_alert)
+
+    db.commit()
+
+    return {
+        "total": len(shipment_alerts) + len(presentation_alerts) + len(expiry_alerts),
+        "shipment_alerts": len(shipment_alerts),
+        "presentation_alerts": len(presentation_alerts),
+        "expiry_alerts": len(expiry_alerts)
+    }
+
+
+def get_alerts_by_lc(db: Session, lc_number: str) -> List[models.LCAlert]:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        raise ValueError(f"信用证 {lc_number} 不存在")
+    return db.query(models.LCAlert).filter(
+        models.LCAlert.lc_id == lc.id
+    ).order_by(models.LCAlert.created_at.desc()).all()
+
+
+def get_active_alerts(db: Session, skip: int = 0, limit: int = 100) -> List[models.LCAlert]:
+    return db.query(models.LCAlert).filter(
+        models.LCAlert.status == models.ALERT_STATUS_ACTIVE
+    ).order_by(models.LCAlert.target_date.asc()).offset(skip).limit(limit).all()
+
+
+def get_alert_by_number(db: Session, alert_number: str) -> Optional[models.LCAlert]:
+    return db.query(models.LCAlert).filter(
+        models.LCAlert.alert_number == alert_number
+    ).first()
+
+
+def acknowledge_alert(db: Session, alert_number: str, acknowledged_by: str) -> models.LCAlert:
+    alert = get_alert_by_number(db, alert_number)
+    if not alert:
+        raise ValueError(f"预警记录 {alert_number} 不存在")
+
+    if alert.status == models.ALERT_STATUS_EXPIRED:
+        raise ValueError(f"预警 {alert_number} 已过期，无法确认")
+
+    if alert.status == models.ALERT_STATUS_ACKNOWLEDGED:
+        return alert
+
+    alert.status = models.ALERT_STATUS_ACKNOWLEDGED
+    alert.acknowledged_at = datetime.utcnow()
+    alert.acknowledged_by = acknowledged_by
+
+    db.commit()
+    db.refresh(alert)
+    return alert
+
+
+def get_alert_statistics(db: Session) -> List[Dict[str, Any]]:
+    from sqlalchemy import func
+    results = db.query(
+        models.LCAlert.alert_type,
+        func.count(models.LCAlert.id).label("count")
+    ).filter(
+        models.LCAlert.status == models.ALERT_STATUS_ACTIVE
+    ).group_by(models.LCAlert.alert_type).all()
+
+    stats = []
+    type_map = {
+        models.ALERT_TYPE_SHIPMENT: "装运预警",
+        models.ALERT_TYPE_PRESENTATION: "交单预警",
+        models.ALERT_TYPE_EXPIRY: "到期预警"
+    }
+    for alert_type in models.VALID_ALERT_TYPES:
+        count = 0
+        for r in results:
+            if r[0] == alert_type:
+                count = r[1]
+                break
+        stats.append({
+            "alert_type": alert_type,
+            "alert_type_name": type_map.get(alert_type, alert_type),
+            "count": count
+        })
+    return stats
+
+
+def has_active_freeze(db: Session, lc_id: int, freeze_type: str = None) -> bool:
+    query = db.query(models.LCFreezeRecord).filter(
+        models.LCFreezeRecord.lc_id == lc_id,
+        models.LCFreezeRecord.status == models.FREEZE_STATUS_ACTIVE
+    )
+    if freeze_type:
+        query = query.filter(models.LCFreezeRecord.freeze_type == freeze_type)
+    return query.first() is not None
+
+
+def get_active_freeze(db: Session, lc_id: int) -> Optional[models.LCFreezeRecord]:
+    return db.query(models.LCFreezeRecord).filter(
+        models.LCFreezeRecord.lc_id == lc_id,
+        models.LCFreezeRecord.status == models.FREEZE_STATUS_ACTIVE
+    ).order_by(models.LCFreezeRecord.frozen_at.desc()).first()
+
+
+def create_freeze_record(
+    db: Session,
+    lc: models.LetterOfCredit,
+    freeze_type: str,
+    reason: str
+) -> models.LCFreezeRecord:
+    if has_active_freeze(db, lc.id, freeze_type):
+        existing = db.query(models.LCFreezeRecord).filter(
+            models.LCFreezeRecord.lc_id == lc.id,
+            models.LCFreezeRecord.freeze_type == freeze_type,
+            models.LCFreezeRecord.status == models.FREEZE_STATUS_ACTIVE
+        ).first()
+        return existing
+
+    freeze_number = generate_freeze_number(db, lc.lc_number, freeze_type)
+
+    freeze_record = models.LCFreezeRecord(
+        freeze_number=freeze_number,
+        lc_id=lc.id,
+        freeze_type=freeze_type,
+        reason=reason,
+        status=models.FREEZE_STATUS_ACTIVE,
+        frozen_at=datetime.utcnow()
+    )
+
+    db.add(freeze_record)
+    db.flush()
+    return freeze_record
+
+
+def check_and_process_expired_alerts(db: Session) -> Dict[str, Any]:
+    today = date.today()
+    active_alerts = db.query(models.LCAlert).filter(
+        models.LCAlert.status.in_([models.ALERT_STATUS_ACTIVE, models.ALERT_STATUS_ACKNOWLEDGED])
+    ).all()
+
+    expired_count = 0
+    freeze_count = 0
+
+    for alert in active_alerts:
+        if alert.target_date < today and alert.status != models.ALERT_STATUS_EXPIRED:
+            alert.status = models.ALERT_STATUS_EXPIRED
+            expired_count += 1
+
+            lc = get_letter_of_credit_by_id(db, alert.lc_id)
+            if not lc:
+                continue
+
+            if alert.alert_type == models.ALERT_TYPE_SHIPMENT:
+                if not has_active_freeze(db, lc.id, models.FREEZE_TYPE_SHIPMENT_EXPIRED):
+                    create_freeze_record(
+                        db, lc,
+                        models.FREEZE_TYPE_SHIPMENT_EXPIRED,
+                        f"最迟装运日 {alert.target_date} 已过期，禁止新交单提交"
+                    )
+                    freeze_count += 1
+
+            elif alert.alert_type == models.ALERT_TYPE_PRESENTATION:
+                if not has_active_freeze(db, lc.id, models.FREEZE_TYPE_PRESENTATION_EXPIRED):
+                    create_freeze_record(
+                        db, lc,
+                        models.FREEZE_TYPE_PRESENTATION_EXPIRED,
+                        f"最迟交单日 {alert.target_date} 已过期，禁止修改重提"
+                    )
+                    freeze_count += 1
+
+            elif alert.alert_type == models.ALERT_TYPE_EXPIRY:
+                if not has_active_freeze(db, lc.id, models.FREEZE_TYPE_EXPIRY_EXPIRED):
+                    create_freeze_record(
+                        db, lc,
+                        models.FREEZE_TYPE_EXPIRY_EXPIRED,
+                        f"信用证到期日 {alert.target_date} 已过期，信用证完全冻结"
+                    )
+                    freeze_count += 1
+
+    if expired_count > 0 or freeze_count > 0:
+        db.commit()
+
+    return {
+        "expired_alerts": expired_count,
+        "new_freezes": freeze_count
+    }
+
+
+def get_all_active_freezes_by_lc_id(db: Session, lc_id: int) -> List[models.LCFreezeRecord]:
+    return db.query(models.LCFreezeRecord).filter(
+        models.LCFreezeRecord.lc_id == lc_id,
+        models.LCFreezeRecord.status == models.FREEZE_STATUS_ACTIVE
+    ).all()
+
+
+def check_lc_frozen_for_submission(db: Session, lc_id: int) -> Optional[str]:
+    active_freezes = get_all_active_freezes_by_lc_id(db, lc_id)
+    if not active_freezes:
+        return None
+
+    for freeze in active_freezes:
+        if freeze.freeze_type in [
+            models.FREEZE_TYPE_EXPIRY_EXPIRED,
+            models.FREEZE_TYPE_SHIPMENT_EXPIRED
+        ]:
+            return freeze.reason
+
+    return None
+
+
+def check_lc_frozen_for_resubmission(db: Session, lc_id: int) -> Optional[str]:
+    active_freezes = get_all_active_freezes_by_lc_id(db, lc_id)
+    if not active_freezes:
+        return None
+
+    for freeze in active_freezes:
+        if freeze.freeze_type in [
+            models.FREEZE_TYPE_EXPIRY_EXPIRED,
+            models.FREEZE_TYPE_PRESENTATION_EXPIRED
+        ]:
+            return freeze.reason
+
+    return None
+
+
+def check_lc_frozen_for_amendment(db: Session, lc_id: int) -> Optional[str]:
+    active_freezes = get_all_active_freezes_by_lc_id(db, lc_id)
+    if not active_freezes:
+        return None
+
+    for freeze in active_freezes:
+        if freeze.freeze_type == models.FREEZE_TYPE_EXPIRY_EXPIRED:
+            return freeze.reason
+
+    return None
+
+
+def get_freeze_records_by_lc(db: Session, lc_number: str) -> List[models.LCFreezeRecord]:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        raise ValueError(f"信用证 {lc_number} 不存在")
+    return db.query(models.LCFreezeRecord).filter(
+        models.LCFreezeRecord.lc_id == lc.id
+    ).order_by(models.LCFreezeRecord.created_at.desc()).all()
+
+
+def get_freeze_record_by_number(db: Session, freeze_number: str) -> Optional[models.LCFreezeRecord]:
+    return db.query(models.LCFreezeRecord).filter(
+        models.LCFreezeRecord.freeze_number == freeze_number
+    ).first()
+
+
+def release_freeze(
+    db: Session,
+    freeze_number: str,
+    released_by: str,
+    release_reason: str
+) -> models.LCFreezeRecord:
+    freeze_record = get_freeze_record_by_number(db, freeze_number)
+    if not freeze_record:
+        raise ValueError(f"冻结记录 {freeze_number} 不存在")
+
+    if freeze_record.status == models.FREEZE_STATUS_RELEASED:
+        raise ValueError(f"冻结记录 {freeze_number} 已被解除")
+
+    freeze_record.status = models.FREEZE_STATUS_RELEASED
+    freeze_record.released_at = datetime.utcnow()
+    freeze_record.released_by = released_by
+    freeze_record.release_reason = release_reason
+
+    db.commit()
+    db.refresh(freeze_record)
+    return freeze_record
+
+
+def get_all_active_freezes(db: Session, skip: int = 0, limit: int = 100) -> List[models.LCFreezeRecord]:
+    return db.query(models.LCFreezeRecord).filter(
+        models.LCFreezeRecord.status == models.FREEZE_STATUS_ACTIVE
+    ).order_by(models.LCFreezeRecord.frozen_at.desc()).offset(skip).limit(limit).all()

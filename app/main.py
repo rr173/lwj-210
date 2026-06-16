@@ -495,6 +495,98 @@ def create_app() -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"查询转让与背对背摘要失败: {str(e)}")
 
+    @app.post("/api/alerts/scan", tags=["预警管理"])
+    async def scan_and_generate_alerts(db: Session = Depends(get_db)):
+        try:
+            result = crud.scan_and_generate_alerts(db)
+            return result
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"预警扫描失败: {str(e)}")
+
+    @app.post("/api/alerts/expire-check", tags=["预警管理"])
+    async def expire_check(db: Session = Depends(get_db)):
+        try:
+            result = crud.check_and_process_expired_alerts(db)
+            return result
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"逾期检查失败: {str(e)}")
+
+    @app.get("/api/alerts/lc/{lc_number}", response_model=List[schemas.AlertResponse], tags=["预警管理"])
+    async def get_alerts_by_lc(lc_number: str, db: Session = Depends(get_db)):
+        try:
+            crud.check_and_process_expired_alerts(db)
+            return crud.get_alerts_by_lc(db, lc_number)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询预警失败: {str(e)}")
+
+    @app.get("/api/alerts/active", response_model=List[schemas.AlertResponse], tags=["预警管理"])
+    async def get_active_alerts(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+        try:
+            crud.check_and_process_expired_alerts(db)
+            return crud.get_active_alerts(db, skip, limit)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询活跃预警失败: {str(e)}")
+
+    @app.get("/api/alerts/{alert_number}", response_model=schemas.AlertResponse, tags=["预警管理"])
+    async def get_alert_detail(alert_number: str, db: Session = Depends(get_db)):
+        alert = crud.get_alert_by_number(db, alert_number)
+        if not alert:
+            raise HTTPException(status_code=404, detail=f"预警记录 {alert_number} 不存在")
+        crud.check_and_process_expired_alerts(db)
+        db.refresh(alert)
+        return alert
+
+    @app.post("/api/alerts/{alert_number}/acknowledge", response_model=schemas.AlertResponse, tags=["预警管理"])
+    async def acknowledge_alert(alert_number: str, ack_req: schemas.AlertAcknowledgeRequest, db: Session = Depends(get_db)):
+        try:
+            return crud.acknowledge_alert(db, alert_number, ack_req.acknowledged_by)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"确认预警失败: {str(e)}")
+
+    @app.get("/api/alerts/stats/by-type", response_model=List[schemas.AlertStatsResponse], tags=["查询统计"])
+    async def get_alert_statistics(db: Session = Depends(get_db)):
+        try:
+            crud.check_and_process_expired_alerts(db)
+            return crud.get_alert_statistics(db)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询预警统计失败: {str(e)}")
+
+    @app.get("/api/freezes/lc/{lc_number}", response_model=List[schemas.FreezeRecordResponse], tags=["冻结管理"])
+    async def get_freeze_records_by_lc(lc_number: str, db: Session = Depends(get_db)):
+        try:
+            return crud.get_freeze_records_by_lc(db, lc_number)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询冻结记录失败: {str(e)}")
+
+    @app.get("/api/freezes/active", response_model=List[schemas.FreezeRecordResponse], tags=["冻结管理"])
+    async def get_active_freezes(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+        try:
+            return crud.get_all_active_freezes(db, skip, limit)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询活跃冻结失败: {str(e)}")
+
+    @app.get("/api/freezes/{freeze_number}", response_model=schemas.FreezeRecordResponse, tags=["冻结管理"])
+    async def get_freeze_detail(freeze_number: str, db: Session = Depends(get_db)):
+        freeze = crud.get_freeze_record_by_number(db, freeze_number)
+        if not freeze:
+            raise HTTPException(status_code=404, detail=f"冻结记录 {freeze_number} 不存在")
+        return freeze
+
+    @app.post("/api/freezes/{freeze_number}/release", response_model=schemas.FreezeRecordResponse, tags=["冻结管理"])
+    async def release_freeze(freeze_number: str, release_req: schemas.FreezeReleaseRequest, db: Session = Depends(get_db)):
+        try:
+            return crud.release_freeze(db, freeze_number, release_req.released_by, release_req.release_reason)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"解除冻结失败: {str(e)}")
+
     return app
 
 
