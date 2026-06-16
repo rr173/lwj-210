@@ -849,6 +849,82 @@ def re_audit_pending_submissions(db: Session, lc_id: int) -> List[models.AuditRe
     return re_audited
 
 
+def handle_amendment_alert_and_freeze_cleanup(
+    db: Session,
+    lc_id: int,
+    field_changes: List[Dict[str, Any]],
+    new_lc_values: models.LetterOfCredit
+) -> Dict[str, int]:
+    today = date.today()
+
+    date_field_alert_map = {
+        "latest_shipment_date": (models.ALERT_TYPE_SHIPMENT, models.FREEZE_TYPE_SHIPMENT_EXPIRED),
+        "latest_presentation_date": (models.ALERT_TYPE_PRESENTATION, models.FREEZE_TYPE_PRESENTATION_EXPIRED),
+        "expiry_date": (models.ALERT_TYPE_EXPIRY, models.FREEZE_TYPE_EXPIRY_EXPIRED),
+    }
+
+    new_date_value_map = {
+        "latest_shipment_date": new_lc_values.latest_shipment_date,
+        "latest_presentation_date": new_lc_values.latest_presentation_date,
+        "expiry_date": new_lc_values.expiry_date,
+    }
+
+    alerts_removed = 0
+    freezes_released = 0
+
+    for change in field_changes:
+        field_name = change.get("field_name")
+        if field_name not in date_field_alert_map:
+            continue
+
+        alert_type, freeze_type = date_field_alert_map[field_name]
+        new_date = new_date_value_map.get(field_name)
+        if new_date is None:
+            continue
+
+        alerts_to_remove = db.query(models.LCAlert).filter(
+            models.LCAlert.lc_id == lc_id,
+            models.LCAlert.alert_type == alert_type,
+            models.LCAlert.status.in_([models.ALERT_STATUS_ACTIVE, models.ALERT_STATUS_ACKNOWLEDGED])
+        ).all()
+
+        for alert in alerts_to_remove:
+            db.delete(alert)
+            alerts_removed += 1
+
+        expired_alerts_to_remove = db.query(models.LCAlert).filter(
+            models.LCAlert.lc_id == lc_id,
+            models.LCAlert.alert_type == alert_type,
+            models.LCAlert.status == models.ALERT_STATUS_EXPIRED
+        ).all()
+
+        for alert in expired_alerts_to_remove:
+            db.delete(alert)
+            alerts_removed += 1
+
+        if new_date >= today:
+            freezes_to_release = db.query(models.LCFreezeRecord).filter(
+                models.LCFreezeRecord.lc_id == lc_id,
+                models.LCFreezeRecord.freeze_type == freeze_type,
+                models.LCFreezeRecord.status == models.FREEZE_STATUS_ACTIVE
+            ).all()
+
+            for freeze in freezes_to_release:
+                freeze.status = models.FREEZE_STATUS_RELEASED
+                freeze.released_at = datetime.utcnow()
+                freeze.released_by = "system"
+                freeze.release_reason = f"信用证修改已更新 {field_name} 为 {new_date}，自动解除冻结"
+                freezes_released += 1
+
+    if alerts_removed > 0 or freezes_released > 0:
+        db.flush()
+
+    return {
+        "alerts_removed": alerts_removed,
+        "freezes_released": freezes_released
+    }
+
+
 def accept_amendment(db: Session, amendment_number: str) -> models.LCAmendment:
     amendment = get_amendment_by_number(db, amendment_number)
     if not amendment:
@@ -869,6 +945,10 @@ def accept_amendment(db: Session, amendment_number: str) -> models.LCAmendment:
     apply_amendment_to_lc(db, lc, amendment.field_changes)
 
     check_back_to_back_conflicts(db, amendment.lc_id, amendment.field_changes)
+
+    cleanup_result = handle_amendment_alert_and_freeze_cleanup(
+        db, amendment.lc_id, amendment.field_changes, lc
+    )
 
     snapshot_after = lc_to_snapshot_dict(lc)
     amendment.snapshot_after = snapshot_after
