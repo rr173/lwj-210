@@ -395,6 +395,32 @@ FREEZE_STATUS_RELEASED = "released"
 VALID_FREEZE_STATUSES = [FREEZE_STATUS_ACTIVE, FREEZE_STATUS_RELEASED]
 
 
+SWIFT_MSG_TYPE_MT700 = "MT700"
+SWIFT_MSG_TYPE_MT707 = "MT707"
+SWIFT_MSG_TYPE_MT799 = "MT799"
+VALID_SWIFT_MSG_TYPES = [SWIFT_MSG_TYPE_MT700, SWIFT_MSG_TYPE_MT707, SWIFT_MSG_TYPE_MT799]
+
+SWIFT_SEND_STATUS_PENDING = "pending"
+SWIFT_SEND_STATUS_SENT = "sent"
+SWIFT_SEND_STATUS_FAILED = "failed"
+VALID_SWIFT_SEND_STATUSES = [SWIFT_SEND_STATUS_PENDING, SWIFT_SEND_STATUS_SENT, SWIFT_SEND_STATUS_FAILED]
+
+
+class SwiftMessageQueue(Base):
+    __tablename__ = "swift_message_queue"
+
+    id = Column(Integer, primary_key=True, index=True)
+    message_number = Column(String(150), unique=True, index=True, nullable=False)
+    message_type = Column(String(10), nullable=False)
+    lc_number = Column(String(100), index=True, nullable=False)
+    lc_id = Column(Integer, ForeignKey("letter_of_credits.id"), nullable=True)
+    raw_message = Column(Text, nullable=False)
+    status = Column(String(20), default=SWIFT_SEND_STATUS_PENDING, nullable=False)
+    sent_at = Column(DateTime, nullable=True)
+    lc = relationship("LetterOfCredit")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class LCFreezeRecord(Base):
     __tablename__ = "lc_freeze_records"
 

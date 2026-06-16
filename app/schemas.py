@@ -669,3 +669,54 @@ class FreezeRecordResponse(BaseModel):
 class FreezeReleaseRequest(BaseModel):
     released_by: str
     release_reason: str
+
+
+class SwiftMessageType(str, Enum):
+    MT700 = "MT700"
+    MT707 = "MT707"
+    MT799 = "MT799"
+
+
+class SwiftSendStatus(str, Enum):
+    PENDING = "pending"
+    SENT = "sent"
+    FAILED = "failed"
+
+
+class SwiftMessageGenerateRequest(BaseModel):
+    message_type: SwiftMessageType
+    lc_number: str
+    narrative: Optional[str] = None
+
+
+class SwiftMessageResponse(BaseModel):
+    id: int
+    message_number: str
+    message_type: str
+    lc_number: str
+    lc_id: Optional[int] = None
+    raw_message: str
+    status: str
+    sent_at: Optional[datetime] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class SwiftParseRequest(BaseModel):
+    raw_message: str
+
+
+class SwiftParsedField(BaseModel):
+    tag: str
+    field_name: str
+    value: str
+
+
+class SwiftParseResponse(BaseModel):
+    message_type: str
+    lc_number: Optional[str] = None
+    fields: List[SwiftParsedField]
+    created_resource_id: Optional[int] = None
+    created_resource_type: Optional[str] = None

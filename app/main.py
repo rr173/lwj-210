@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from typing import List, Optional
-from datetime import date
+from datetime import date, datetime
 
 from app.database import get_db, Base, engine
 from app import models, schemas, crud
@@ -586,6 +586,104 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"解除冻结失败: {str(e)}")
+
+    @app.post("/api/swift/generate", response_model=schemas.SwiftMessageResponse, tags=["SWIFT报文"], status_code=status.HTTP_201_CREATED)
+    async def generate_swift_message(req: schemas.SwiftMessageGenerateRequest, db: Session = Depends(get_db)):
+        try:
+            msg_type = req.message_type.value if hasattr(req.message_type, 'value') else req.message_type
+            if msg_type == "MT700":
+                msg = crud.generate_and_enqueue_mt700(db, req.lc_number)
+            elif msg_type == "MT707":
+                lc = crud.get_letter_of_credit_by_number(db, req.lc_number)
+                if not lc:
+                    raise HTTPException(status_code=404, detail=f"信用证 {req.lc_number} 不存在")
+                amendments = crud.get_amendments_by_lc(db, req.lc_number)
+                if not amendments:
+                    raise HTTPException(status_code=400, detail=f"信用证 {req.lc_number} 没有修改记录，无法生成MT707报文")
+                latest_amendment = amendments[0]
+                msg = crud.generate_and_enqueue_mt707(db, latest_amendment.amendment_number)
+            elif msg_type == "MT799":
+                if not req.narrative:
+                    raise HTTPException(status_code=400, detail="MT799报文必须提供narrative叙述内容")
+                msg = crud.generate_and_enqueue_mt799(db, req.lc_number, req.narrative)
+            else:
+                raise HTTPException(status_code=400, detail=f"不支持的报文类型: {msg_type}")
+            return msg
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"生成SWIFT报文失败: {str(e)}")
+
+    @app.post("/api/swift/generate/mt707/{amendment_number}", response_model=schemas.SwiftMessageResponse, tags=["SWIFT报文"], status_code=status.HTTP_201_CREATED)
+    async def generate_mt707_by_amendment(amendment_number: str, db: Session = Depends(get_db)):
+        try:
+            msg = crud.generate_and_enqueue_mt707(db, amendment_number)
+            return msg
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"生成MT707报文失败: {str(e)}")
+
+    @app.post("/api/swift/parse", response_model=schemas.SwiftParseResponse, tags=["SWIFT报文"])
+    async def parse_swift_message(req: schemas.SwiftParseRequest, db: Session = Depends(get_db)):
+        try:
+            result = crud.parse_and_process_swift_message(db, req.raw_message)
+            return result
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"解析SWIFT报文失败: {str(e)}")
+
+    @app.get("/api/swift/{message_number}", response_model=schemas.SwiftMessageResponse, tags=["SWIFT报文"])
+    async def get_swift_message(message_number: str, db: Session = Depends(get_db)):
+        msg = crud.get_swift_message_by_number(db, message_number)
+        if not msg:
+            raise HTTPException(status_code=404, detail=f"报文 {message_number} 不存在")
+        return msg
+
+    @app.get("/api/swift/lc/{lc_number}", response_model=List[schemas.SwiftMessageResponse], tags=["SWIFT报文"])
+    async def get_swift_messages_by_lc(
+        lc_number: str,
+        status: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 100,
+        db: Session = Depends(get_db),
+    ):
+        from app.models import VALID_SWIFT_SEND_STATUSES
+        if status and status not in VALID_SWIFT_SEND_STATUSES:
+            raise HTTPException(status_code=400, detail=f"无效的状态: {status}，允许值: {', '.join(VALID_SWIFT_SEND_STATUSES)}")
+        lc = crud.get_letter_of_credit_by_number(db, lc_number)
+        if not lc:
+            raise HTTPException(status_code=404, detail=f"信用证 {lc_number} 不存在")
+        return crud.get_swift_messages_by_lc(db, lc_number, status=status, skip=skip, limit=limit)
+
+    @app.get("/api/swift/query/time-range", response_model=List[schemas.SwiftMessageResponse], tags=["SWIFT报文"])
+    async def query_swift_messages_by_time(
+        start_time: datetime,
+        end_time: datetime,
+        lc_number: Optional[str] = None,
+        status: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 100,
+        db: Session = Depends(get_db),
+    ):
+        from app.models import VALID_SWIFT_SEND_STATUSES
+        if status and status not in VALID_SWIFT_SEND_STATUSES:
+            raise HTTPException(status_code=400, detail=f"无效的状态: {status}，允许值: {', '.join(VALID_SWIFT_SEND_STATUSES)}")
+        if start_time > end_time:
+            raise HTTPException(status_code=400, detail="开始时间不能大于结束时间")
+        return crud.get_swift_messages_by_time_range(
+            db, start_time, end_time, lc_number=lc_number, status=status, skip=skip, limit=limit
+        )
+
+    @app.post("/api/swift/{message_number}/resend", response_model=schemas.SwiftMessageResponse, tags=["SWIFT报文"])
+    async def resend_swift_message(message_number: str, db: Session = Depends(get_db)):
+        try:
+            return crud.resend_swift_message(db, message_number)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"重发报文失败: {str(e)}")
 
     return app
 

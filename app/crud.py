@@ -2371,3 +2371,266 @@ def get_all_active_freezes(db: Session, skip: int = 0, limit: int = 100) -> List
     return db.query(models.LCFreezeRecord).filter(
         models.LCFreezeRecord.status == models.FREEZE_STATUS_ACTIVE
     ).order_by(models.LCFreezeRecord.frozen_at.desc()).offset(skip).limit(limit).all()
+
+
+def generate_swift_message_number(db: Session, lc_number: str, message_type: str) -> str:
+    from sqlalchemy import func
+    date_str = datetime.utcnow().strftime("%Y%m%d")
+    prefix = f"SWIFT-{message_type}-{lc_number}-{date_str}-"
+    count = db.query(func.count(models.SwiftMessageQueue.id)).filter(
+        models.SwiftMessageQueue.message_number.like(f"{prefix}%")
+    ).scalar() or 0
+    return f"{prefix}{count + 1:04d}"
+
+
+def create_swift_message(
+    db: Session,
+    message_type: str,
+    lc_number: str,
+    raw_message: str,
+    lc_id: Optional[int] = None,
+) -> models.SwiftMessageQueue:
+    message_number = generate_swift_message_number(db, lc_number, message_type)
+
+    queue_item = models.SwiftMessageQueue(
+        message_number=message_number,
+        message_type=message_type,
+        lc_number=lc_number,
+        lc_id=lc_id,
+        raw_message=raw_message,
+        status=models.SWIFT_SEND_STATUS_PENDING,
+    )
+    db.add(queue_item)
+    db.commit()
+    db.refresh(queue_item)
+    return queue_item
+
+
+def generate_and_enqueue_mt700(db: Session, lc_number: str) -> models.SwiftMessageQueue:
+    from app.swift import generate_mt700
+
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        raise ValueError(f"信用证 {lc_number} 不存在")
+
+    raw_message = generate_mt700(lc)
+    return create_swift_message(
+        db,
+        models.SWIFT_MSG_TYPE_MT700,
+        lc_number,
+        raw_message,
+        lc_id=lc.id,
+    )
+
+
+def generate_and_enqueue_mt707(db: Session, amendment_number: str) -> models.SwiftMessageQueue:
+    from app.swift import generate_mt707
+
+    amendment = get_amendment_by_number(db, amendment_number)
+    if not amendment:
+        raise ValueError(f"修改编号 {amendment_number} 不存在")
+
+    lc = get_letter_of_credit_by_id(db, amendment.lc_id)
+    if not lc:
+        raise ValueError("关联信用证不存在")
+
+    raw_message = generate_mt707(amendment, lc)
+    return create_swift_message(
+        db,
+        models.SWIFT_MSG_TYPE_MT707,
+        lc.lc_number,
+        raw_message,
+        lc_id=lc.id,
+    )
+
+
+def generate_and_enqueue_mt799(db: Session, lc_number: str, narrative: str) -> models.SwiftMessageQueue:
+    from app.swift import generate_mt799
+
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        raise ValueError(f"信用证 {lc_number} 不存在")
+
+    raw_message = generate_mt799(lc_number, narrative)
+    return create_swift_message(
+        db,
+        models.SWIFT_MSG_TYPE_MT799,
+        lc_number,
+        raw_message,
+        lc_id=lc.id,
+    )
+
+
+def get_swift_message_by_number(db: Session, message_number: str) -> Optional[models.SwiftMessageQueue]:
+    return db.query(models.SwiftMessageQueue).filter(
+        models.SwiftMessageQueue.message_number == message_number
+    ).first()
+
+
+def get_swift_messages_by_lc(
+    db: Session,
+    lc_number: str,
+    status: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+) -> List[models.SwiftMessageQueue]:
+    query = db.query(models.SwiftMessageQueue).filter(
+        models.SwiftMessageQueue.lc_number == lc_number
+    )
+    if status:
+        query = query.filter(models.SwiftMessageQueue.status == status)
+    return query.order_by(models.SwiftMessageQueue.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def get_swift_messages_by_time_range(
+    db: Session,
+    start_time: datetime,
+    end_time: datetime,
+    lc_number: Optional[str] = None,
+    status: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+) -> List[models.SwiftMessageQueue]:
+    query = db.query(models.SwiftMessageQueue).filter(
+        models.SwiftMessageQueue.created_at >= start_time,
+        models.SwiftMessageQueue.created_at <= end_time,
+    )
+    if lc_number:
+        query = query.filter(models.SwiftMessageQueue.lc_number == lc_number)
+    if status:
+        query = query.filter(models.SwiftMessageQueue.status == status)
+    return query.order_by(models.SwiftMessageQueue.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def resend_swift_message(db: Session, message_number: str) -> models.SwiftMessageQueue:
+    msg = get_swift_message_by_number(db, message_number)
+    if not msg:
+        raise ValueError(f"报文 {message_number} 不存在")
+    if msg.status != models.SWIFT_SEND_STATUS_FAILED:
+        raise ValueError(f"只有 failed 状态的报文可以重发，当前状态: {msg.status}")
+    msg.status = models.SWIFT_SEND_STATUS_PENDING
+    msg.sent_at = None
+    db.commit()
+    db.refresh(msg)
+    return msg
+
+
+def parse_and_process_swift_message(db: Session, raw_message: str) -> Dict[str, Any]:
+    from app.swift import (
+        parse_swift_message,
+        validate_swift_message,
+        map_tags_to_fields,
+        extract_lc_number_from_tags,
+        extract_lc_data_from_mt700,
+        extract_amendment_data_from_mt707,
+    )
+
+    message_type, tags, tag_order_list = parse_swift_message(raw_message)
+
+    errors = validate_swift_message(message_type, tags)
+    if errors:
+        raise ValueError(f"报文校验失败: {'; '.join(errors)}")
+
+    fields = map_tags_to_fields(message_type, tags)
+    lc_number = extract_lc_number_from_tags(message_type, tags)
+
+    created_resource_id = None
+    created_resource_type = None
+
+    if message_type == models.SWIFT_MSG_TYPE_MT700:
+        lc_data = extract_lc_data_from_mt700(tags)
+        existing = get_letter_of_credit_by_number(db, lc_data.get("lc_number", ""))
+        if existing:
+            raise ValueError(f"信用证编号 {lc_data.get('lc_number')} 已存在，无法通过MT700报文自动创建")
+        lc = _create_lc_from_swift_mt700(db, lc_data)
+        created_resource_id = lc.id
+        created_resource_type = "letter_of_credit"
+
+    elif message_type == models.SWIFT_MSG_TYPE_MT707:
+        amendment_data = extract_amendment_data_from_mt707(tags)
+        lc_num = amendment_data.get("lc_number", "")
+        lc = get_letter_of_credit_by_number(db, lc_num)
+        if not lc:
+            raise ValueError(f"信用证 {lc_num} 不存在，无法通过MT707报文自动创建修改")
+        amendment = _create_amendment_from_swift_mt707(db, lc, amendment_data)
+        created_resource_id = amendment.id
+        created_resource_type = "amendment"
+
+    return {
+        "message_type": message_type,
+        "lc_number": lc_number,
+        "fields": fields,
+        "created_resource_id": created_resource_id,
+        "created_resource_type": created_resource_type,
+    }
+
+
+def _create_lc_from_swift_mt700(db: Session, lc_data: Dict[str, Any]) -> models.LetterOfCredit:
+    lc = models.LetterOfCredit(
+        lc_number=lc_data.get("lc_number", ""),
+        issuing_bank=lc_data.get("issuing_bank", "UNKNOWN"),
+        beneficiary_name=lc_data.get("beneficiary_name", ""),
+        applicant_name=lc_data.get("applicant_name", ""),
+        currency=lc_data.get("currency", "USD"),
+        amount=lc_data.get("amount", 0),
+        latest_shipment_date=lc_data.get("latest_shipment_date", date.today()),
+        latest_presentation_date=lc_data.get("latest_presentation_date", date.today()),
+        expiry_date=lc_data.get("expiry_date", date.today()),
+        transport_mode=lc_data.get("transport_mode", "海运"),
+        port_of_loading=lc_data.get("port_of_loading", ""),
+        port_of_discharge=lc_data.get("port_of_discharge", ""),
+        partial_shipment_allowed=lc_data.get("partial_shipment_allowed", False),
+        transshipment_allowed=lc_data.get("transshipment_allowed", False),
+        goods_description=lc_data.get("goods_description", ""),
+        additional_terms=lc_data.get("additional_terms", []),
+        fee_tier="standard",
+    )
+    db.add(lc)
+    db.flush()
+
+    db.add(models.DocumentRequirement(
+        lc_id=lc.id,
+        document_type="bill_of_lading",
+        original_copies=1,
+        copy_copies=0,
+    ))
+
+    db.commit()
+    db.refresh(lc)
+    return lc
+
+
+def _create_amendment_from_swift_mt707(
+    db: Session,
+    lc: models.LetterOfCredit,
+    amendment_data: Dict[str, Any],
+) -> models.LCAmendment:
+    field_changes = amendment_data.get("field_changes", [])
+    for change in field_changes:
+        field_name = change.get("field_name")
+        if field_name in ["amount", "latest_shipment_date", "latest_presentation_date", "expiry_date"]:
+            actual = _get_field_actual_value(lc, field_name)
+            change["old_value"] = _format_value(field_name, actual) if actual is not None else None
+
+    if has_pending_amendment(db, lc.id):
+        raise ValueError(f"信用证 {lc.lc_number} 已有一个待处理的修改，请先处理后再发起新修改")
+
+    snapshot_before = lc_to_snapshot_dict(lc)
+    sequence_number = get_next_amendment_sequence(db, lc.id)
+    amendment_number = f"{lc.lc_number}-AMD-{sequence_number:03d}"
+    expiry_time = datetime.utcnow() + timedelta(days=AMENDMENT_EXPIRY_DAYS)
+
+    amendment = models.LCAmendment(
+        lc_id=lc.id,
+        amendment_number=amendment_number,
+        sequence_number=sequence_number,
+        status=AMENDMENT_STATUS_PENDING,
+        field_changes=field_changes,
+        snapshot_before=snapshot_before,
+        snapshot_after=None,
+        expiry_time=expiry_time,
+    )
+    db.add(amendment)
+    db.commit()
+    db.refresh(amendment)
+    return amendment
