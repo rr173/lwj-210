@@ -457,3 +457,143 @@ class ReviewerStatsResponse(BaseModel):
     overrule_count: int
     avg_review_duration_seconds: float
     total_review_duration_seconds: int
+
+
+class TransferType(str, Enum):
+    FULL = "full"
+    PARTIAL = "partial"
+
+
+class TransferStatus(str, Enum):
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+
+
+class BackToBackStatus(str, Enum):
+    PENDING_REVIEW = "pending_review"
+    IN_REVIEW = "in_review"
+    REVIEWED = "reviewed"
+    REJECTED = "rejected"
+
+
+class ConflictStatus(str, Enum):
+    NORMAL = "normal"
+    CONFLICT = "conflict"
+
+
+class TransferCreate(BaseModel):
+    lc_number: str
+    second_beneficiary_name: str
+    transfer_amount: float
+    transfer_type: TransferType
+
+
+class TransferConfirmRequest(BaseModel):
+    action: str
+
+
+class TransferResponse(BaseModel):
+    id: int
+    original_lc_id: int
+    transfer_number: str
+    second_beneficiary_name: str
+    transfer_amount: float
+    transfer_type: str
+    status: str
+    confirmation_time: Optional[datetime] = None
+    inherited_terms: Optional[Dict[str, Any]] = None
+    sequence_number: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class TransferDetailResponse(TransferResponse):
+    original_lc: LetterOfCreditResponse
+
+
+class BackToBackDocumentRequirementCreate(BaseModel):
+    document_type: str
+    original_copies: int = 0
+    copy_copies: int = 0
+
+
+class BackToBackDocumentRequirementResponse(BaseModel):
+    id: int
+    document_type: str
+    original_copies: int
+    copy_copies: int
+
+    class Config:
+        from_attributes = True
+
+
+class BackToBackLCCreate(BaseModel):
+    lc_number: str
+    beneficiary_name: str
+    applicant_name: str
+    issuing_bank: str
+    amount: float
+    latest_shipment_date: date
+    latest_presentation_date: date
+    expiry_date: date
+    transport_mode: TransportMode
+    port_of_loading: str
+    port_of_discharge: str
+    partial_shipment_allowed: bool = False
+    transshipment_allowed: bool = False
+    goods_description: str
+    additional_terms: List[str] = []
+    document_requirements: List[BackToBackDocumentRequirementCreate]
+
+
+class BackToBackLCResponse(BaseModel):
+    id: int
+    original_lc_id: int
+    back_to_back_number: str
+    beneficiary_name: str
+    applicant_name: str
+    issuing_bank: str
+    currency: str
+    amount: float
+    latest_shipment_date: date
+    latest_presentation_date: date
+    expiry_date: date
+    transport_mode: str
+    port_of_loading: str
+    port_of_discharge: str
+    partial_shipment_allowed: bool
+    transshipment_allowed: bool
+    goods_description: str
+    additional_terms: List[str]
+    document_requirements: List[BackToBackDocumentRequirementResponse]
+    status: str
+    conflict_status: str
+    conflict_details: Optional[Dict[str, Any]] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class BackToBackLCDetailResponse(BackToBackLCResponse):
+    original_lc: LetterOfCreditResponse
+
+
+class LcAvailableAmountResponse(BaseModel):
+    lc_number: str
+    original_amount: float
+    total_transferred_amount: float
+    total_back_to_back_amount: float
+    remaining_available_amount: float
+    transfers: List[TransferResponse]
+    back_to_back_lcs: List[BackToBackLCResponse]
+
+
+class LcTransferBackToBackSummaryResponse(BaseModel):
+    lc_number: str
+    transfers: List[TransferResponse]
+    back_to_back_lcs: List[BackToBackLCResponse]

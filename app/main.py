@@ -416,6 +416,85 @@ def create_app() -> FastAPI:
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+    @app.post("/api/transfer", response_model=schemas.TransferResponse, tags=["信用证转让"], status_code=status.HTTP_201_CREATED)
+    async def create_transfer(transfer_data: schemas.TransferCreate, db: Session = Depends(get_db)):
+        try:
+            transfer = crud.create_transfer(db, transfer_data)
+            return transfer
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"创建转让申请失败: {str(e)}")
+
+    @app.get("/api/transfer/{transfer_number}", response_model=schemas.TransferDetailResponse, tags=["信用证转让"])
+    async def get_transfer(transfer_number: str, db: Session = Depends(get_db)):
+        result = crud.get_transfer_detail(db, transfer_number)
+        if not result:
+            raise HTTPException(status_code=404, detail=f"转让证 {transfer_number} 不存在")
+        return result
+
+    @app.post("/api/transfer/{transfer_number}/action", response_model=schemas.TransferResponse, tags=["信用证转让"])
+    async def transfer_action(transfer_number: str, action_req: schemas.TransferConfirmRequest, db: Session = Depends(get_db)):
+        action = action_req.action.lower()
+        if action not in ["confirm", "reject"]:
+            raise HTTPException(status_code=400, detail=f"无效的操作: {action}，仅支持 confirm 或 reject")
+        try:
+            transfer = crud.confirm_transfer(db, transfer_number, action)
+            return transfer
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"转让操作失败: {str(e)}")
+
+    @app.get("/api/lc/{lc_number}/transfers", response_model=List[schemas.TransferResponse], tags=["信用证转让"])
+    async def get_lc_transfers(lc_number: str, db: Session = Depends(get_db)):
+        lc = crud.get_letter_of_credit_by_number(db, lc_number)
+        if not lc:
+            raise HTTPException(status_code=404, detail=f"信用证 {lc_number} 不存在")
+        return crud.get_transfers_by_lc(db, lc_number)
+
+    @app.post("/api/back-to-back", response_model=schemas.BackToBackLCResponse, tags=["背对背信用证"], status_code=status.HTTP_201_CREATED)
+    async def create_back_to_back(btb_data: schemas.BackToBackLCCreate, db: Session = Depends(get_db)):
+        try:
+            btb = crud.create_back_to_back_lc(db, btb_data)
+            return btb
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"创建背对背证失败: {str(e)}")
+
+    @app.get("/api/back-to-back/{back_to_back_number}", response_model=schemas.BackToBackLCDetailResponse, tags=["背对背信用证"])
+    async def get_back_to_back(back_to_back_number: str, db: Session = Depends(get_db)):
+        result = crud.get_back_to_back_detail(db, back_to_back_number)
+        if not result:
+            raise HTTPException(status_code=404, detail=f"背对背证 {back_to_back_number} 不存在")
+        return result
+
+    @app.get("/api/lc/{lc_number}/back-to-back", response_model=List[schemas.BackToBackLCResponse], tags=["背对背信用证"])
+    async def get_lc_back_to_back(lc_number: str, db: Session = Depends(get_db)):
+        lc = crud.get_letter_of_credit_by_number(db, lc_number)
+        if not lc:
+            raise HTTPException(status_code=404, detail=f"信用证 {lc_number} 不存在")
+        return crud.get_back_to_back_lcs_by_lc(db, lc_number)
+
+    @app.get("/api/lc/{lc_number}/available-amount", response_model=schemas.LcAvailableAmountResponse, tags=["转让与背对背查询"])
+    async def get_available_amount(lc_number: str, db: Session = Depends(get_db)):
+        try:
+            return crud.get_lc_available_amount(db, lc_number)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询可用金额失败: {str(e)}")
+
+    @app.get("/api/lc/{lc_number}/transfer-backtoback-summary", response_model=schemas.LcTransferBackToBackSummaryResponse, tags=["转让与背对背查询"])
+    async def get_transfer_backtoback_summary(lc_number: str, db: Session = Depends(get_db)):
+        try:
+            return crud.get_lc_transfer_and_back_to_back_summary(db, lc_number)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询转让与背对背摘要失败: {str(e)}")
+
     return app
 
 

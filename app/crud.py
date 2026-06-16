@@ -850,6 +850,8 @@ def accept_amendment(db: Session, amendment_number: str) -> models.LCAmendment:
 
     apply_amendment_to_lc(db, lc, amendment.field_changes)
 
+    check_back_to_back_conflicts(db, amendment.lc_id, amendment.field_changes)
+
     snapshot_after = lc_to_snapshot_dict(lc)
     amendment.snapshot_after = snapshot_after
     amendment.status = AMENDMENT_STATUS_ACCEPTED
@@ -1432,4 +1434,437 @@ def get_reviewer_stats(
         "overrule_count": overrule_count,
         "avg_review_duration_seconds": round(avg_duration, 2),
         "total_review_duration_seconds": total_duration
+    }
+
+
+def get_confirmed_transfer_amount(db: Session, lc_id: int) -> float:
+    from sqlalchemy import func
+    result = db.query(func.sum(models.LCTransfer.transfer_amount)).filter(
+        models.LCTransfer.original_lc_id == lc_id,
+        models.LCTransfer.status == models.TRANSFER_STATUS_CONFIRMED
+    ).scalar()
+    return float(result or 0)
+
+
+def get_back_to_back_total_amount(db: Session, lc_id: int) -> float:
+    from sqlalchemy import func
+    result = db.query(func.sum(models.BackToBackLC.amount)).filter(
+        models.BackToBackLC.original_lc_id == lc_id,
+        models.BackToBackLC.status != models.BACK_TO_BACK_STATUS_REJECTED
+    ).scalar()
+    return float(result or 0)
+
+
+def get_remaining_available_amount(db: Session, lc: models.LetterOfCredit) -> float:
+    transferred = get_confirmed_transfer_amount(db, lc.id)
+    back_to_back = get_back_to_back_total_amount(db, lc.id)
+    return lc.amount - transferred - back_to_back
+
+
+def get_next_transfer_sequence(db: Session, lc_id: int) -> int:
+    from sqlalchemy import func
+    max_seq = db.query(func.max(models.LCTransfer.sequence_number)).filter(
+        models.LCTransfer.original_lc_id == lc_id
+    ).scalar()
+    return (max_seq or 0) + 1
+
+
+def get_distinct_second_beneficiary_count(db: Session, lc_id: int) -> int:
+    from sqlalchemy import func
+    result = db.query(func.count(func.distinct(models.LCTransfer.second_beneficiary_name))).filter(
+        models.LCTransfer.original_lc_id == lc_id,
+        models.LCTransfer.status.in_([models.TRANSFER_STATUS_PENDING, models.TRANSFER_STATUS_CONFIRMED])
+    ).scalar()
+    return int(result or 0)
+
+
+def create_transfer(db: Session, transfer_data: schemas.TransferCreate) -> models.LCTransfer:
+    lc = get_letter_of_credit_by_number(db, transfer_data.lc_number)
+    if not lc:
+        raise ValueError(f"信用证 {transfer_data.lc_number} 不存在")
+
+    transfer_type = transfer_data.transfer_type.value if hasattr(transfer_data.transfer_type, 'value') else transfer_data.transfer_type
+    transfer_amount = transfer_data.transfer_amount
+
+    if transfer_type == models.TRANSFER_TYPE_FULL:
+        if abs(transfer_amount - lc.amount) > 0.01:
+            raise ValueError(f"全额转让的转让金额必须等于原证金额 {lc.amount}，当前提交金额: {transfer_amount}")
+    elif transfer_type == models.TRANSFER_TYPE_PARTIAL:
+        max_partial = lc.amount * models.PARTIAL_TRANSFER_MAX_RATIO
+        if transfer_amount > max_partial + 0.01:
+            raise ValueError(f"部分转让金额不得超过原证金额的80% ({max_partial:.2f})，当前提交金额: {transfer_amount}")
+        if transfer_amount <= 0:
+            raise ValueError("部分转让金额必须大于0")
+    else:
+        raise ValueError(f"无效的转让类型: {transfer_type}")
+
+    remaining = get_remaining_available_amount(db, lc)
+    if transfer_amount > remaining + 0.01:
+        raise ValueError(f"转让金额 {transfer_amount} 超过原证剩余可用金额 {remaining:.2f}")
+
+    beneficiary_count = get_distinct_second_beneficiary_count(db, lc.id)
+    existing_beneficiaries = db.query(models.LCTransfer.second_beneficiary_name).filter(
+        models.LCTransfer.original_lc_id == lc.id,
+        models.LCTransfer.status.in_([models.TRANSFER_STATUS_PENDING, models.TRANSFER_STATUS_CONFIRMED])
+    ).all()
+    existing_names = {b[0] for b in existing_beneficiaries}
+
+    if transfer_data.second_beneficiary_name not in existing_names:
+        if beneficiary_count >= models.MAX_SECOND_BENEFICIARIES:
+            raise ValueError(f"同一份信用证最多允许转让给 {models.MAX_SECOND_BENEFICIARIES} 个不同的第二受益人")
+
+    sequence_number = get_next_transfer_sequence(db, lc.id)
+    transfer_number = f"{lc.lc_number}-T-{sequence_number:03d}"
+
+    inherited_terms = {
+        "port_of_loading": lc.port_of_loading,
+        "port_of_discharge": lc.port_of_discharge,
+        "goods_description": lc.goods_description,
+        "transport_mode": lc.transport_mode,
+        "additional_terms": copy.deepcopy(lc.additional_terms) if lc.additional_terms else [],
+        "currency": lc.currency,
+        "latest_shipment_date": lc.latest_shipment_date.isoformat() if lc.latest_shipment_date else None,
+        "latest_presentation_date": lc.latest_presentation_date.isoformat() if lc.latest_presentation_date else None,
+        "expiry_date": lc.expiry_date.isoformat() if lc.expiry_date else None,
+        "partial_shipment_allowed": lc.partial_shipment_allowed,
+        "transshipment_allowed": lc.transshipment_allowed,
+    }
+
+    doc_reqs = []
+    for req in lc.document_requirements:
+        doc_reqs.append({
+            "document_type": req.document_type,
+            "original_copies": req.original_copies,
+            "copy_copies": req.copy_copies,
+        })
+    inherited_terms["document_requirements"] = doc_reqs
+
+    transfer = models.LCTransfer(
+        original_lc_id=lc.id,
+        transfer_number=transfer_number,
+        second_beneficiary_name=transfer_data.second_beneficiary_name,
+        transfer_amount=transfer_amount,
+        transfer_type=transfer_type,
+        status=models.TRANSFER_STATUS_PENDING,
+        inherited_terms=inherited_terms,
+        sequence_number=sequence_number,
+    )
+
+    db.add(transfer)
+    db.commit()
+    db.refresh(transfer)
+    return transfer
+
+
+def get_transfer_by_number(db: Session, transfer_number: str) -> Optional[models.LCTransfer]:
+    return db.query(models.LCTransfer).filter(models.LCTransfer.transfer_number == transfer_number).first()
+
+
+def get_transfers_by_lc(db: Session, lc_number: str) -> List[models.LCTransfer]:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        return []
+    return db.query(models.LCTransfer).filter(
+        models.LCTransfer.original_lc_id == lc.id
+    ).order_by(models.LCTransfer.sequence_number.asc()).all()
+
+
+def confirm_transfer(db: Session, transfer_number: str, action: str) -> models.LCTransfer:
+    transfer = get_transfer_by_number(db, transfer_number)
+    if not transfer:
+        raise ValueError(f"转让证 {transfer_number} 不存在")
+
+    if transfer.status != models.TRANSFER_STATUS_PENDING:
+        raise ValueError(f"转让证 {transfer_number} 当前状态为 {transfer.status}，只有 pending 状态的转让可以确认")
+
+    if action == "confirm":
+        lc = get_letter_of_credit_by_id(db, transfer.original_lc_id)
+        if not lc:
+            raise ValueError("关联信用证不存在")
+
+        remaining = get_remaining_available_amount(db, lc)
+        if transfer.transfer_amount > remaining + 0.01:
+            raise ValueError(f"转让金额 {transfer.transfer_amount} 超过原证剩余可用金额 {remaining:.2f}，无法确认")
+
+        transfer.status = models.TRANSFER_STATUS_CONFIRMED
+        transfer.confirmation_time = datetime.utcnow()
+    elif action == "reject":
+        transfer.status = models.TRANSFER_STATUS_REJECTED
+        transfer.confirmation_time = datetime.utcnow()
+    else:
+        raise ValueError(f"无效的操作: {action}，仅支持 confirm 或 reject")
+
+    db.commit()
+    db.refresh(transfer)
+    return transfer
+
+
+def get_transfer_detail(db: Session, transfer_number: str) -> Optional[Dict[str, Any]]:
+    transfer = get_transfer_by_number(db, transfer_number)
+    if not transfer:
+        return None
+
+    lc = get_letter_of_credit_by_id(db, transfer.original_lc_id)
+    return {
+        "id": transfer.id,
+        "original_lc_id": transfer.original_lc_id,
+        "transfer_number": transfer.transfer_number,
+        "second_beneficiary_name": transfer.second_beneficiary_name,
+        "transfer_amount": transfer.transfer_amount,
+        "transfer_type": transfer.transfer_type,
+        "status": transfer.status,
+        "confirmation_time": transfer.confirmation_time,
+        "inherited_terms": transfer.inherited_terms,
+        "sequence_number": transfer.sequence_number,
+        "created_at": transfer.created_at,
+        "original_lc": lc,
+    }
+
+
+def get_next_back_to_back_sequence(db: Session, lc_id: int) -> int:
+    from sqlalchemy import func
+    count = db.query(func.count(models.BackToBackLC.id)).filter(
+        models.BackToBackLC.original_lc_id == lc_id
+    ).scalar() or 0
+    return count + 1
+
+
+def create_back_to_back_lc(db: Session, btb_data: schemas.BackToBackLCCreate) -> models.BackToBackLC:
+    lc = get_letter_of_credit_by_number(db, btb_data.lc_number)
+    if not lc:
+        raise ValueError(f"信用证 {btb_data.lc_number} 不存在")
+
+    max_amount = lc.amount * models.BACK_TO_BACK_AMOUNT_RATIO
+    if btb_data.amount > max_amount + 0.01:
+        raise ValueError(f"背对背证金额不得超过原证金额的95% ({max_amount:.2f})，当前提交金额: {btb_data.amount}")
+
+    if btb_data.amount <= 0:
+        raise ValueError("背对背证金额必须大于0")
+
+    remaining = get_remaining_available_amount(db, lc)
+    if btb_data.amount > remaining + 0.01:
+        raise ValueError(f"背对背证金额 {btb_data.amount} 超过原证剩余可用金额 {remaining:.2f}")
+
+    max_shipment_date = lc.latest_shipment_date - timedelta(days=models.BACK_TO_BACK_SHIPMENT_DAYS_BEFORE)
+    if btb_data.latest_shipment_date > max_shipment_date:
+        raise ValueError(
+            f"背对背证装运日期不晚于原证装运日期前{models.BACK_TO_BACK_SHIPMENT_DAYS_BEFORE}天，"
+            f"原证装运日期: {lc.latest_shipment_date}，最迟允许: {max_shipment_date}，"
+            f"提交的装运日期: {btb_data.latest_shipment_date}"
+        )
+
+    max_expiry_date = lc.expiry_date - timedelta(days=models.BACK_TO_BACK_EXPIRY_DAYS_BEFORE)
+    if btb_data.expiry_date > max_expiry_date:
+        raise ValueError(
+            f"背对背证到期日不晚于原证到期日前{models.BACK_TO_BACK_EXPIRY_DAYS_BEFORE}天，"
+            f"原证到期日: {lc.expiry_date}，最迟允许: {max_expiry_date}，"
+            f"提交的到期日: {btb_data.expiry_date}"
+        )
+
+    sequence = get_next_back_to_back_sequence(db, lc.id)
+    back_to_back_number = f"{lc.lc_number}-BB-{sequence:03d}"
+
+    transport_mode_value = btb_data.transport_mode.value if hasattr(btb_data.transport_mode, 'value') else btb_data.transport_mode
+
+    btb_lc = models.BackToBackLC(
+        original_lc_id=lc.id,
+        back_to_back_number=back_to_back_number,
+        beneficiary_name=btb_data.beneficiary_name,
+        applicant_name=btb_data.applicant_name,
+        issuing_bank=btb_data.issuing_bank,
+        currency=lc.currency,
+        amount=btb_data.amount,
+        latest_shipment_date=btb_data.latest_shipment_date,
+        latest_presentation_date=btb_data.latest_presentation_date,
+        expiry_date=btb_data.expiry_date,
+        transport_mode=transport_mode_value,
+        port_of_loading=btb_data.port_of_loading,
+        port_of_discharge=btb_data.port_of_discharge,
+        partial_shipment_allowed=btb_data.partial_shipment_allowed,
+        transshipment_allowed=btb_data.transshipment_allowed,
+        goods_description=btb_data.goods_description,
+        additional_terms=btb_data.additional_terms,
+        status=models.BACK_TO_BACK_STATUS_PENDING,
+        conflict_status=models.CONFLICT_STATUS_NORMAL,
+    )
+
+    db.add(btb_lc)
+    db.flush()
+
+    for req in btb_data.document_requirements:
+        db_req = models.BackToBackDocumentRequirement(
+            back_to_back_lc_id=btb_lc.id,
+            document_type=req.document_type,
+            original_copies=req.original_copies,
+            copy_copies=req.copy_copies,
+        )
+        db.add(db_req)
+
+    db.commit()
+    db.refresh(btb_lc)
+    return btb_lc
+
+
+def get_back_to_back_by_number(db: Session, back_to_back_number: str) -> Optional[models.BackToBackLC]:
+    return db.query(models.BackToBackLC).filter(
+        models.BackToBackLC.back_to_back_number == back_to_back_number
+    ).first()
+
+
+def get_back_to_back_lcs_by_lc(db: Session, lc_number: str) -> List[models.BackToBackLC]:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        return []
+    return db.query(models.BackToBackLC).filter(
+        models.BackToBackLC.original_lc_id == lc.id
+    ).order_by(models.BackToBackLC.created_at.desc()).all()
+
+
+def get_back_to_back_detail(db: Session, back_to_back_number: str) -> Optional[Dict[str, Any]]:
+    btb = get_back_to_back_by_number(db, back_to_back_number)
+    if not btb:
+        return None
+
+    lc = get_letter_of_credit_by_id(db, btb.original_lc_id)
+    return {
+        "id": btb.id,
+        "original_lc_id": btb.original_lc_id,
+        "back_to_back_number": btb.back_to_back_number,
+        "beneficiary_name": btb.beneficiary_name,
+        "applicant_name": btb.applicant_name,
+        "issuing_bank": btb.issuing_bank,
+        "currency": btb.currency,
+        "amount": btb.amount,
+        "latest_shipment_date": btb.latest_shipment_date,
+        "latest_presentation_date": btb.latest_presentation_date,
+        "expiry_date": btb.expiry_date,
+        "transport_mode": btb.transport_mode,
+        "port_of_loading": btb.port_of_loading,
+        "port_of_discharge": btb.port_of_discharge,
+        "partial_shipment_allowed": btb.partial_shipment_allowed,
+        "transshipment_allowed": btb.transshipment_allowed,
+        "goods_description": btb.goods_description,
+        "additional_terms": btb.additional_terms,
+        "document_requirements": btb.document_requirements,
+        "status": btb.status,
+        "conflict_status": btb.conflict_status,
+        "conflict_details": btb.conflict_details,
+        "created_at": btb.created_at,
+        "original_lc": lc,
+    }
+
+
+def check_back_to_back_conflicts(db: Session, lc_id: int, field_changes: List[Dict[str, Any]]) -> None:
+    btb_lcs = db.query(models.BackToBackLC).filter(
+        models.BackToBackLC.original_lc_id == lc_id,
+        models.BackToBackLC.status != models.BACK_TO_BACK_STATUS_REJECTED
+    ).all()
+
+    if not btb_lcs:
+        return
+
+    lc = get_letter_of_credit_by_id(db, lc_id)
+    if not lc:
+        return
+
+    changes_map = {}
+    for change in field_changes:
+        changes_map[change["field_name"]] = change["new_value"]
+
+    for btb in btb_lcs:
+        conflicts = []
+
+        if "latest_shipment_date" in changes_map:
+            new_shipment = changes_map["latest_shipment_date"]
+            if isinstance(new_shipment, str):
+                new_shipment = date.fromisoformat(new_shipment)
+            max_allowed = new_shipment - timedelta(days=models.BACK_TO_BACK_SHIPMENT_DAYS_BEFORE)
+            if btb.latest_shipment_date > max_allowed:
+                conflicts.append({
+                    "field": "latest_shipment_date",
+                    "back_to_back_value": btb.latest_shipment_date.isoformat(),
+                    "max_allowed": max_allowed.isoformat(),
+                    "new_original_value": new_shipment.isoformat(),
+                    "message": f"原证装运日期修改为 {new_shipment}，背对背证装运日期 {btb.latest_shipment_date} 超过新约束 (不晚于原证装运日期前{models.BACK_TO_BACK_SHIPMENT_DAYS_BEFORE}天 = {max_allowed})"
+                })
+
+        if "expiry_date" in changes_map:
+            new_expiry = changes_map["expiry_date"]
+            if isinstance(new_expiry, str):
+                new_expiry = date.fromisoformat(new_expiry)
+            max_allowed = new_expiry - timedelta(days=models.BACK_TO_BACK_EXPIRY_DAYS_BEFORE)
+            if btb.expiry_date > max_allowed:
+                conflicts.append({
+                    "field": "expiry_date",
+                    "back_to_back_value": btb.expiry_date.isoformat(),
+                    "max_allowed": max_allowed.isoformat(),
+                    "new_original_value": new_expiry.isoformat(),
+                    "message": f"原证到期日修改为 {new_expiry}，背对背证到期日 {btb.expiry_date} 超过新约束 (不晚于原证到期日前{models.BACK_TO_BACK_EXPIRY_DAYS_BEFORE}天 = {max_allowed})"
+                })
+
+        if "amount" in changes_map:
+            new_amount = float(changes_map["amount"])
+            max_allowed = new_amount * models.BACK_TO_BACK_AMOUNT_RATIO
+            if btb.amount > max_allowed + 0.01:
+                conflicts.append({
+                    "field": "amount",
+                    "back_to_back_value": btb.amount,
+                    "max_allowed": max_allowed,
+                    "new_original_value": new_amount,
+                    "message": f"原证金额修改为 {new_amount}，背对背证金额 {btb.amount} 超过新约束 (不超过原证金额的95% = {max_allowed:.2f})"
+                })
+
+        if conflicts:
+            btb.conflict_status = models.CONFLICT_STATUS_CONFLICT
+            existing_details = btb.conflict_details or []
+            btb.conflict_details = existing_details + conflicts
+        else:
+            btb.conflict_status = models.CONFLICT_STATUS_NORMAL
+
+
+def get_lc_available_amount(db: Session, lc_number: str) -> Dict[str, Any]:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        raise ValueError(f"信用证 {lc_number} 不存在")
+
+    transferred = get_confirmed_transfer_amount(db, lc.id)
+    back_to_back = get_back_to_back_total_amount(db, lc.id)
+    remaining = lc.amount - transferred - back_to_back
+
+    transfers = db.query(models.LCTransfer).filter(
+        models.LCTransfer.original_lc_id == lc.id
+    ).order_by(models.LCTransfer.sequence_number.asc()).all()
+
+    btb_lcs = db.query(models.BackToBackLC).filter(
+        models.BackToBackLC.original_lc_id == lc.id
+    ).order_by(models.BackToBackLC.created_at.desc()).all()
+
+    return {
+        "lc_number": lc.lc_number,
+        "original_amount": lc.amount,
+        "total_transferred_amount": round(transferred, 2),
+        "total_back_to_back_amount": round(back_to_back, 2),
+        "remaining_available_amount": round(remaining, 2),
+        "transfers": transfers,
+        "back_to_back_lcs": btb_lcs,
+    }
+
+
+def get_lc_transfer_and_back_to_back_summary(db: Session, lc_number: str) -> Dict[str, Any]:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        raise ValueError(f"信用证 {lc_number} 不存在")
+
+    transfers = db.query(models.LCTransfer).filter(
+        models.LCTransfer.original_lc_id == lc.id
+    ).order_by(models.LCTransfer.sequence_number.asc()).all()
+
+    btb_lcs = db.query(models.BackToBackLC).filter(
+        models.BackToBackLC.original_lc_id == lc.id
+    ).order_by(models.BackToBackLC.created_at.desc()).all()
+
+    return {
+        "lc_number": lc.lc_number,
+        "transfers": transfers,
+        "back_to_back_lcs": btb_lcs,
     }
