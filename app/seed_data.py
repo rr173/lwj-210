@@ -18,6 +18,8 @@ def seed_data():
     db = SessionLocal()
 
     try:
+        crud.migrate_existing_audit_records(db)
+
         existing_lc1 = crud.get_letter_of_credit_by_number(db, "LC-SEA-CIF-2024-001")
         if existing_lc1:
             print("预置数据已存在，跳过初始化")

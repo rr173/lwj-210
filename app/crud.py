@@ -215,6 +215,80 @@ def create_fee_record(
     return fee_record
 
 
+def migrate_existing_audit_records(db: Session) -> int:
+    from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+
+    migrated = 0
+    try:
+        columns_added_audit = False
+        try:
+            db.execute(text("SELECT review_status FROM audit_records LIMIT 1"))
+        except OperationalError:
+            db.execute(text("ALTER TABLE audit_records ADD COLUMN review_status VARCHAR(20)"))
+            db.execute(text("ALTER TABLE audit_records ADD COLUMN auto_conclusion VARCHAR(50)"))
+            db.execute(text("ALTER TABLE audit_records ADD COLUMN final_conclusion VARCHAR(50)"))
+            db.commit()
+            migrated += 3
+            columns_added_audit = True
+
+        columns_added_disc = False
+        try:
+            db.execute(text("SELECT source FROM discrepancies LIMIT 1"))
+        except OperationalError:
+            db.execute(text("ALTER TABLE discrepancies ADD COLUMN source VARCHAR(20)"))
+            db.execute(text("ALTER TABLE discrepancies ADD COLUMN is_removed BOOLEAN"))
+            db.execute(text("ALTER TABLE discrepancies ADD COLUMN removal_reason TEXT"))
+            db.commit()
+            migrated += 3
+            columns_added_disc = True
+
+        tables_created = False
+        try:
+            db.execute(text("SELECT 1 FROM reviewers LIMIT 1"))
+        except OperationalError:
+            conn = db.connection()
+            models.Reviewer.__table__.create(bind=conn)
+            models.ReviewAssignment.__table__.create(bind=conn)
+            models.ReviewOpinion.__table__.create(bind=conn)
+            db.commit()
+            migrated += 3
+            tables_created = True
+
+        needs_update = False
+        all_audits = db.query(models.AuditRecord).all()
+        for record in all_audits:
+            updated = False
+            if not record.review_status:
+                record.review_status = REVIEW_STATUS_PENDING
+                updated = True
+            if not record.auto_conclusion:
+                record.auto_conclusion = record.conclusion
+                updated = True
+            if updated:
+                migrated += 1
+                needs_update = True
+
+        all_discs = db.query(models.Discrepancy).all()
+        for disc in all_discs:
+            updated = False
+            if not disc.source:
+                disc.source = "auto"
+                updated = True
+            if disc.is_removed is None:
+                disc.is_removed = False
+                updated = True
+            if updated:
+                migrated += 1
+                needs_update = True
+
+        if needs_update:
+            db.commit()
+    except Exception as e:
+        db.rollback()
+    return migrated
+
+
 def submit_documents_and_audit(db: Session, submission: schemas.SubmissionSubmit):
     lc = get_letter_of_credit_by_number(db, submission.lc_number)
     if not lc:

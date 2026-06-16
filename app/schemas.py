@@ -177,10 +177,13 @@ class AuditRecordResponse(BaseModel):
     resubmission_round: int
     modification_remark: Optional[str] = None
     conclusion: str
+    auto_conclusion: Optional[str] = None
+    final_conclusion: Optional[str] = None
     total_discrepancies: int
     critical_count: int
     minor_count: int
     presentation_date: date
+    review_status: str
     discrepancies: List[DiscrepancyResponse]
     created_at: datetime
 
@@ -196,10 +199,13 @@ class AuditRecordDetailResponse(BaseModel):
     resubmission_round: int
     modification_remark: Optional[str] = None
     conclusion: str
+    auto_conclusion: Optional[str] = None
+    final_conclusion: Optional[str] = None
     total_discrepancies: int
     critical_count: int
     minor_count: int
     presentation_date: date
+    review_status: str
     discrepancies: List[DiscrepancyResponse]
     created_at: datetime
     lc: LetterOfCreditResponse
