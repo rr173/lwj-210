@@ -306,6 +306,113 @@ def create_app() -> FastAPI:
     async def list_all_fees(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
         return crud.get_all_fee_records(db, skip, limit)
 
+    @app.post("/api/reviewers", response_model=schemas.ReviewerResponse, tags=["审单员管理"], status_code=status.HTTP_201_CREATED)
+    async def create_reviewer(reviewer_data: schemas.ReviewerCreate, db: Session = Depends(get_db)):
+        try:
+            return crud.create_reviewer(db, reviewer_data)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/api/reviewers", response_model=List[schemas.ReviewerResponse], tags=["审单员管理"])
+    async def list_reviewers(skip: int = 0, limit: int = 100, active_only: bool = True, db: Session = Depends(get_db)):
+        return crud.get_all_reviewers(db, skip, limit, active_only)
+
+    @app.get("/api/reviewers/{employee_id}", response_model=schemas.ReviewerResponse, tags=["审单员管理"])
+    async def get_reviewer(employee_id: str, db: Session = Depends(get_db)):
+        reviewer = crud.get_reviewer_by_employee_id(db, employee_id)
+        if not reviewer:
+            raise HTTPException(status_code=404, detail=f"审单员工号 {employee_id} 不存在")
+        return reviewer
+
+    @app.get("/api/review/pending", response_model=List[schemas.AuditRecordResponse], tags=["审单员工作台"])
+    async def list_pending_reviews(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+        return crud.get_pending_review_audits(db, skip, limit)
+
+    @app.post("/api/audit/{audit_record_id}/claim", response_model=schemas.ReviewAssignmentResponse, tags=["审单员工作台"])
+    async def claim_review(audit_record_id: int, claim_req: schemas.ReviewClaimRequest, db: Session = Depends(get_db)):
+        try:
+            assignment = crud.claim_review_task(db, audit_record_id, claim_req.employee_id)
+            reviewer = crud.get_reviewer_by_id(db, assignment.reviewer_id)
+            return {
+                "id": assignment.id,
+                "audit_record_id": assignment.audit_record_id,
+                "reviewer_id": assignment.reviewer_id,
+                "reviewer_name": reviewer.name if reviewer else None,
+                "claimed_at": assignment.claimed_at,
+                "expires_at": assignment.expires_at,
+                "completed_at": assignment.completed_at,
+                "is_expired": assignment.is_expired
+            }
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/api/reviewer/{employee_id}/assignments", response_model=List[schemas.ReviewAssignmentResponse], tags=["审单员工作台"])
+    async def get_reviewer_assignments(employee_id: str, db: Session = Depends(get_db)):
+        reviewer = crud.get_reviewer_by_employee_id(db, employee_id)
+        if not reviewer:
+            raise HTTPException(status_code=404, detail=f"审单员工号 {employee_id} 不存在")
+        assignments = crud.get_reviewer_active_assignments(db, reviewer.id)
+        result = []
+        for assignment in assignments:
+            result.append({
+                "id": assignment.id,
+                "audit_record_id": assignment.audit_record_id,
+                "reviewer_id": assignment.reviewer_id,
+                "reviewer_name": reviewer.name,
+                "claimed_at": assignment.claimed_at,
+                "expires_at": assignment.expires_at,
+                "completed_at": assignment.completed_at,
+                "is_expired": assignment.is_expired
+            })
+        return result
+
+    @app.get("/api/audit/{audit_record_id}/review", response_model=schemas.AuditRecordWithReviewResponse, tags=["审单员工作台"])
+    async def get_audit_for_review(audit_record_id: int, db: Session = Depends(get_db)):
+        result = crud.get_audit_record_with_review(db, audit_record_id)
+        if not result:
+            raise HTTPException(status_code=404, detail=f"审核记录 {audit_record_id} 不存在")
+        return result
+
+    @app.post("/api/audit/{audit_record_id}/review", tags=["审单员工作台"])
+    async def complete_review(audit_record_id: int, review_data: schemas.ReviewCompleteRequest, db: Session = Depends(get_db)):
+        assignments = crud.get_active_assignment_for_audit(db, audit_record_id)
+        if not assignments:
+            raise HTTPException(status_code=400, detail="该交单未被认领或认领已过期")
+
+        try:
+            result = crud.complete_review(db, audit_record_id, assignments.reviewer_id, review_data)
+            return {
+                "message": "复核完成",
+                "submission_id": result["audit_record"].submission_id,
+                "final_conclusion": result["audit_record"].final_conclusion,
+                "review_duration_seconds": result["review_duration_seconds"],
+                "review_status": result["audit_record"].review_status
+            }
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/api/review/expire-check", tags=["审单员工作台"])
+    async def expire_overdue_reviews(db: Session = Depends(get_db)):
+        count = crud.expire_overdue_assignments(db)
+        return {"expired_count": count, "message": f"已释放 {count} 个过期认领任务"}
+
+    @app.get("/api/reviewer/{employee_id}/stats", response_model=schemas.ReviewerStatsResponse, tags=["审单员工作台"])
+    async def get_reviewer_statistics(
+        employee_id: str,
+        start_date: date,
+        end_date: date,
+        db: Session = Depends(get_db)
+    ):
+        reviewer = crud.get_reviewer_by_employee_id(db, employee_id)
+        if not reviewer:
+            raise HTTPException(status_code=404, detail=f"审单员工号 {employee_id} 不存在")
+        try:
+            if start_date > end_date:
+                raise HTTPException(status_code=400, detail="开始日期不能大于结束日期")
+            return crud.get_reviewer_stats(db, reviewer.id, start_date, end_date)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
     return app
 
 

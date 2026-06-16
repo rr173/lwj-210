@@ -7,7 +7,7 @@ from datetime import date, timedelta
 from app.database import Base, engine, SessionLocal
 from app import models, schemas, crud
 from app.audit_engine import AuditEngine
-from app.models import FEE_TYPE_FIRST_SUBMISSION
+from app.models import FEE_TYPE_FIRST_SUBMISSION, REVIEW_STATUS_PENDING
 
 
 def init_db():
@@ -196,8 +196,11 @@ def seed_data():
             original_submission_id=submission1_id, resubmission_round=0,
             modification_remark=None,
             conclusion=conclusion1,
+            auto_conclusion=conclusion1,
+            final_conclusion=None,
             total_discrepancies=len(discrepancies1), critical_count=critical1,
-            minor_count=minor1, presentation_date=presentation_date1
+            minor_count=minor1, presentation_date=presentation_date1,
+            review_status=REVIEW_STATUS_PENDING
         )
         db.add(audit1)
         db.flush()
@@ -313,8 +316,11 @@ def seed_data():
             original_submission_id=submission2_id, resubmission_round=0,
             modification_remark=None,
             conclusion=conclusion2,
+            auto_conclusion=conclusion2,
+            final_conclusion=None,
             total_discrepancies=len(discrepancies2), critical_count=critical2,
-            minor_count=minor2, presentation_date=presentation_date2
+            minor_count=minor2, presentation_date=presentation_date2,
+            review_status=REVIEW_STATUS_PENDING
         )
         db.add(audit2)
         db.flush()

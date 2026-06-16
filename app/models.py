@@ -4,6 +4,22 @@ from datetime import datetime, timedelta
 
 from app.database import Base
 
+REVIEW_STATUS_PENDING = "pending_review"
+REVIEW_STATUS_IN_REVIEW = "in_review"
+REVIEW_STATUS_REVIEWED = "reviewed"
+VALID_REVIEW_STATUSES = [REVIEW_STATUS_PENDING, REVIEW_STATUS_IN_REVIEW, REVIEW_STATUS_REVIEWED]
+
+REVIEW_ACTION_CONFIRM = "confirm"
+REVIEW_ACTION_OVERRULE = "overrule"
+REVIEW_ACTION_ADD_DISCREPANCY = "add_discrepancy"
+REVIEW_ACTION_REMOVE_DISCREPANCY = "remove_discrepancy"
+VALID_REVIEW_ACTIONS = [REVIEW_ACTION_CONFIRM, REVIEW_ACTION_OVERRULE, REVIEW_ACTION_ADD_DISCREPANCY, REVIEW_ACTION_REMOVE_DISCREPANCY]
+
+DISCREPANCY_ACTION_REMOVED = "removed"
+DISCREPANCY_ACTION_MANUAL = "manual"
+
+CLAIM_TIMEOUT_HOURS = 24
+
 
 FEE_TIER_STANDARD = "standard"
 FEE_TIER_PREFERRED = "preferred"
@@ -143,11 +159,16 @@ class AuditRecord(Base):
     resubmission_round = Column(Integer, default=0)
     modification_remark = Column(Text, nullable=True)
     conclusion = Column(String(50), nullable=False)
+    auto_conclusion = Column(String(50), nullable=True)
+    final_conclusion = Column(String(50), nullable=True)
     total_discrepancies = Column(Integer, default=0)
     critical_count = Column(Integer, default=0)
     minor_count = Column(Integer, default=0)
     presentation_date = Column(Date, nullable=False)
+    review_status = Column(String(20), default=REVIEW_STATUS_PENDING, nullable=False)
     discrepancies = relationship("Discrepancy", back_populates="audit_record", cascade="all, delete-orphan")
+    review_assignments = relationship("ReviewAssignment", back_populates="audit_record", cascade="all, delete-orphan")
+    review_opinions = relationship("ReviewOpinion", back_populates="audit_record", cascade="all, delete-orphan")
     lc = relationship("LetterOfCredit", back_populates="audit_records")
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -162,6 +183,9 @@ class Discrepancy(Base):
     document_type = Column(String(50))
     description = Column(Text, nullable=False)
     lc_clause_reference = Column(String(255))
+    source = Column(String(20), default="auto", nullable=False)
+    is_removed = Column(Boolean, default=False, nullable=False)
+    removal_reason = Column(Text, nullable=True)
     audit_record = relationship("AuditRecord", back_populates="discrepancies")
 
 
@@ -185,3 +209,51 @@ class FeeRecord(Base):
 
     lc = relationship("LetterOfCredit", back_populates="fee_records")
     audit_record = relationship("AuditRecord")
+
+
+class Reviewer(Base):
+    __tablename__ = "reviewers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    employee_id = Column(String(50), unique=True, index=True, nullable=False)
+    name = Column(String(100), nullable=False)
+    department = Column(String(200), nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    review_assignments = relationship("ReviewAssignment", back_populates="reviewer")
+    review_opinions = relationship("ReviewOpinion", back_populates="reviewer")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ReviewAssignment(Base):
+    __tablename__ = "review_assignments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    audit_record_id = Column(Integer, ForeignKey("audit_records.id"), nullable=False)
+    reviewer_id = Column(Integer, ForeignKey("reviewers.id"), nullable=False)
+    claimed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+    is_expired = Column(Boolean, default=False, nullable=False)
+    audit_record = relationship("AuditRecord", back_populates="review_assignments")
+    reviewer = relationship("Reviewer", back_populates="review_assignments")
+
+    def is_still_valid(self) -> bool:
+        if self.completed_at is not None or self.is_expired:
+            return False
+        return datetime.utcnow() <= self.expires_at
+
+
+class ReviewOpinion(Base):
+    __tablename__ = "review_opinions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    audit_record_id = Column(Integer, ForeignKey("audit_records.id"), nullable=False)
+    reviewer_id = Column(Integer, ForeignKey("reviewers.id"), nullable=False)
+    action_type = Column(String(30), nullable=False)
+    overruled_reason = Column(Text, nullable=True)
+    new_conclusion = Column(String(50), nullable=True)
+    remarks = Column(Text, nullable=True)
+    review_duration_seconds = Column(Integer, nullable=True)
+    audit_record = relationship("AuditRecord", back_populates="review_opinions")
+    reviewer = relationship("Reviewer", back_populates="review_opinions")
+    created_at = Column(DateTime, default=datetime.utcnow)

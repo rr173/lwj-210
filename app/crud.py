@@ -20,6 +20,15 @@ from app.models import (
     FEE_STATUS_PENDING,
     VALID_FEE_TIERS,
     FEE_TIER_STANDARD,
+    REVIEW_STATUS_PENDING,
+    REVIEW_STATUS_IN_REVIEW,
+    REVIEW_STATUS_REVIEWED,
+    REVIEW_ACTION_CONFIRM,
+    REVIEW_ACTION_OVERRULE,
+    REVIEW_ACTION_ADD_DISCREPANCY,
+    REVIEW_ACTION_REMOVE_DISCREPANCY,
+    DISCREPANCY_ACTION_MANUAL,
+    CLAIM_TIMEOUT_HOURS,
 )
 
 
@@ -256,10 +265,13 @@ def submit_documents_and_audit(db: Session, submission: schemas.SubmissionSubmit
         resubmission_round=0,
         modification_remark=None,
         conclusion=conclusion,
+        auto_conclusion=conclusion,
+        final_conclusion=None,
         total_discrepancies=len(discrepancies),
         critical_count=critical_count,
         minor_count=minor_count,
-        presentation_date=submission.presentation_date
+        presentation_date=submission.presentation_date,
+        review_status=REVIEW_STATUS_PENDING
     )
     db.add(audit_record)
     db.flush()
@@ -369,10 +381,13 @@ def resubmit_documents_and_audit(db: Session, original_submission_id: str, resub
         resubmission_round=new_round,
         modification_remark=resubmit.modification_remark,
         conclusion=conclusion,
+        auto_conclusion=conclusion,
+        final_conclusion=None,
         total_discrepancies=len(discrepancies),
         critical_count=critical_count,
         minor_count=minor_count,
-        presentation_date=resubmit.presentation_date
+        presentation_date=resubmit.presentation_date,
+        review_status=REVIEW_STATUS_PENDING
     )
     db.add(audit_record)
     db.flush()
@@ -942,3 +957,405 @@ def get_fee_records_by_time_range(
 
 def get_all_fee_records(db: Session, skip: int = 0, limit: int = 100) -> List[models.FeeRecord]:
     return db.query(models.FeeRecord).order_by(models.FeeRecord.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def create_reviewer(db: Session, reviewer_data: schemas.ReviewerCreate) -> models.Reviewer:
+    existing = db.query(models.Reviewer).filter(
+        models.Reviewer.employee_id == reviewer_data.employee_id
+    ).first()
+    if existing:
+        raise ValueError(f"工号 {reviewer_data.employee_id} 已存在")
+
+    db_reviewer = models.Reviewer(
+        employee_id=reviewer_data.employee_id,
+        name=reviewer_data.name,
+        department=reviewer_data.department,
+        is_active=True
+    )
+    db.add(db_reviewer)
+    db.commit()
+    db.refresh(db_reviewer)
+    return db_reviewer
+
+
+def get_reviewer_by_employee_id(db: Session, employee_id: str) -> Optional[models.Reviewer]:
+    return db.query(models.Reviewer).filter(
+        models.Reviewer.employee_id == employee_id
+    ).first()
+
+
+def get_reviewer_by_id(db: Session, reviewer_id: int) -> Optional[models.Reviewer]:
+    return db.query(models.Reviewer).filter(models.Reviewer.id == reviewer_id).first()
+
+
+def get_all_reviewers(db: Session, skip: int = 0, limit: int = 100, active_only: bool = True) -> List[models.Reviewer]:
+    query = db.query(models.Reviewer)
+    if active_only:
+        query = query.filter(models.Reviewer.is_active == True)
+    return query.order_by(models.Reviewer.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def expire_overdue_assignments(db: Session) -> int:
+    now = datetime.utcnow()
+    expired = db.query(models.ReviewAssignment).filter(
+        models.ReviewAssignment.completed_at.is_(None),
+        models.ReviewAssignment.is_expired == False,
+        models.ReviewAssignment.expires_at < now
+    ).all()
+
+    count = 0
+    for assignment in expired:
+        assignment.is_expired = True
+        audit_record = db.query(models.AuditRecord).filter(
+            models.AuditRecord.id == assignment.audit_record_id
+        ).first()
+        if audit_record and audit_record.review_status == REVIEW_STATUS_IN_REVIEW:
+            audit_record.review_status = REVIEW_STATUS_PENDING
+        count += 1
+
+    if count > 0:
+        db.commit()
+    return count
+
+
+def get_pending_review_audits(db: Session, skip: int = 0, limit: int = 100) -> List[models.AuditRecord]:
+    expire_overdue_assignments(db)
+    return db.query(models.AuditRecord).filter(
+        models.AuditRecord.review_status == REVIEW_STATUS_PENDING
+    ).order_by(models.AuditRecord.created_at.asc()).offset(skip).limit(limit).all()
+
+
+def get_active_assignment_for_audit(db: Session, audit_record_id: int) -> Optional[models.ReviewAssignment]:
+    return db.query(models.ReviewAssignment).filter(
+        models.ReviewAssignment.audit_record_id == audit_record_id,
+        models.ReviewAssignment.completed_at.is_(None),
+        models.ReviewAssignment.is_expired == False
+    ).first()
+
+
+def claim_review_task(db: Session, audit_record_id: int, employee_id: str) -> models.ReviewAssignment:
+    expire_overdue_assignments(db)
+
+    reviewer = get_reviewer_by_employee_id(db, employee_id)
+    if not reviewer:
+        raise ValueError(f"审单员工号 {employee_id} 不存在")
+    if not reviewer.is_active:
+        raise ValueError(f"审单员 {reviewer.name} 已停用")
+
+    audit_record = db.query(models.AuditRecord).filter(
+        models.AuditRecord.id == audit_record_id
+    ).first()
+    if not audit_record:
+        raise ValueError(f"审核记录 {audit_record_id} 不存在")
+
+    if audit_record.review_status == REVIEW_STATUS_REVIEWED:
+        raise ValueError("该交单已完成复核，无法认领")
+
+    active_assignment = get_active_assignment_for_audit(db, audit_record_id)
+    if active_assignment:
+        if active_assignment.reviewer_id == reviewer.id:
+            return active_assignment
+        raise ValueError("该交单已被其他审单员认领")
+
+    now = datetime.utcnow()
+    expires_at = now + timedelta(hours=CLAIM_TIMEOUT_HOURS)
+
+    assignment = models.ReviewAssignment(
+        audit_record_id=audit_record_id,
+        reviewer_id=reviewer.id,
+        claimed_at=now,
+        expires_at=expires_at,
+        is_expired=False
+    )
+    db.add(assignment)
+
+    audit_record.review_status = REVIEW_STATUS_IN_REVIEW
+
+    db.commit()
+    db.refresh(assignment)
+    return assignment
+
+
+def get_reviewer_active_assignments(db: Session, reviewer_id: int) -> List[models.ReviewAssignment]:
+    expire_overdue_assignments(db)
+    return db.query(models.ReviewAssignment).filter(
+        models.ReviewAssignment.reviewer_id == reviewer_id,
+        models.ReviewAssignment.completed_at.is_(None),
+        models.ReviewAssignment.is_expired == False
+    ).order_by(models.ReviewAssignment.claimed_at.asc()).all()
+
+
+def _recalculate_discrepancy_counts(db: Session, audit_record_id: int) -> None:
+    audit_record = db.query(models.AuditRecord).filter(
+        models.AuditRecord.id == audit_record_id
+    ).first()
+    if not audit_record:
+        return
+
+    active_discrepancies = [
+        d for d in audit_record.discrepancies
+        if not d.is_removed
+    ]
+    audit_record.total_discrepancies = len(active_discrepancies)
+    audit_record.critical_count = sum(1 for d in active_discrepancies if d.severity == "critical")
+    audit_record.minor_count = sum(1 for d in active_discrepancies if d.severity == "minor")
+
+
+def _determine_conclusion_from_discrepancies(audit_record: models.AuditRecord) -> str:
+    active_discrepancies = [
+        d for d in audit_record.discrepancies
+        if not d.is_removed
+    ]
+    total = len(active_discrepancies)
+    critical_count = sum(1 for d in active_discrepancies if d.severity == "critical")
+    minor_count = sum(1 for d in active_discrepancies if d.severity == "minor")
+
+    if total == 0:
+        return "compliant"
+    elif critical_count == 0 and minor_count <= 2:
+        return "minor_discrepancy"
+    else:
+        return "discrepant"
+
+
+def add_manual_discrepancy(
+    db: Session,
+    audit_record_id: int,
+    reviewer_id: int,
+    disc_data: schemas.DiscrepancyCreateRequest
+) -> models.Discrepancy:
+    db_disc = models.Discrepancy(
+        audit_record_id=audit_record_id,
+        discrepancy_type=disc_data.discrepancy_type,
+        severity=disc_data.severity,
+        document_type=disc_data.document_type,
+        description=disc_data.description,
+        lc_clause_reference=disc_data.lc_clause_reference,
+        source=DISCREPANCY_ACTION_MANUAL,
+        is_removed=False
+    )
+    db.add(db_disc)
+    db.flush()
+    _recalculate_discrepancy_counts(db, audit_record_id)
+    return db_disc
+
+
+def remove_discrepancy(
+    db: Session,
+    discrepancy_id: int,
+    removal_reason: str
+) -> Optional[models.Discrepancy]:
+    discrepancy = db.query(models.Discrepancy).filter(
+        models.Discrepancy.id == discrepancy_id
+    ).first()
+    if not discrepancy:
+        raise ValueError(f"不符点 {discrepancy_id} 不存在")
+    if discrepancy.is_removed:
+        raise ValueError("该不符点已被标记为误判")
+
+    discrepancy.is_removed = True
+    discrepancy.removal_reason = removal_reason
+    _recalculate_discrepancy_counts(db, discrepancy.audit_record_id)
+    return discrepancy
+
+
+def complete_review(
+    db: Session,
+    audit_record_id: int,
+    reviewer_id: int,
+    review_data: schemas.ReviewCompleteRequest
+) -> Dict[str, Any]:
+    expire_overdue_assignments(db)
+
+    audit_record = db.query(models.AuditRecord).filter(
+        models.AuditRecord.id == audit_record_id
+    ).first()
+    if not audit_record:
+        raise ValueError(f"审核记录 {audit_record_id} 不存在")
+
+    if audit_record.review_status == REVIEW_STATUS_REVIEWED:
+        raise ValueError("该交单已完成复核")
+
+    active_assignment = get_active_assignment_for_audit(db, audit_record_id)
+    if not active_assignment:
+        raise ValueError("该交单未被认领或认领已过期")
+    if active_assignment.reviewer_id != reviewer_id:
+        raise ValueError("该交单由其他审单员认领，您无权操作")
+
+    action = review_data.action.value if hasattr(review_data.action, 'value') else review_data.action
+
+    if action == REVIEW_ACTION_CONFIRM:
+        audit_record.final_conclusion = audit_record.auto_conclusion
+        audit_record.conclusion = audit_record.auto_conclusion
+
+    elif action == REVIEW_ACTION_OVERRULE:
+        if not review_data.overrule_data:
+            raise ValueError("推翻结论时必须提供 overrule_data")
+        valid_conclusions = ["compliant", "minor_discrepancy", "discrepant"]
+        if review_data.overrule_data.new_conclusion not in valid_conclusions:
+            raise ValueError(f"无效的结论值，允许的值: {', '.join(valid_conclusions)}")
+        audit_record.final_conclusion = review_data.overrule_data.new_conclusion
+        audit_record.conclusion = review_data.overrule_data.new_conclusion
+
+    elif action in [REVIEW_ACTION_ADD_DISCREPANCY, REVIEW_ACTION_REMOVE_DISCREPANCY]:
+        pass
+    else:
+        raise ValueError(f"无效的操作类型: {action}")
+
+    if review_data.remove_discrepancies:
+        for remove_req in review_data.remove_discrepancies:
+            remove_discrepancy(db, remove_req.discrepancy_id, remove_req.removal_reason)
+
+    if review_data.add_discrepancies:
+        for add_req in review_data.add_discrepancies:
+            add_manual_discrepancy(db, audit_record_id, reviewer_id, add_req)
+
+    if action == REVIEW_ACTION_ADD_DISCREPANCY or action == REVIEW_ACTION_REMOVE_DISCREPANCY:
+        new_conclusion = _determine_conclusion_from_discrepancies(audit_record)
+        audit_record.final_conclusion = new_conclusion
+        audit_record.conclusion = new_conclusion
+
+    fee_record = db.query(models.FeeRecord).filter(
+        models.FeeRecord.audit_record_id == audit_record_id
+    ).first()
+    if fee_record:
+        fee_record.status = determine_fee_status(audit_record.conclusion)
+
+    now = datetime.utcnow()
+    review_duration = int((now - active_assignment.claimed_at).total_seconds())
+
+    opinion = models.ReviewOpinion(
+        audit_record_id=audit_record_id,
+        reviewer_id=reviewer_id,
+        action_type=action,
+        overruled_reason=review_data.overrule_data.overruled_reason if review_data.overrule_data else None,
+        new_conclusion=audit_record.final_conclusion,
+        remarks=review_data.remarks,
+        review_duration_seconds=review_duration
+    )
+    db.add(opinion)
+
+    active_assignment.completed_at = now
+    audit_record.review_status = REVIEW_STATUS_REVIEWED
+
+    db.commit()
+    db.refresh(audit_record)
+    db.refresh(opinion)
+
+    return {
+        "audit_record": audit_record,
+        "review_opinion": opinion,
+        "review_duration_seconds": review_duration
+    }
+
+
+def get_audit_record_with_review(db: Session, audit_record_id: int) -> Dict[str, Any]:
+    audit_record = db.query(models.AuditRecord).filter(
+        models.AuditRecord.id == audit_record_id
+    ).first()
+    if not audit_record:
+        return None
+
+    expire_overdue_assignments(db)
+    db.refresh(audit_record)
+
+    active_assignment = get_active_assignment_for_audit(db, audit_record_id)
+    assignment_dict = None
+    if active_assignment:
+        reviewer = get_reviewer_by_id(db, active_assignment.reviewer_id)
+        assignment_dict = {
+            "id": active_assignment.id,
+            "audit_record_id": active_assignment.audit_record_id,
+            "reviewer_id": active_assignment.reviewer_id,
+            "reviewer_name": reviewer.name if reviewer else None,
+            "claimed_at": active_assignment.claimed_at,
+            "expires_at": active_assignment.expires_at,
+            "completed_at": active_assignment.completed_at,
+            "is_expired": active_assignment.is_expired
+        }
+
+    opinions = []
+    for opinion in audit_record.review_opinions:
+        reviewer = get_reviewer_by_id(db, opinion.reviewer_id)
+        opinions.append({
+            "id": opinion.id,
+            "audit_record_id": opinion.audit_record_id,
+            "reviewer_id": opinion.reviewer_id,
+            "reviewer_name": reviewer.name if reviewer else None,
+            "action_type": opinion.action_type,
+            "overruled_reason": opinion.overruled_reason,
+            "new_conclusion": opinion.new_conclusion,
+            "remarks": opinion.remarks,
+            "review_duration_seconds": opinion.review_duration_seconds,
+            "created_at": opinion.created_at
+        })
+
+    lc = get_letter_of_credit_by_id(db, audit_record.lc_id)
+    documents = get_documents_by_submission(db, audit_record.submission_id)
+
+    return {
+        "id": audit_record.id,
+        "lc_id": audit_record.lc_id,
+        "submission_id": audit_record.submission_id,
+        "original_submission_id": audit_record.original_submission_id,
+        "resubmission_round": audit_record.resubmission_round,
+        "modification_remark": audit_record.modification_remark,
+        "conclusion": audit_record.conclusion,
+        "auto_conclusion": audit_record.auto_conclusion,
+        "final_conclusion": audit_record.final_conclusion,
+        "total_discrepancies": audit_record.total_discrepancies,
+        "critical_count": audit_record.critical_count,
+        "minor_count": audit_record.minor_count,
+        "presentation_date": audit_record.presentation_date,
+        "review_status": audit_record.review_status,
+        "discrepancies": audit_record.discrepancies,
+        "created_at": audit_record.created_at,
+        "lc": lc,
+        "documents": documents,
+        "active_assignment": assignment_dict,
+        "review_opinions": opinions
+    }
+
+
+def get_reviewer_stats(
+    db: Session,
+    reviewer_id: int,
+    start_date: date,
+    end_date: date
+) -> Dict[str, Any]:
+    from sqlalchemy import func
+
+    reviewer = get_reviewer_by_id(db, reviewer_id)
+    if not reviewer:
+        raise ValueError(f"审单员ID {reviewer_id} 不存在")
+
+    start_dt = datetime.combine(start_date, datetime.min.time())
+    end_dt = datetime.combine(end_date, datetime.max.time())
+
+    opinions_query = db.query(models.ReviewOpinion).filter(
+        models.ReviewOpinion.reviewer_id == reviewer_id,
+        models.ReviewOpinion.created_at >= start_dt,
+        models.ReviewOpinion.created_at <= end_dt
+    )
+    opinions = opinions_query.all()
+
+    total_reviewed = len(opinions)
+    confirm_count = sum(1 for o in opinions if o.action_type == REVIEW_ACTION_CONFIRM)
+    overrule_count = sum(1 for o in opinions if o.action_type == REVIEW_ACTION_OVERRULE)
+    total_duration = sum(o.review_duration_seconds or 0 for o in opinions)
+    avg_duration = (total_duration / total_reviewed) if total_reviewed > 0 else 0.0
+    confirm_rate = (confirm_count / total_reviewed) if total_reviewed > 0 else 0.0
+
+    return {
+        "reviewer_id": reviewer.id,
+        "reviewer_name": reviewer.name,
+        "employee_id": reviewer.employee_id,
+        "start_date": start_date,
+        "end_date": end_date,
+        "total_reviewed": total_reviewed,
+        "confirm_count": confirm_count,
+        "confirm_rate": round(confirm_rate, 4),
+        "overrule_count": overrule_count,
+        "avg_review_duration_seconds": round(avg_duration, 2),
+        "total_review_duration_seconds": total_duration
+    }

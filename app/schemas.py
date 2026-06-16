@@ -161,6 +161,9 @@ class DiscrepancyResponse(BaseModel):
     document_type: Optional[str] = None
     description: str
     lc_clause_reference: Optional[str] = None
+    source: str
+    is_removed: bool
+    removal_reason: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -335,3 +338,116 @@ class FeeSummaryResponse(BaseModel):
     total_records: int
     grand_total: float
     by_tier: List[FeeTierSummary]
+
+
+class ReviewStatus(str, Enum):
+    PENDING_REVIEW = "pending_review"
+    IN_REVIEW = "in_review"
+    REVIEWED = "reviewed"
+
+
+class ReviewAction(str, Enum):
+    CONFIRM = "confirm"
+    OVERRULE = "overrule"
+    ADD_DISCREPANCY = "add_discrepancy"
+    REMOVE_DISCREPANCY = "remove_discrepancy"
+
+
+class ReviewerCreate(BaseModel):
+    employee_id: str
+    name: str
+    department: str
+
+
+class ReviewerResponse(BaseModel):
+    id: int
+    employee_id: str
+    name: str
+    department: str
+    is_active: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ReviewAssignmentResponse(BaseModel):
+    id: int
+    audit_record_id: int
+    reviewer_id: int
+    reviewer_name: Optional[str] = None
+    claimed_at: datetime
+    expires_at: datetime
+    completed_at: Optional[datetime] = None
+    is_expired: bool
+
+    class Config:
+        from_attributes = True
+
+
+class ReviewClaimRequest(BaseModel):
+    employee_id: str
+
+
+class DiscrepancyCreateRequest(BaseModel):
+    discrepancy_type: str
+    severity: str
+    document_type: Optional[str] = None
+    description: str
+    lc_clause_reference: Optional[str] = None
+
+
+class DiscrepancyRemoveRequest(BaseModel):
+    discrepancy_id: int
+    removal_reason: str
+
+
+class ReviewOverruleRequest(BaseModel):
+    new_conclusion: str
+    overruled_reason: str
+
+
+class ReviewCompleteRequest(BaseModel):
+    action: ReviewAction
+    overrule_data: Optional[ReviewOverruleRequest] = None
+    add_discrepancies: Optional[List[DiscrepancyCreateRequest]] = None
+    remove_discrepancies: Optional[List[DiscrepancyRemoveRequest]] = None
+    remarks: Optional[str] = None
+
+
+class ReviewOpinionResponse(BaseModel):
+    id: int
+    audit_record_id: int
+    reviewer_id: int
+    reviewer_name: Optional[str] = None
+    action_type: str
+    overruled_reason: Optional[str] = None
+    new_conclusion: Optional[str] = None
+    remarks: Optional[str] = None
+    review_duration_seconds: Optional[int] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AuditRecordWithReviewResponse(AuditRecordResponse):
+    review_status: str
+    auto_conclusion: Optional[str] = None
+    final_conclusion: Optional[str] = None
+    active_assignment: Optional[ReviewAssignmentResponse] = None
+    review_opinions: List[ReviewOpinionResponse] = []
+
+
+class ReviewerStatsResponse(BaseModel):
+    reviewer_id: int
+    reviewer_name: str
+    employee_id: str
+    start_date: date
+    end_date: date
+    total_reviewed: int
+    confirm_count: int
+    confirm_rate: float
+    overrule_count: int
+    avg_review_duration_seconds: float
+    total_review_duration_seconds: int
