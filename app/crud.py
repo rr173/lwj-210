@@ -2,6 +2,7 @@ from sqlalchemy.orm import Session
 from typing import List, Optional, Dict, Any
 from datetime import date, datetime, timedelta
 import copy
+import random
 
 from app import models, schemas
 from app.audit_engine import AuditEngine
@@ -30,6 +31,13 @@ from app.models import (
     REVIEW_ACTION_REMOVE_DISCREPANCY,
     DISCREPANCY_ACTION_MANUAL,
     CLAIM_TIMEOUT_HOURS,
+    RULE_VERSION_STATUS_DRAFT,
+    RULE_VERSION_STATUS_TESTING,
+    RULE_VERSION_STATUS_ACTIVE,
+    RULE_VERSION_STATUS_ARCHIVED,
+    VALID_RULE_VERSION_STATUSES,
+    VALID_CHECK_CATEGORIES,
+    DEFAULT_RULE_CONTENT,
 )
 
 
@@ -337,7 +345,8 @@ def submit_documents_and_audit(db: Session, submission: schemas.SubmissionSubmit
 
     db.flush()
 
-    engine = AuditEngine(lc, documents, submission.presentation_date)
+    rule_version = resolve_rule_version_for_audit(db)
+    engine = AuditEngine(lc, documents, submission.presentation_date, rule_version=rule_version)
     conclusion, discrepancies = engine.run_audit()
 
     critical_count = sum(1 for d in discrepancies if d["severity"] == "critical")
@@ -356,7 +365,8 @@ def submit_documents_and_audit(db: Session, submission: schemas.SubmissionSubmit
         critical_count=critical_count,
         minor_count=minor_count,
         presentation_date=submission.presentation_date,
-        review_status=REVIEW_STATUS_PENDING
+        review_status=REVIEW_STATUS_PENDING,
+        rule_version_id=rule_version.id if rule_version else None
     )
     db.add(audit_record)
     db.flush()
@@ -462,7 +472,8 @@ def resubmit_documents_and_audit(db: Session, original_submission_id: str, resub
 
     db.flush()
 
-    engine = AuditEngine(lc, documents, resubmit.presentation_date)
+    rule_version = resolve_rule_version_for_audit(db)
+    engine = AuditEngine(lc, documents, resubmit.presentation_date, rule_version=rule_version)
     conclusion, discrepancies = engine.run_audit()
 
     critical_count = sum(1 for d in discrepancies if d["severity"] == "critical")
@@ -481,7 +492,8 @@ def resubmit_documents_and_audit(db: Session, original_submission_id: str, resub
         critical_count=critical_count,
         minor_count=minor_count,
         presentation_date=resubmit.presentation_date,
-        review_status=REVIEW_STATUS_PENDING
+        review_status=REVIEW_STATUS_PENDING,
+        rule_version_id=rule_version.id if rule_version else None
     )
     db.add(audit_record)
     db.flush()
@@ -824,7 +836,7 @@ def re_audit_pending_submissions(db: Session, lc_id: int) -> List[models.AuditRe
         if not lc:
             continue
 
-        engine = AuditEngine(lc, documents, record.presentation_date)
+        engine = AuditEngine(lc, documents, record.presentation_date, rule_version=record.rule_version)
         conclusion, discrepancies = engine.run_audit()
 
         critical_count = sum(1 for d in discrepancies if d["severity"] == "critical")
@@ -1509,6 +1521,7 @@ def get_audit_record_with_review(db: Session, audit_record_id: int) -> Dict[str,
         "minor_count": audit_record.minor_count,
         "presentation_date": audit_record.presentation_date,
         "review_status": audit_record.review_status,
+        "rule_version_id": audit_record.rule_version_id,
         "discrepancies": audit_record.discrepancies,
         "created_at": audit_record.created_at,
         "lc": lc,
@@ -3058,3 +3071,239 @@ def create_lc_with_parties(db: Session, lc_data: schemas.LetterOfCreditCreate) -
     db.commit()
     db.refresh(lc)
     return lc
+
+
+def create_rule_version(db: Session, data: schemas.RuleVersionCreate) -> models.RuleVersion:
+    existing = db.query(models.RuleVersion).filter(
+        models.RuleVersion.version_number == data.version_number
+    ).first()
+    if existing:
+        raise ValueError(f"版本号 {data.version_number} 已存在")
+
+    rules_dict = data.rules.model_dump()
+
+    for cat in rules_dict.get("enabled_categories", []):
+        if cat not in VALID_CHECK_CATEGORIES:
+            raise ValueError(f"无效的检查类别: {cat}，允许值: {', '.join(VALID_CHECK_CATEGORIES)}")
+
+    if rules_dict.get("amount_tolerance") is not None and rules_dict["amount_tolerance"] < 0:
+        raise ValueError("金额容差阈值不能为负数")
+
+    if rules_dict.get("date_tolerance_days") is not None and rules_dict["date_tolerance_days"] < 0:
+        raise ValueError("日期容差天数不能为负数")
+
+    rule_version = models.RuleVersion(
+        version_number=data.version_number,
+        status=RULE_VERSION_STATUS_DRAFT,
+        rules=rules_dict,
+        grayscale_percentage=0,
+        description=data.description,
+    )
+    db.add(rule_version)
+    db.commit()
+    db.refresh(rule_version)
+    return rule_version
+
+
+def get_rule_version_by_number(db: Session, version_number: str) -> Optional[models.RuleVersion]:
+    return db.query(models.RuleVersion).filter(
+        models.RuleVersion.version_number == version_number
+    ).first()
+
+
+def get_rule_version_by_id(db: Session, version_id: int) -> Optional[models.RuleVersion]:
+    return db.query(models.RuleVersion).filter(models.RuleVersion.id == version_id).first()
+
+
+def get_all_rule_versions(db: Session, status: Optional[str] = None, skip: int = 0, limit: int = 100) -> List[models.RuleVersion]:
+    query = db.query(models.RuleVersion)
+    if status:
+        if status not in VALID_RULE_VERSION_STATUSES:
+            raise ValueError(f"无效的版本状态: {status}，允许值: {', '.join(VALID_RULE_VERSION_STATUSES)}")
+        query = query.filter(models.RuleVersion.status == status)
+    return query.order_by(models.RuleVersion.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def update_rule_version(db: Session, version_number: str, data: schemas.RuleVersionUpdate) -> models.RuleVersion:
+    rule_version = get_rule_version_by_number(db, version_number)
+    if not rule_version:
+        raise ValueError(f"版本 {version_number} 不存在")
+
+    if rule_version.status != RULE_VERSION_STATUS_DRAFT:
+        raise ValueError(f"只有 draft 状态的版本可以编辑，当前状态: {rule_version.status}")
+
+    if data.rules is not None:
+        rules_dict = data.rules.model_dump()
+        for cat in rules_dict.get("enabled_categories", []):
+            if cat not in VALID_CHECK_CATEGORIES:
+                raise ValueError(f"无效的检查类别: {cat}")
+        if rules_dict.get("amount_tolerance") is not None and rules_dict["amount_tolerance"] < 0:
+            raise ValueError("金额容差阈值不能为负数")
+        if rules_dict.get("date_tolerance_days") is not None and rules_dict["date_tolerance_days"] < 0:
+            raise ValueError("日期容差天数不能为负数")
+        rule_version.rules = rules_dict
+
+    if data.description is not None:
+        rule_version.description = data.description
+
+    rule_version.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(rule_version)
+    return rule_version
+
+
+def publish_rule_version_to_testing(db: Session, version_number: str, grayscale_percentage: int) -> models.RuleVersion:
+    rule_version = get_rule_version_by_number(db, version_number)
+    if not rule_version:
+        raise ValueError(f"版本 {version_number} 不存在")
+
+    if rule_version.status != RULE_VERSION_STATUS_DRAFT:
+        raise ValueError(f"只有 draft 状态的版本可以发布为 testing，当前状态: {rule_version.status}")
+
+    if grayscale_percentage < 0 or grayscale_percentage > 100:
+        raise ValueError("灰度比例必须在 0-100 之间")
+
+    existing_testing = db.query(models.RuleVersion).filter(
+        models.RuleVersion.status == RULE_VERSION_STATUS_TESTING
+    ).first()
+    if existing_testing:
+        raise ValueError(f"已有 testing 版本: {existing_testing.version_number}，请先将其发布为 active 或回退为 draft")
+
+    rule_version.status = RULE_VERSION_STATUS_TESTING
+    rule_version.grayscale_percentage = grayscale_percentage
+    rule_version.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(rule_version)
+    return rule_version
+
+
+def publish_rule_version_to_active(db: Session, version_number: str) -> models.RuleVersion:
+    rule_version = get_rule_version_by_number(db, version_number)
+    if not rule_version:
+        raise ValueError(f"版本 {version_number} 不存在")
+
+    if rule_version.status != RULE_VERSION_STATUS_TESTING:
+        raise ValueError(f"只有 testing 状态的版本可以发布为 active，当前状态: {rule_version.status}")
+
+    current_active = db.query(models.RuleVersion).filter(
+        models.RuleVersion.status == RULE_VERSION_STATUS_ACTIVE
+    ).first()
+    if current_active:
+        current_active.status = RULE_VERSION_STATUS_ARCHIVED
+        current_active.archived_at = datetime.utcnow()
+        current_active.updated_at = datetime.utcnow()
+
+    rule_version.status = RULE_VERSION_STATUS_ACTIVE
+    rule_version.grayscale_percentage = 100
+    rule_version.activated_at = datetime.utcnow()
+    rule_version.updated_at = datetime.utcnow()
+
+    db.commit()
+    db.refresh(rule_version)
+    return rule_version
+
+
+def revert_testing_to_draft(db: Session, version_number: str) -> models.RuleVersion:
+    rule_version = get_rule_version_by_number(db, version_number)
+    if not rule_version:
+        raise ValueError(f"版本 {version_number} 不存在")
+
+    if rule_version.status != RULE_VERSION_STATUS_TESTING:
+        raise ValueError(f"只有 testing 状态的版本可以回退为 draft，当前状态: {rule_version.status}")
+
+    rule_version.status = RULE_VERSION_STATUS_DRAFT
+    rule_version.grayscale_percentage = 0
+    rule_version.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(rule_version)
+    return rule_version
+
+
+def compare_rule_versions(db: Session, version_a: str, version_b: str) -> Dict[str, Any]:
+    rv_a = get_rule_version_by_number(db, version_a)
+    rv_b = get_rule_version_by_number(db, version_b)
+    if not rv_a:
+        raise ValueError(f"版本 {version_a} 不存在")
+    if not rv_b:
+        raise ValueError(f"版本 {version_b} 不存在")
+
+    differences = []
+    rules_a = rv_a.rules or {}
+    rules_b = rv_b.rules or {}
+
+    simple_fields = ["amount_tolerance", "date_tolerance_days", "name_case_sensitive"]
+    for field in simple_fields:
+        val_a = rules_a.get(field)
+        val_b = rules_b.get(field)
+        if val_a != val_b:
+            differences.append({
+                "field": field,
+                "old_value": val_a,
+                "new_value": val_b,
+                "path": field,
+            })
+
+    cats_a = set(rules_a.get("enabled_categories", []))
+    cats_b = set(rules_b.get("enabled_categories", []))
+    if cats_a != cats_b:
+        differences.append({
+            "field": "enabled_categories",
+            "old_value": sorted(cats_a),
+            "new_value": sorted(cats_b),
+            "path": "enabled_categories",
+        })
+
+    overrides_a = rules_a.get("severity_overrides", {})
+    overrides_b = rules_b.get("severity_overrides", {})
+    all_override_keys = set(list(overrides_a.keys()) + list(overrides_b.keys()))
+    override_diffs = {}
+    for key in all_override_keys:
+        val_a = overrides_a.get(key)
+        val_b = overrides_b.get(key)
+        if val_a != val_b:
+            override_diffs[key] = {"old_value": val_a, "new_value": val_b}
+    if override_diffs:
+        differences.append({
+            "field": "severity_overrides",
+            "old_value": overrides_a,
+            "new_value": overrides_b,
+            "path": "severity_overrides",
+        })
+
+    return {
+        "version_a": version_a,
+        "version_b": version_b,
+        "differences": differences,
+    }
+
+
+def get_submissions_by_rule_version(db: Session, version_number: str, skip: int = 0, limit: int = 100) -> Dict[str, Any]:
+    rule_version = get_rule_version_by_number(db, version_number)
+    if not rule_version:
+        raise ValueError(f"版本 {version_number} 不存在")
+
+    audit_records = db.query(models.AuditRecord).filter(
+        models.AuditRecord.rule_version_id == rule_version.id
+    ).order_by(models.AuditRecord.created_at.desc()).offset(skip).limit(limit).all()
+
+    return {
+        "rule_version_number": version_number,
+        "total_count": len(audit_records),
+        "submissions": audit_records,
+    }
+
+
+def resolve_rule_version_for_audit(db: Session) -> Optional[models.RuleVersion]:
+    testing_version = db.query(models.RuleVersion).filter(
+        models.RuleVersion.status == RULE_VERSION_STATUS_TESTING
+    ).first()
+
+    if testing_version and testing_version.grayscale_percentage > 0:
+        if random.randint(1, 100) <= testing_version.grayscale_percentage:
+            return testing_version
+
+    active_version = db.query(models.RuleVersion).filter(
+        models.RuleVersion.status == RULE_VERSION_STATUS_ACTIVE
+    ).first()
+
+    return active_version

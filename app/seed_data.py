@@ -12,6 +12,23 @@ from app.models import FEE_TYPE_FIRST_SUBMISSION, REVIEW_STATUS_PENDING
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    _migrate_rule_version_columns()
+
+
+def _migrate_rule_version_columns():
+    from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+    db = SessionLocal()
+    try:
+        try:
+            db.execute(text("SELECT rule_version_id FROM audit_records LIMIT 1"))
+        except OperationalError:
+            db.execute(text("ALTER TABLE audit_records ADD COLUMN rule_version_id INTEGER REFERENCES rule_versions(id)"))
+            db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
 
 
 def seed_data():

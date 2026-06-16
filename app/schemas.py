@@ -184,6 +184,7 @@ class AuditRecordResponse(BaseModel):
     minor_count: int
     presentation_date: date
     review_status: str
+    rule_version_id: Optional[int] = None
     discrepancies: List[DiscrepancyResponse]
     created_at: datetime
 
@@ -206,6 +207,7 @@ class AuditRecordDetailResponse(BaseModel):
     minor_count: int
     presentation_date: date
     review_status: str
+    rule_version_id: Optional[int] = None
     discrepancies: List[DiscrepancyResponse]
     created_at: datetime
     lc: LetterOfCreditResponse
@@ -826,3 +828,91 @@ class LCEventStreamResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class RuleVersionStatus(str, Enum):
+    DRAFT = "draft"
+    TESTING = "testing"
+    ACTIVE = "active"
+    ARCHIVED = "archived"
+
+
+class CheckCategory(str, Enum):
+    COMPLETENESS = "completeness"
+    AMOUNT = "amount"
+    DATE = "date"
+    PARTY = "party"
+    GOODS = "goods"
+    TRANSPORT = "transport"
+    SPECIAL = "special"
+
+
+class SeverityOverrideItem(BaseModel):
+    category: str
+    check_key: str
+    new_severity: str
+
+
+class RuleContent(BaseModel):
+    amount_tolerance: float = 0.01
+    date_tolerance_days: int = 0
+    name_case_sensitive: bool = False
+    enabled_categories: List[str] = [
+        "completeness", "amount", "date", "party", "goods", "transport", "special"
+    ]
+    severity_overrides: Dict[str, Any] = {}
+
+
+class RuleVersionCreate(BaseModel):
+    version_number: str
+    rules: RuleContent
+    description: Optional[str] = None
+
+
+class RuleVersionUpdate(BaseModel):
+    rules: Optional[RuleContent] = None
+    description: Optional[str] = None
+
+
+class RuleVersionPublishTesting(BaseModel):
+    grayscale_percentage: int = Field(..., ge=0, le=100)
+
+
+class RuleVersionResponse(BaseModel):
+    id: int
+    version_number: str
+    status: str
+    rules: Dict[str, Any]
+    grayscale_percentage: int
+    description: Optional[str] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    activated_at: Optional[datetime] = None
+    archived_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class RuleDiffItem(BaseModel):
+    field: str
+    old_value: Any
+    new_value: Any
+    path: Optional[str] = None
+
+
+class RuleVersionDiffResponse(BaseModel):
+    version_a: str
+    version_b: str
+    differences: List[RuleDiffItem]
+
+
+class AuditRecordWithRuleVersionResponse(AuditRecordResponse):
+    rule_version_id: Optional[int] = None
+    rule_version_number: Optional[str] = None
+
+
+class SubmissionByRuleVersionResponse(BaseModel):
+    rule_version_number: str
+    total_count: int
+    submissions: List[AuditRecordResponse]

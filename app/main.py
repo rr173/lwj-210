@@ -124,6 +124,7 @@ def create_app() -> FastAPI:
             "minor_count": audit_record.minor_count,
             "presentation_date": audit_record.presentation_date,
             "review_status": audit_record.review_status,
+            "rule_version_id": audit_record.rule_version_id,
             "discrepancies": audit_record.discrepancies,
             "created_at": audit_record.created_at,
             "lc": lc,
@@ -789,6 +790,83 @@ def create_app() -> FastAPI:
         if not lc:
             raise HTTPException(status_code=404, detail=f"信用证 {lc_number} 不存在")
         return crud.get_lc_event_stream(db, lc.id, skip, limit)
+
+    @app.post("/api/rule-versions", response_model=schemas.RuleVersionResponse, tags=["规则版本管理"], status_code=status.HTTP_201_CREATED)
+    async def create_rule_version(data: schemas.RuleVersionCreate, db: Session = Depends(get_db)):
+        try:
+            return crud.create_rule_version(db, data)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"创建规则版本失败: {str(e)}")
+
+    @app.get("/api/rule-versions", response_model=List[schemas.RuleVersionResponse], tags=["规则版本管理"])
+    async def list_rule_versions(status: Optional[str] = None, skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+        try:
+            return crud.get_all_rule_versions(db, status=status, skip=skip, limit=limit)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/api/rule-versions/{version_number}", response_model=schemas.RuleVersionResponse, tags=["规则版本管理"])
+    async def get_rule_version(version_number: str, db: Session = Depends(get_db)):
+        rv = crud.get_rule_version_by_number(db, version_number)
+        if not rv:
+            raise HTTPException(status_code=404, detail=f"规则版本 {version_number} 不存在")
+        return rv
+
+    @app.put("/api/rule-versions/{version_number}", response_model=schemas.RuleVersionResponse, tags=["规则版本管理"])
+    async def update_rule_version(version_number: str, data: schemas.RuleVersionUpdate, db: Session = Depends(get_db)):
+        try:
+            return crud.update_rule_version(db, version_number, data)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"更新规则版本失败: {str(e)}")
+
+    @app.post("/api/rule-versions/{version_number}/publish-testing", response_model=schemas.RuleVersionResponse, tags=["规则版本管理"])
+    async def publish_rule_version_testing(version_number: str, req: schemas.RuleVersionPublishTesting, db: Session = Depends(get_db)):
+        try:
+            return crud.publish_rule_version_to_testing(db, version_number, req.grayscale_percentage)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"发布灰度测试失败: {str(e)}")
+
+    @app.post("/api/rule-versions/{version_number}/publish-active", response_model=schemas.RuleVersionResponse, tags=["规则版本管理"])
+    async def publish_rule_version_active(version_number: str, db: Session = Depends(get_db)):
+        try:
+            return crud.publish_rule_version_to_active(db, version_number)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"发布正式版本失败: {str(e)}")
+
+    @app.post("/api/rule-versions/{version_number}/revert-draft", response_model=schemas.RuleVersionResponse, tags=["规则版本管理"])
+    async def revert_rule_version_to_draft(version_number: str, db: Session = Depends(get_db)):
+        try:
+            return crud.revert_testing_to_draft(db, version_number)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"回退版本失败: {str(e)}")
+
+    @app.get("/api/rule-versions/compare", response_model=schemas.RuleVersionDiffResponse, tags=["规则版本管理"])
+    async def compare_rule_versions(version_a: str, version_b: str, db: Session = Depends(get_db)):
+        try:
+            return crud.compare_rule_versions(db, version_a, version_b)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"版本对比失败: {str(e)}")
+
+    @app.get("/api/rule-versions/{version_number}/submissions", response_model=schemas.SubmissionByRuleVersionResponse, tags=["规则版本管理"])
+    async def get_submissions_by_rule_version(version_number: str, skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+        try:
+            return crud.get_submissions_by_rule_version(db, version_number, skip, limit)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询交单列表失败: {str(e)}")
 
     return app
 

@@ -153,6 +153,50 @@ class Document(Base):
     lc = relationship("LetterOfCredit", back_populates="documents")
 
 
+RULE_VERSION_STATUS_DRAFT = "draft"
+RULE_VERSION_STATUS_TESTING = "testing"
+RULE_VERSION_STATUS_ACTIVE = "active"
+RULE_VERSION_STATUS_ARCHIVED = "archived"
+VALID_RULE_VERSION_STATUSES = [
+    RULE_VERSION_STATUS_DRAFT,
+    RULE_VERSION_STATUS_TESTING,
+    RULE_VERSION_STATUS_ACTIVE,
+    RULE_VERSION_STATUS_ARCHIVED,
+]
+
+VALID_CHECK_CATEGORIES = [
+    "completeness", "amount", "date", "party", "goods", "transport", "special"
+]
+
+DEFAULT_RULE_CONTENT = {
+    "amount_tolerance": 0.01,
+    "date_tolerance_days": 0,
+    "name_case_sensitive": False,
+    "enabled_categories": [
+        "completeness", "amount", "date", "party", "goods", "transport", "special"
+    ],
+    "severity_overrides": {}
+}
+
+
+class RuleVersion(Base):
+    __tablename__ = "rule_versions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    version_number = Column(String(50), unique=True, index=True, nullable=False)
+    status = Column(String(20), default=RULE_VERSION_STATUS_DRAFT, nullable=False)
+    rules = Column(JSON, nullable=False)
+    grayscale_percentage = Column(Integer, default=0, nullable=False)
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    activated_at = Column(DateTime, nullable=True)
+    archived_at = Column(DateTime, nullable=True)
+
+
+EPSILON = 0.01
+
+
 class AuditRecord(Base):
     __tablename__ = "audit_records"
 
@@ -170,9 +214,11 @@ class AuditRecord(Base):
     minor_count = Column(Integer, default=0)
     presentation_date = Column(Date, nullable=False)
     review_status = Column(String(20), default=REVIEW_STATUS_PENDING, nullable=False)
+    rule_version_id = Column(Integer, ForeignKey("rule_versions.id"), nullable=True)
     discrepancies = relationship("Discrepancy", back_populates="audit_record", cascade="all, delete-orphan")
     review_assignments = relationship("ReviewAssignment", back_populates="audit_record", cascade="all, delete-orphan")
     review_opinions = relationship("ReviewOpinion", back_populates="audit_record", cascade="all, delete-orphan")
+    rule_version = relationship("RuleVersion")
     lc = relationship("LetterOfCredit", back_populates="audit_records")
     created_at = Column(DateTime, default=datetime.utcnow)
 
