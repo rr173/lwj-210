@@ -69,6 +69,10 @@ def create_letter_of_credit(db: Session, lc_data: schemas.LetterOfCreditCreate) 
         )
         db.add(db_req)
 
+    db.flush()
+    associate_lc_parties(db, db_lc)
+    dispatch_notifications(db, db_lc, models.EVENT_TYPE_LC_CREATED)
+
     db.commit()
     db.refresh(db_lc)
     return db_lc
@@ -370,6 +374,9 @@ def submit_documents_and_audit(db: Session, submission: schemas.SubmissionSubmit
 
     create_fee_record(db, lc, audit_record, FEE_TYPE_FIRST_SUBMISSION, len(documents))
 
+    db.flush()
+    dispatch_notifications(db, lc, models.EVENT_TYPE_SUBMISSION_CREATED, event_ref_id=submission.submission_id)
+
     db.commit()
     db.refresh(audit_record)
     return audit_record
@@ -491,6 +498,9 @@ def resubmit_documents_and_audit(db: Session, original_submission_id: str, resub
         db.add(db_disc)
 
     create_fee_record(db, lc, audit_record, FEE_TYPE_RESUBMISSION, len(documents))
+
+    db.flush()
+    dispatch_notifications(db, lc, models.EVENT_TYPE_SUBMISSION_CREATED, event_ref_id=resubmit.new_submission_id)
 
     db.commit()
     db.refresh(audit_record)
@@ -741,6 +751,9 @@ def create_amendment(db: Session, amendment_data: schemas.AmendmentCreate) -> mo
     )
 
     db.add(amendment)
+    db.flush()
+    dispatch_notifications(db, lc, models.EVENT_TYPE_AMENDMENT_CREATED, event_ref_id=amendment_number)
+
     db.commit()
     db.refresh(amendment)
     return amendment
@@ -958,6 +971,9 @@ def accept_amendment(db: Session, amendment_number: str) -> models.LCAmendment:
 
     re_audited = re_audit_pending_submissions(db, amendment.lc_id)
 
+    db.flush()
+    dispatch_notifications(db, lc, models.EVENT_TYPE_AMENDMENT_ACCEPTED, event_ref_id=amendment_number)
+
     db.commit()
     db.refresh(amendment)
     return amendment
@@ -978,6 +994,11 @@ def reject_amendment(db: Session, amendment_number: str) -> models.LCAmendment:
 
     amendment.status = AMENDMENT_STATUS_REJECTED
     amendment.acceptance_time = datetime.utcnow()
+
+    lc = get_letter_of_credit_by_id(db, amendment.lc_id)
+    db.flush()
+    if lc:
+        dispatch_notifications(db, lc, models.EVENT_TYPE_AMENDMENT_REJECTED, event_ref_id=amendment_number)
 
     db.commit()
     db.refresh(amendment)
@@ -1413,6 +1434,11 @@ def complete_review(
     active_assignment.completed_at = now
     audit_record.review_status = REVIEW_STATUS_REVIEWED
 
+    db.flush()
+    lc = get_letter_of_credit_by_id(db, audit_record.lc_id)
+    if lc:
+        dispatch_notifications(db, lc, models.EVENT_TYPE_SUBMISSION_REVIEWED, event_ref_id=audit_record.submission_id)
+
     db.commit()
     db.refresh(audit_record)
     db.refresh(opinion)
@@ -1650,6 +1676,9 @@ def create_transfer(db: Session, transfer_data: schemas.TransferCreate) -> model
     )
 
     db.add(transfer)
+    db.flush()
+    dispatch_notifications(db, lc, models.EVENT_TYPE_TRANSFER_CREATED, event_ref_id=transfer_number)
+
     db.commit()
     db.refresh(transfer)
     return transfer
@@ -1798,6 +1827,9 @@ def create_back_to_back_lc(db: Session, btb_data: schemas.BackToBackLCCreate) ->
             copy_copies=req.copy_copies,
         )
         db.add(db_req)
+
+    db.flush()
+    dispatch_notifications(db, lc, models.EVENT_TYPE_BACK_TO_BACK_CREATED, event_ref_id=back_to_back_number)
 
     db.commit()
     db.refresh(btb_lc)
@@ -2058,6 +2090,8 @@ def create_alert_if_needed(
         if freeze_type and not has_active_freeze(db, lc.id, freeze_type):
             create_freeze_record(db, lc, freeze_type, reason)
 
+    dispatch_notifications(db, lc, models.EVENT_TYPE_ALERT_GENERATED, event_ref_id=alert_number)
+
     return alert
 
 
@@ -2224,6 +2258,7 @@ def create_freeze_record(
 
     db.add(freeze_record)
     db.flush()
+    dispatch_notifications(db, lc, models.EVENT_TYPE_FREEZE_CREATED, event_ref_id=freeze_number)
     return freeze_record
 
 
@@ -2362,6 +2397,11 @@ def release_freeze(
     freeze_record.released_at = datetime.utcnow()
     freeze_record.released_by = released_by
     freeze_record.release_reason = release_reason
+
+    db.flush()
+    lc = get_letter_of_credit_by_id(db, freeze_record.lc_id)
+    if lc:
+        dispatch_notifications(db, lc, models.EVENT_TYPE_FREEZE_RELEASED, event_ref_id=freeze_number)
 
     db.commit()
     db.refresh(freeze_record)
@@ -2617,6 +2657,9 @@ def _create_lc_from_swift_mt700(
     else:
         missing_fields.append("document_requirements (标签:46A)")
 
+    associate_lc_parties(db, lc)
+    dispatch_notifications(db, lc, models.EVENT_TYPE_LC_CREATED)
+
     db.commit()
     db.refresh(lc)
     return lc
@@ -2653,6 +2696,365 @@ def _create_amendment_from_swift_mt707(
         expiry_time=expiry_time,
     )
     db.add(amendment)
+    db.flush()
+    dispatch_notifications(db, lc, models.EVENT_TYPE_AMENDMENT_CREATED, event_ref_id=amendment_number)
+
     db.commit()
     db.refresh(amendment)
     return amendment
+
+
+def create_party(db: Session, party_data: schemas.PartyCreate) -> models.Party:
+    role_value = party_data.role.value if hasattr(party_data.role, 'value') else party_data.role
+    if role_value not in models.VALID_PARTY_ROLES:
+        raise ValueError(f"无效的角色类型: {role_value}，允许值: {', '.join(models.VALID_PARTY_ROLES)}")
+
+    existing = db.query(models.Party).filter(
+        models.Party.name == party_data.name,
+        models.Party.role == role_value
+    ).first()
+    if existing:
+        raise ValueError(f"同名同角色的参与方已存在: {party_data.name} ({role_value})")
+
+    db_party = models.Party(
+        name=party_data.name,
+        role=role_value,
+        contact=party_data.contact
+    )
+    db.add(db_party)
+    db.flush()
+
+    default_events = models.DEFAULT_SUBSCRIPTIONS.get(role_value, [])
+    for event_type in default_events:
+        db_sub = models.PartySubscription(
+            party_id=db_party.id,
+            event_type=event_type,
+            is_active=True
+        )
+        db.add(db_sub)
+
+    db.commit()
+    db.refresh(db_party)
+    return db_party
+
+
+def get_party_by_id(db: Session, party_id: int) -> Optional[models.Party]:
+    return db.query(models.Party).filter(models.Party.id == party_id).first()
+
+
+def get_party_by_name_and_role(db: Session, name: str, role: str) -> Optional[models.Party]:
+    return db.query(models.Party).filter(
+        models.Party.name == name,
+        models.Party.role == role
+    ).first()
+
+
+def get_all_parties(db: Session, skip: int = 0, limit: int = 100, role: Optional[str] = None) -> List[models.Party]:
+    query = db.query(models.Party)
+    if role:
+        query = query.filter(models.Party.role == role)
+    return query.order_by(models.Party.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def get_party_subscriptions(db: Session, party_id: int) -> List[models.PartySubscription]:
+    return db.query(models.PartySubscription).filter(
+        models.PartySubscription.party_id == party_id
+    ).all()
+
+
+def is_party_subscribed_to(db: Session, party_id: int, event_type: str) -> bool:
+    subscription = db.query(models.PartySubscription).filter(
+        models.PartySubscription.party_id == party_id,
+        models.PartySubscription.event_type == event_type,
+        models.PartySubscription.is_active == True
+    ).first()
+    return subscription is not None
+
+
+def update_party_subscriptions(
+    db: Session,
+    party_id: int,
+    updates: List[Dict[str, Any]]
+) -> List[models.PartySubscription]:
+    party = get_party_by_id(db, party_id)
+    if not party:
+        raise ValueError(f"参与方 {party_id} 不存在")
+
+    existing_subs = {
+        sub.event_type: sub
+        for sub in get_party_subscriptions(db, party_id)
+    }
+
+    for update in updates:
+        event_type_val = update["event_type"]
+        event_type = event_type_val.value if hasattr(event_type_val, 'value') else event_type_val
+        is_active = update["is_active"]
+
+        if event_type not in models.VALID_EVENT_TYPES:
+            raise ValueError(f"无效的事件类型: {event_type}，允许值: {', '.join(models.VALID_EVENT_TYPES)}")
+
+        if event_type in existing_subs:
+            existing_subs[event_type].is_active = is_active
+        else:
+            db_sub = models.PartySubscription(
+                party_id=party_id,
+                event_type=event_type,
+                is_active=is_active
+            )
+            db.add(db_sub)
+
+    db.commit()
+    return get_party_subscriptions(db, party_id)
+
+
+def get_lc_parties(db: Session, lc_id: int) -> List[models.LetterOfCreditParty]:
+    return db.query(models.LetterOfCreditParty).filter(
+        models.LetterOfCreditParty.lc_id == lc_id
+    ).all()
+
+
+def associate_lc_parties(db: Session, lc: models.LetterOfCredit):
+    role_name_map = {
+        models.PARTY_ROLE_ISSUING_BANK: lc.issuing_bank,
+        models.PARTY_ROLE_BENEFICIARY: lc.beneficiary_name,
+        models.PARTY_ROLE_APPLICANT: lc.applicant_name,
+    }
+
+    existing = {(lp.role, lp.party_id) for lp in get_lc_parties(db, lc.id)}
+
+    for role, name in role_name_map.items():
+        if not name:
+            continue
+        party = get_party_by_name_and_role(db, name, role)
+        if party and (role, party.id) not in existing:
+            db_lc_party = models.LetterOfCreditParty(
+                lc_id=lc.id,
+                party_id=party.id,
+                role=role
+            )
+            db.add(db_lc_party)
+
+    db.flush()
+
+
+def generate_notification_number(db: Session, lc_number: str, event_type: str, party_id: int) -> str:
+    import uuid
+    unique_suffix = uuid.uuid4().hex[:8].upper()
+    date_str = datetime.utcnow().strftime("%Y%m%d")
+    return f"NTF-{lc_number}-{event_type}-{date_str}-{party_id}-{unique_suffix}"
+
+
+def _build_event_summary(event_type: str, lc: models.LetterOfCredit, ref_id: Optional[str] = None) -> str:
+    summaries = {
+        models.EVENT_TYPE_LC_CREATED: f"信用证 {lc.lc_number} 已成功开立",
+        models.EVENT_TYPE_SUBMISSION_CREATED: f"信用证 {lc.lc_number} 收到新的交单{submission_id_suffix(ref_id)}",
+        models.EVENT_TYPE_SUBMISSION_REVIEWED: f"信用证 {lc.lc_number} 的交单{submission_id_suffix(ref_id)} 已完成审核",
+        models.EVENT_TYPE_AMENDMENT_CREATED: f"信用证 {lc.lc_number} 收到修改请求{ref_id_suffix(ref_id)}",
+        models.EVENT_TYPE_AMENDMENT_ACCEPTED: f"信用证 {lc.lc_number} 的修改{ref_id_suffix(ref_id)} 已被接受",
+        models.EVENT_TYPE_AMENDMENT_REJECTED: f"信用证 {lc.lc_number} 的修改{ref_id_suffix(ref_id)} 已被拒绝",
+        models.EVENT_TYPE_ALERT_GENERATED: f"信用证 {lc.lc_number} 触发了新的预警{ref_id_suffix(ref_id)}",
+        models.EVENT_TYPE_FREEZE_CREATED: f"信用证 {lc.lc_number} 已被冻结{ref_id_suffix(ref_id)}",
+        models.EVENT_TYPE_FREEZE_RELEASED: f"信用证 {lc.lc_number} 已解除冻结{ref_id_suffix(ref_id)}",
+        models.EVENT_TYPE_TRANSFER_CREATED: f"信用证 {lc.lc_number} 创建了转让{ref_id_suffix(ref_id)}",
+        models.EVENT_TYPE_BACK_TO_BACK_CREATED: f"基于信用证 {lc.lc_number} 创建了背对背证{ref_id_suffix(ref_id)}",
+    }
+    return summaries.get(event_type, f"信用证 {lc.lc_number} 发生事件: {event_type}")
+
+
+def ref_id_suffix(ref_id: Optional[str]) -> str:
+    return f" ({ref_id})" if ref_id else ""
+
+
+def submission_id_suffix(submission_id: Optional[str]) -> str:
+    return f" (交单编号: {submission_id})" if submission_id else ""
+
+
+def has_existing_notification(
+    db: Session,
+    party_id: int,
+    event_type: str,
+    lc_id: int,
+    event_ref_id: Optional[str]
+) -> bool:
+    query = db.query(models.Notification).filter(
+        models.Notification.party_id == party_id,
+        models.Notification.event_type == event_type,
+        models.Notification.lc_id == lc_id,
+    )
+    if event_ref_id:
+        query = query.filter(models.Notification.event_ref_id == event_ref_id)
+    return query.first() is not None
+
+
+def dispatch_notifications(
+    db: Session,
+    lc: models.LetterOfCredit,
+    event_type: str,
+    event_ref_id: Optional[str] = None,
+    event_summary_override: Optional[str] = None
+) -> List[models.Notification]:
+    if event_type not in models.VALID_EVENT_TYPES:
+        raise ValueError(f"无效的事件类型: {event_type}")
+
+    lc_parties = get_lc_parties(db, lc.id)
+    notifications = []
+
+    for lc_party in lc_parties:
+        if not is_party_subscribed_to(db, lc_party.party_id, event_type):
+            continue
+
+        if has_existing_notification(db, lc_party.party_id, event_type, lc.id, event_ref_id):
+            continue
+
+        summary = event_summary_override or _build_event_summary(event_type, lc, event_ref_id)
+        notification_number = generate_notification_number(db, lc.lc_number, event_type, lc_party.party_id)
+
+        notification = models.Notification(
+            notification_number=notification_number,
+            party_id=lc_party.party_id,
+            event_type=event_type,
+            lc_id=lc.id,
+            event_summary=summary,
+            event_ref_id=event_ref_id,
+            status=models.NOTIFICATION_STATUS_UNREAD,
+        )
+        db.add(notification)
+        notifications.append(notification)
+
+    if notifications:
+        db.commit()
+        for n in notifications:
+            db.refresh(n)
+
+    return notifications
+
+
+def get_notifications_by_party(
+    db: Session,
+    party_id: int,
+    status: Optional[str] = None,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
+    skip: int = 0,
+    limit: int = 100
+) -> List[Dict[str, Any]]:
+    query = db.query(models.Notification).filter(models.Notification.party_id == party_id)
+
+    if status:
+        if status not in models.VALID_NOTIFICATION_STATUSES:
+            raise ValueError(f"无效的通知状态: {status}，允许值: {', '.join(models.VALID_NOTIFICATION_STATUSES)}")
+        query = query.filter(models.Notification.status == status)
+
+    if start_time:
+        query = query.filter(models.Notification.created_at >= start_time)
+    if end_time:
+        query = query.filter(models.Notification.created_at <= end_time)
+
+    notifications = query.order_by(models.Notification.created_at.desc()).offset(skip).limit(limit).all()
+
+    result = []
+    for n in notifications:
+        result.append(_notification_to_dict(db, n))
+    return result
+
+
+def _notification_to_dict(db: Session, n: models.Notification) -> Dict[str, Any]:
+    party = get_party_by_id(db, n.party_id)
+    lc = get_letter_of_credit_by_id(db, n.lc_id)
+    return {
+        "id": n.id,
+        "notification_number": n.notification_number,
+        "party_id": n.party_id,
+        "party_name": party.name if party else None,
+        "event_type": n.event_type,
+        "lc_id": n.lc_id,
+        "lc_number": lc.lc_number if lc else None,
+        "event_summary": n.event_summary,
+        "event_ref_id": n.event_ref_id,
+        "status": n.status,
+        "read_at": n.read_at,
+        "archived_at": n.archived_at,
+        "created_at": n.created_at,
+    }
+
+
+def mark_notifications_read(db: Session, party_id: int, notification_ids: List[int]) -> int:
+    if not notification_ids:
+        return 0
+
+    notifications = db.query(models.Notification).filter(
+        models.Notification.party_id == party_id,
+        models.Notification.id.in_(notification_ids)
+    ).all()
+
+    count = 0
+    for n in notifications:
+        if n.status == models.NOTIFICATION_STATUS_UNREAD:
+            n.status = models.NOTIFICATION_STATUS_READ
+            n.read_at = datetime.utcnow()
+            count += 1
+
+    if count > 0:
+        db.commit()
+    return count
+
+
+def archive_notifications(db: Session, party_id: int, notification_ids: List[int]) -> int:
+    if not notification_ids:
+        return 0
+
+    notifications = db.query(models.Notification).filter(
+        models.Notification.party_id == party_id,
+        models.Notification.id.in_(notification_ids)
+    ).all()
+
+    count = 0
+    for n in notifications:
+        if n.status != models.NOTIFICATION_STATUS_ARCHIVED:
+            n.status = models.NOTIFICATION_STATUS_ARCHIVED
+            n.archived_at = datetime.utcnow()
+            count += 1
+
+    if count > 0:
+        db.commit()
+    return count
+
+
+def get_lc_event_stream(
+    db: Session,
+    lc_id: int,
+    skip: int = 0,
+    limit: int = 200
+) -> List[Dict[str, Any]]:
+    notifications = db.query(models.Notification).filter(
+        models.Notification.lc_id == lc_id
+    ).order_by(models.Notification.created_at.desc()).offset(skip).limit(limit).all()
+
+    result = []
+    seen_keys = set()
+    for n in notifications:
+        key = (n.event_type, n.event_ref_id, n.party_id)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        party = get_party_by_id(db, n.party_id)
+        result.append({
+            "id": n.id,
+            "event_type": n.event_type,
+            "event_summary": n.event_summary,
+            "event_ref_id": n.event_ref_id,
+            "lc_id": n.lc_id,
+            "party_id": n.party_id,
+            "party_name": party.name if party else None,
+            "created_at": n.created_at,
+        })
+    return result
+
+
+def create_lc_with_parties(db: Session, lc_data: schemas.LetterOfCreditCreate) -> models.LetterOfCredit:
+    lc = create_letter_of_credit(db, lc_data)
+    associate_lc_parties(db, lc)
+    dispatch_notifications(db, lc, models.EVENT_TYPE_LC_CREATED)
+    db.commit()
+    db.refresh(lc)
+    return lc

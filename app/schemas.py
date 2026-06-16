@@ -721,3 +721,108 @@ class SwiftParseResponse(BaseModel):
     created_resource_id: Optional[int] = None
     created_resource_type: Optional[str] = None
     missing_fields: List[str] = []
+
+
+class PartyRole(str, Enum):
+    ISSUING_BANK = "issuing_bank"
+    ADVISING_BANK = "advising_bank"
+    BENEFICIARY = "beneficiary"
+    APPLICANT = "applicant"
+
+
+class EventType(str, Enum):
+    LC_CREATED = "lc_created"
+    SUBMISSION_CREATED = "submission_created"
+    SUBMISSION_REVIEWED = "submission_reviewed"
+    AMENDMENT_CREATED = "amendment_created"
+    AMENDMENT_ACCEPTED = "amendment_accepted"
+    AMENDMENT_REJECTED = "amendment_rejected"
+    ALERT_GENERATED = "alert_generated"
+    FREEZE_CREATED = "freeze_created"
+    FREEZE_RELEASED = "freeze_released"
+    TRANSFER_CREATED = "transfer_created"
+    BACK_TO_BACK_CREATED = "back_to_back_created"
+
+
+class NotificationStatus(str, Enum):
+    UNREAD = "unread"
+    READ = "read"
+    ARCHIVED = "archived"
+
+
+class PartyCreate(BaseModel):
+    name: str
+    role: PartyRole
+    contact: str
+
+
+class PartyResponse(BaseModel):
+    id: int
+    name: str
+    role: str
+    contact: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PartySubscriptionResponse(BaseModel):
+    id: int
+    party_id: int
+    event_type: str
+    is_active: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class SubscriptionUpdate(BaseModel):
+    event_type: EventType
+    is_active: bool
+
+
+class SubscriptionBatchUpdate(BaseModel):
+    subscriptions: List[SubscriptionUpdate]
+
+
+class NotificationResponse(BaseModel):
+    id: int
+    notification_number: str
+    party_id: int
+    party_name: Optional[str] = None
+    event_type: str
+    lc_id: int
+    lc_number: Optional[str] = None
+    event_summary: str
+    event_ref_id: Optional[str] = None
+    status: str
+    read_at: Optional[datetime] = None
+    archived_at: Optional[datetime] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class NotificationMarkReadRequest(BaseModel):
+    notification_ids: List[int]
+
+
+class NotificationArchiveRequest(BaseModel):
+    notification_ids: List[int]
+
+
+class LCEventStreamResponse(BaseModel):
+    id: int
+    event_type: str
+    event_summary: str
+    event_ref_id: Optional[str] = None
+    lc_id: int
+    party_id: Optional[int] = None
+    party_name: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True

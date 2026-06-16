@@ -436,3 +436,142 @@ class LCFreezeRecord(Base):
     release_reason = Column(Text, nullable=True)
     lc = relationship("LetterOfCredit", back_populates="freeze_records")
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+PARTY_ROLE_ISSUING_BANK = "issuing_bank"
+PARTY_ROLE_ADVISING_BANK = "advising_bank"
+PARTY_ROLE_BENEFICIARY = "beneficiary"
+PARTY_ROLE_APPLICANT = "applicant"
+VALID_PARTY_ROLES = [
+    PARTY_ROLE_ISSUING_BANK,
+    PARTY_ROLE_ADVISING_BANK,
+    PARTY_ROLE_BENEFICIARY,
+    PARTY_ROLE_APPLICANT,
+]
+
+EVENT_TYPE_LC_CREATED = "lc_created"
+EVENT_TYPE_SUBMISSION_CREATED = "submission_created"
+EVENT_TYPE_SUBMISSION_REVIEWED = "submission_reviewed"
+EVENT_TYPE_AMENDMENT_CREATED = "amendment_created"
+EVENT_TYPE_AMENDMENT_ACCEPTED = "amendment_accepted"
+EVENT_TYPE_AMENDMENT_REJECTED = "amendment_rejected"
+EVENT_TYPE_ALERT_GENERATED = "alert_generated"
+EVENT_TYPE_FREEZE_CREATED = "freeze_created"
+EVENT_TYPE_FREEZE_RELEASED = "freeze_released"
+EVENT_TYPE_TRANSFER_CREATED = "transfer_created"
+EVENT_TYPE_BACK_TO_BACK_CREATED = "back_to_back_created"
+VALID_EVENT_TYPES = [
+    EVENT_TYPE_LC_CREATED,
+    EVENT_TYPE_SUBMISSION_CREATED,
+    EVENT_TYPE_SUBMISSION_REVIEWED,
+    EVENT_TYPE_AMENDMENT_CREATED,
+    EVENT_TYPE_AMENDMENT_ACCEPTED,
+    EVENT_TYPE_AMENDMENT_REJECTED,
+    EVENT_TYPE_ALERT_GENERATED,
+    EVENT_TYPE_FREEZE_CREATED,
+    EVENT_TYPE_FREEZE_RELEASED,
+    EVENT_TYPE_TRANSFER_CREATED,
+    EVENT_TYPE_BACK_TO_BACK_CREATED,
+]
+
+DEFAULT_SUBSCRIPTIONS = {
+    PARTY_ROLE_BENEFICIARY: [
+        EVENT_TYPE_AMENDMENT_CREATED,
+        EVENT_TYPE_SUBMISSION_REVIEWED,
+        EVENT_TYPE_ALERT_GENERATED,
+        EVENT_TYPE_FREEZE_CREATED,
+        EVENT_TYPE_LC_CREATED,
+        EVENT_TYPE_SUBMISSION_CREATED,
+        EVENT_TYPE_FREEZE_RELEASED,
+    ],
+    PARTY_ROLE_ISSUING_BANK: [
+        EVENT_TYPE_SUBMISSION_CREATED,
+        EVENT_TYPE_AMENDMENT_ACCEPTED,
+        EVENT_TYPE_LC_CREATED,
+        EVENT_TYPE_SUBMISSION_REVIEWED,
+        EVENT_TYPE_FREEZE_CREATED,
+        EVENT_TYPE_FREEZE_RELEASED,
+        EVENT_TYPE_ALERT_GENERATED,
+    ],
+    PARTY_ROLE_ADVISING_BANK: [
+        EVENT_TYPE_LC_CREATED,
+        EVENT_TYPE_AMENDMENT_CREATED,
+        EVENT_TYPE_AMENDMENT_ACCEPTED,
+        EVENT_TYPE_ALERT_GENERATED,
+    ],
+    PARTY_ROLE_APPLICANT: [
+        EVENT_TYPE_LC_CREATED,
+        EVENT_TYPE_SUBMISSION_CREATED,
+        EVENT_TYPE_SUBMISSION_REVIEWED,
+        EVENT_TYPE_AMENDMENT_CREATED,
+        EVENT_TYPE_AMENDMENT_ACCEPTED,
+        EVENT_TYPE_ALERT_GENERATED,
+    ],
+}
+
+NOTIFICATION_STATUS_UNREAD = "unread"
+NOTIFICATION_STATUS_READ = "read"
+NOTIFICATION_STATUS_ARCHIVED = "archived"
+VALID_NOTIFICATION_STATUSES = [
+    NOTIFICATION_STATUS_UNREAD,
+    NOTIFICATION_STATUS_READ,
+    NOTIFICATION_STATUS_ARCHIVED,
+]
+
+
+class Party(Base):
+    __tablename__ = "parties"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255), nullable=False)
+    role = Column(String(30), nullable=False)
+    contact = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    subscriptions = relationship("PartySubscription", back_populates="party", cascade="all, delete-orphan")
+    lc_parties = relationship("LetterOfCreditParty", back_populates="party", cascade="all, delete-orphan")
+    notifications = relationship("Notification", back_populates="party", cascade="all, delete-orphan")
+
+
+class PartySubscription(Base):
+    __tablename__ = "party_subscriptions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    party_id = Column(Integer, ForeignKey("parties.id"), nullable=False)
+    event_type = Column(String(50), nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    party = relationship("Party", back_populates="subscriptions")
+
+
+class LetterOfCreditParty(Base):
+    __tablename__ = "letter_of_credit_parties"
+
+    id = Column(Integer, primary_key=True, index=True)
+    lc_id = Column(Integer, ForeignKey("letter_of_credits.id"), nullable=False)
+    party_id = Column(Integer, ForeignKey("parties.id"), nullable=False)
+    role = Column(String(30), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    lc = relationship("LetterOfCredit")
+    party = relationship("Party", back_populates="lc_parties")
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id = Column(Integer, primary_key=True, index=True)
+    notification_number = Column(String(150), unique=True, index=True, nullable=False)
+    party_id = Column(Integer, ForeignKey("parties.id"), nullable=False)
+    event_type = Column(String(50), nullable=False)
+    lc_id = Column(Integer, ForeignKey("letter_of_credits.id"), nullable=False)
+    event_summary = Column(String(500), nullable=False)
+    event_ref_id = Column(String(100), nullable=True)
+    status = Column(String(20), default=NOTIFICATION_STATUS_UNREAD, nullable=False)
+    read_at = Column(DateTime, nullable=True)
+    archived_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    party = relationship("Party", back_populates="notifications")
+    lc = relationship("LetterOfCredit")

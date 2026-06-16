@@ -685,6 +685,111 @@ def create_app() -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"重发报文失败: {str(e)}")
 
+    @app.post("/api/parties", response_model=schemas.PartyResponse, tags=["多方通知与事件订阅"], status_code=status.HTTP_201_CREATED)
+    async def create_party(party_data: schemas.PartyCreate, db: Session = Depends(get_db)):
+        try:
+            return crud.create_party(db, party_data)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"创建参与方失败: {str(e)}")
+
+    @app.get("/api/parties", response_model=List[schemas.PartyResponse], tags=["多方通知与事件订阅"])
+    async def list_parties(
+        skip: int = 0,
+        limit: int = 100,
+        role: Optional[str] = None,
+        db: Session = Depends(get_db)
+    ):
+        if role and role not in models.VALID_PARTY_ROLES:
+            raise HTTPException(status_code=400, detail=f"无效的角色: {role}，允许值: {', '.join(models.VALID_PARTY_ROLES)}")
+        return crud.get_all_parties(db, skip, limit, role)
+
+    @app.get("/api/parties/{party_id}", response_model=schemas.PartyResponse, tags=["多方通知与事件订阅"])
+    async def get_party(party_id: int, db: Session = Depends(get_db)):
+        party = crud.get_party_by_id(db, party_id)
+        if not party:
+            raise HTTPException(status_code=404, detail=f"参与方 {party_id} 不存在")
+        return party
+
+    @app.get("/api/parties/{party_id}/subscriptions", response_model=List[schemas.PartySubscriptionResponse], tags=["多方通知与事件订阅"])
+    async def get_party_subscriptions(party_id: int, db: Session = Depends(get_db)):
+        party = crud.get_party_by_id(db, party_id)
+        if not party:
+            raise HTTPException(status_code=404, detail=f"参与方 {party_id} 不存在")
+        return crud.get_party_subscriptions(db, party_id)
+
+    @app.put("/api/parties/{party_id}/subscriptions", response_model=List[schemas.PartySubscriptionResponse], tags=["多方通知与事件订阅"])
+    async def update_party_subscriptions(
+        party_id: int,
+        req: schemas.SubscriptionBatchUpdate,
+        db: Session = Depends(get_db)
+    ):
+        try:
+            updates = [
+                {"event_type": s.event_type, "is_active": s.is_active}
+                for s in req.subscriptions
+            ]
+            return crud.update_party_subscriptions(db, party_id, updates)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/api/notifications/party/{party_id}", response_model=List[schemas.NotificationResponse], tags=["多方通知与事件订阅"])
+    async def get_party_notifications(
+        party_id: int,
+        status: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        skip: int = 0,
+        limit: int = 100,
+        db: Session = Depends(get_db)
+    ):
+        party = crud.get_party_by_id(db, party_id)
+        if not party:
+            raise HTTPException(status_code=404, detail=f"参与方 {party_id} 不存在")
+        if start_time and end_time and start_time > end_time:
+            raise HTTPException(status_code=400, detail="开始时间不能大于结束时间")
+        try:
+            return crud.get_notifications_by_party(db, party_id, status, start_time, end_time, skip, limit)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/api/notifications/party/{party_id}/mark-read", tags=["多方通知与事件订阅"])
+    async def mark_notifications_read(
+        party_id: int,
+        req: schemas.NotificationMarkReadRequest,
+        db: Session = Depends(get_db)
+    ):
+        party = crud.get_party_by_id(db, party_id)
+        if not party:
+            raise HTTPException(status_code=404, detail=f"参与方 {party_id} 不存在")
+        count = crud.mark_notifications_read(db, party_id, req.notification_ids)
+        return {"marked_count": count, "message": f"已标记 {count} 条通知为已读"}
+
+    @app.post("/api/notifications/party/{party_id}/archive", tags=["多方通知与事件订阅"])
+    async def archive_notifications(
+        party_id: int,
+        req: schemas.NotificationArchiveRequest,
+        db: Session = Depends(get_db)
+    ):
+        party = crud.get_party_by_id(db, party_id)
+        if not party:
+            raise HTTPException(status_code=404, detail=f"参与方 {party_id} 不存在")
+        count = crud.archive_notifications(db, party_id, req.notification_ids)
+        return {"archived_count": count, "message": f"已归档 {count} 条通知"}
+
+    @app.get("/api/lc/{lc_number}/event-stream", response_model=List[schemas.LCEventStreamResponse], tags=["多方通知与事件订阅"])
+    async def get_lc_event_stream(
+        lc_number: str,
+        skip: int = 0,
+        limit: int = 200,
+        db: Session = Depends(get_db)
+    ):
+        lc = crud.get_letter_of_credit_by_number(db, lc_number)
+        if not lc:
+            raise HTTPException(status_code=404, detail=f"信用证 {lc_number} 不存在")
+        return crud.get_lc_event_stream(db, lc.id, skip, limit)
+
     return app
 
 
