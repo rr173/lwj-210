@@ -46,6 +46,24 @@ def create_letter_of_credit(db: Session, lc_data: schemas.LetterOfCreditCreate) 
     if fee_tier_value not in VALID_FEE_TIERS:
         raise ValueError(f"无效的费率档位: {fee_tier_value}，允许的值: {', '.join(VALID_FEE_TIERS)}")
 
+    payment_method = lc_data.payment_method.value if hasattr(lc_data.payment_method, 'value') else lc_data.payment_method
+    if payment_method not in models.VALID_PAYMENT_METHODS:
+        raise ValueError(f"无效的付款方式: {payment_method}，允许的值: {', '.join(models.VALID_PAYMENT_METHODS)}")
+
+    usance_days = lc_data.usance_days
+    usance_basis = lc_data.usance_basis.value if hasattr(lc_data.usance_basis, 'value') else lc_data.usance_basis
+    deferred_payment_date = lc_data.deferred_payment_date
+
+    if payment_method == models.PAYMENT_METHOD_USANCE:
+        if usance_days is None or usance_days <= 0:
+            raise ValueError("远期付款必须指定大于0的远期天数")
+        if usance_basis not in models.VALID_USANCE_BASES:
+            raise ValueError(f"远期付款必须指定有效的起算基准，允许的值: {', '.join(models.VALID_USANCE_BASES)}")
+
+    if payment_method == models.PAYMENT_METHOD_DEFERRED:
+        if deferred_payment_date is None:
+            raise ValueError("延期付款必须指定付款日期")
+
     db_lc = models.LetterOfCredit(
         lc_number=lc_data.lc_number,
         issuing_bank=lc_data.issuing_bank,
@@ -63,7 +81,11 @@ def create_letter_of_credit(db: Session, lc_data: schemas.LetterOfCreditCreate) 
         transshipment_allowed=lc_data.transshipment_allowed,
         goods_description=lc_data.goods_description,
         additional_terms=lc_data.additional_terms,
-        fee_tier=fee_tier_value
+        fee_tier=fee_tier_value,
+        payment_method=payment_method,
+        usance_days=usance_days,
+        usance_basis=usance_basis,
+        deferred_payment_date=deferred_payment_date,
     )
     db.add(db_lc)
     db.flush()
@@ -107,6 +129,23 @@ def update_letter_of_credit(db: Session, lc_id: int, lc_data: schemas.LetterOfCr
     if new_fee_tier != db_lc.fee_tier:
         raise ValueError(f"费率档位创建后不可修改，当前档位: {db_lc.fee_tier}，提交的档位: {new_fee_tier}")
 
+    new_payment_method = lc_data.payment_method.value if hasattr(lc_data.payment_method, 'value') else lc_data.payment_method
+    if new_payment_method not in models.VALID_PAYMENT_METHODS:
+        raise ValueError(f"无效的付款方式: {new_payment_method}")
+
+    new_usance_days = lc_data.usance_days
+    new_usance_basis = lc_data.usance_basis.value if hasattr(lc_data.usance_basis, 'value') else lc_data.usance_basis
+    new_deferred_payment_date = lc_data.deferred_payment_date
+
+    if new_payment_method == models.PAYMENT_METHOD_USANCE:
+        if new_usance_days is None or new_usance_days <= 0:
+            raise ValueError("远期付款必须指定大于0的远期天数")
+        if new_usance_basis not in models.VALID_USANCE_BASES:
+            raise ValueError(f"远期付款必须指定有效的起算基准")
+    if new_payment_method == models.PAYMENT_METHOD_DEFERRED:
+        if new_deferred_payment_date is None:
+            raise ValueError("延期付款必须指定付款日期")
+
     db_lc.lc_number = lc_data.lc_number
     db_lc.issuing_bank = lc_data.issuing_bank
     db_lc.beneficiary_name = lc_data.beneficiary_name
@@ -123,6 +162,10 @@ def update_letter_of_credit(db: Session, lc_id: int, lc_data: schemas.LetterOfCr
     db_lc.transshipment_allowed = lc_data.transshipment_allowed
     db_lc.goods_description = lc_data.goods_description
     db_lc.additional_terms = lc_data.additional_terms
+    db_lc.payment_method = new_payment_method
+    db_lc.usance_days = new_usance_days
+    db_lc.usance_basis = new_usance_basis
+    db_lc.deferred_payment_date = new_deferred_payment_date
 
     db.query(models.DocumentRequirement).filter(models.DocumentRequirement.lc_id == lc_id).delete()
     for req in lc_data.document_requirements:
@@ -3307,3 +3350,450 @@ def resolve_rule_version_for_audit(db: Session) -> Optional[models.RuleVersion]:
     ).first()
 
     return active_version
+
+
+def is_business_day(d: date) -> bool:
+    return d.weekday() < 5
+
+
+def add_business_days(start_date: date, days: int) -> date:
+    current = start_date
+    added = 0
+    while added < days:
+        current += timedelta(days=1)
+        if is_business_day(current):
+            added += 1
+    return current
+
+
+def generate_payment_number(db: Session, lc_number: str) -> str:
+    from sqlalchemy import func
+    date_str = datetime.utcnow().strftime("%Y%m%d")
+    prefix = f"PAY-{lc_number}-{date_str}-"
+    count = db.query(func.count(models.Payment.id)).filter(
+        models.Payment.payment_number.like(f"{prefix}%")
+    ).scalar() or 0
+    return f"{prefix}{count + 1:04d}"
+
+
+def _add_payment_status_history(
+    db: Session,
+    payment: models.Payment,
+    from_status: Optional[str],
+    to_status: str,
+    changed_by: Optional[str] = None,
+    remark: Optional[str] = None,
+) -> models.PaymentStatusHistory:
+    history = models.PaymentStatusHistory(
+        payment_id=payment.id,
+        from_status=from_status,
+        to_status=to_status,
+        changed_by=changed_by,
+        changed_at=datetime.utcnow(),
+        remark=remark,
+    )
+    db.add(history)
+    return history
+
+
+def calculate_maturity_date(
+    db: Session,
+    lc: models.LetterOfCredit,
+    audit_record: models.AuditRecord,
+    application_date: Optional[date] = None,
+) -> date:
+    if application_date is None:
+        application_date = date.today()
+
+    payment_method = lc.payment_method or models.PAYMENT_METHOD_SIGHT
+
+    if payment_method == models.PAYMENT_METHOD_SIGHT:
+        return add_business_days(application_date, models.SIGHT_PROCESSING_DAYS)
+
+    elif payment_method == models.PAYMENT_METHOD_USANCE:
+        usance_days = lc.usance_days
+        if usance_days is None or usance_days <= 0:
+            raise ValueError("远期付款必须指定远期天数")
+
+        usance_basis = lc.usance_basis
+        if usance_basis not in models.VALID_USANCE_BASES:
+            raise ValueError(f"无效的远期起算基准: {usance_basis}")
+
+        if usance_basis == models.USANCE_BASIS_PRESENTATION_DATE:
+            basis_date = audit_record.presentation_date
+        elif usance_basis == models.USANCE_BASIS_SHIPMENT_DATE:
+            basis_date = _get_shipment_date_from_docs(db, audit_record)
+        elif usance_basis == models.USANCE_BASIS_BL_DATE:
+            basis_date = _get_bl_date_from_docs(db, audit_record)
+        else:
+            basis_date = audit_record.presentation_date
+
+        if basis_date is None:
+            raise ValueError(f"无法获取{usance_basis}作为起算基准日期")
+
+        return add_business_days(basis_date, usance_days)
+
+    elif payment_method == models.PAYMENT_METHOD_DEFERRED:
+        if lc.deferred_payment_date is None:
+            raise ValueError("延期付款必须指定付款日期")
+        return lc.deferred_payment_date
+
+    else:
+        raise ValueError(f"无效的付款方式: {payment_method}")
+
+
+def _get_shipment_date_from_docs(db: Session, audit_record: models.AuditRecord) -> Optional[date]:
+    docs = get_documents_by_submission(db, audit_record.submission_id)
+    for doc in docs:
+        if doc.document_type == "bill_of_lading":
+            shipment_date_str = doc.content.get("shipment_date")
+            if shipment_date_str:
+                if isinstance(shipment_date_str, str):
+                    return date.fromisoformat(shipment_date_str)
+                elif isinstance(shipment_date_str, date):
+                    return shipment_date_str
+    return None
+
+
+def _get_bl_date_from_docs(db: Session, audit_record: models.AuditRecord) -> Optional[date]:
+    docs = get_documents_by_submission(db, audit_record.submission_id)
+    for doc in docs:
+        if doc.document_type == "bill_of_lading":
+            bl_date_str = doc.content.get("bl_date") or doc.content.get("issue_date")
+            if bl_date_str:
+                if isinstance(bl_date_str, str):
+                    return date.fromisoformat(bl_date_str)
+                elif isinstance(bl_date_str, date):
+                    return bl_date_str
+    return None
+
+
+def _get_invoice_amount_from_docs(db: Session, audit_record: models.AuditRecord) -> float:
+    docs = get_documents_by_submission(db, audit_record.submission_id)
+    for doc in docs:
+        if doc.document_type == "invoice":
+            total_amount = doc.content.get("total_amount")
+            if total_amount is not None:
+                return float(total_amount)
+    return 0.0
+
+
+def _is_audit_eligible_for_payment(audit_record: models.AuditRecord) -> bool:
+    if audit_record.conclusion == "compliant":
+        return True
+    if audit_record.conclusion == "minor_discrepancy" and audit_record.review_status == models.REVIEW_STATUS_REVIEWED:
+        return True
+    return False
+
+
+def create_payment_application(db: Session, submission_id: str) -> models.Payment:
+    audit_record = get_audit_record_by_submission(db, submission_id)
+    if not audit_record:
+        raise ValueError(f"交单记录 {submission_id} 不存在")
+
+    lc = get_letter_of_credit_by_id(db, audit_record.lc_id)
+    if not lc:
+        raise ValueError(f"信用证不存在")
+
+    existing_payment = db.query(models.Payment).filter(
+        models.Payment.submission_id == submission_id,
+        models.Payment.status != models.PAYMENT_STATUS_REJECTED
+    ).first()
+    if existing_payment:
+        raise ValueError(f"交单 {submission_id} 已有有效付款申请: {existing_payment.payment_number}")
+
+    if not _is_audit_eligible_for_payment(audit_record):
+        raise ValueError(
+            f"交单 {submission_id} 不符合付款条件。"
+            f"审核结论: {audit_record.conclusion}, 复核状态: {audit_record.review_status}。"
+            f"需要 compliant 或 minor_discrepancy且复核完成(reviewed)才能发起付款。"
+        )
+
+    payment_amount = _get_invoice_amount_from_docs(db, audit_record)
+    if payment_amount <= 0:
+        raise ValueError("无法从发票中获取付款金额")
+
+    application_date = date.today()
+    maturity_date = calculate_maturity_date(db, lc, audit_record, application_date)
+
+    payment_number = generate_payment_number(db, lc.lc_number)
+
+    initial_status = models.PAYMENT_STATUS_PENDING
+
+    payment = models.Payment(
+        payment_number=payment_number,
+        lc_id=lc.id,
+        submission_id=submission_id,
+        audit_record_id=audit_record.id,
+        payment_amount=payment_amount,
+        currency=lc.currency,
+        payment_method=lc.payment_method or models.PAYMENT_METHOD_SIGHT,
+        maturity_date=maturity_date,
+        status=initial_status,
+        total_paid_amount=0.0,
+    )
+    db.add(payment)
+    db.flush()
+
+    _add_payment_status_history(db, payment, None, initial_status, remark="付款申请创建")
+
+    db.commit()
+    db.refresh(payment)
+    return payment
+
+
+def accept_payment(db: Session, payment_number: str, accepted_by: Optional[str] = None) -> models.Payment:
+    payment = get_payment_by_number(db, payment_number)
+    if not payment:
+        raise ValueError(f"付款申请 {payment_number} 不存在")
+
+    if payment.payment_method != models.PAYMENT_METHOD_USANCE:
+        raise ValueError(f"只有远期付款(usance)需要承兑，当前付款方式: {payment.payment_method}")
+
+    if payment.status == models.PAYMENT_STATUS_ACCEPTED:
+        return payment
+
+    if payment.status != models.PAYMENT_STATUS_PENDING:
+        raise ValueError(f"只有 pending 状态的付款可以承兑，当前状态: {payment.status}")
+
+    old_status = payment.status
+    payment.status = models.PAYMENT_STATUS_ACCEPTED
+    payment.accepted_at = datetime.utcnow()
+
+    _add_payment_status_history(db, payment, old_status, models.PAYMENT_STATUS_ACCEPTED, changed_by=accepted_by, remark="银行承兑")
+
+    db.commit()
+    db.refresh(payment)
+    return payment
+
+
+def reject_payment(db: Session, payment_number: str, rejection_reason: str, rejected_by: Optional[str] = None) -> models.Payment:
+    payment = get_payment_by_number(db, payment_number)
+    if not payment:
+        raise ValueError(f"付款申请 {payment_number} 不存在")
+
+    if payment.status != models.PAYMENT_STATUS_PENDING:
+        raise ValueError(f"只有 pending 状态的付款可以拒付，当前状态: {payment.status}")
+
+    old_status = payment.status
+    payment.status = models.PAYMENT_STATUS_REJECTED
+    payment.rejection_reason = rejection_reason
+
+    _add_payment_status_history(db, payment, old_status, models.PAYMENT_STATUS_REJECTED, changed_by=rejected_by, remark=f"拒付: {rejection_reason}")
+
+    fee_records = db.query(models.FeeRecord).filter(
+        models.FeeRecord.submission_id == payment.submission_id
+    ).all()
+    for fee in fee_records:
+        fee.status = "cancelled"
+
+    db.commit()
+    db.refresh(payment)
+    return payment
+
+
+def settle_payment(
+    db: Session,
+    payment_number: str,
+    payment_date: date,
+    amount: Optional[float] = None,
+    reference: Optional[str] = None,
+    settled_by: Optional[str] = None,
+) -> models.Payment:
+    payment = get_payment_by_number(db, payment_number)
+    if not payment:
+        raise ValueError(f"付款申请 {payment_number} 不存在")
+
+    if payment.status == models.PAYMENT_STATUS_PAID:
+        raise ValueError(f"付款申请 {payment_number} 已全部付清")
+
+    if payment.status == models.PAYMENT_STATUS_REJECTED:
+        raise ValueError(f"付款申请 {payment_number} 已被拒付，无法付款")
+
+    check_and_update_matured_payments(db, payment.lc_id)
+    db.refresh(payment)
+
+    if payment.status not in [models.PAYMENT_STATUS_MATURED, models.PAYMENT_STATUS_PENDING]:
+        raise ValueError(f"只有到期(matured)或即期待到期(pending)的付款可以结算，当前状态: {payment.status}")
+
+    if payment.status == models.PAYMENT_STATUS_PENDING and payment.payment_method != models.PAYMENT_METHOD_SIGHT:
+        raise ValueError(f"非即期付款需要先承兑或到期后才能付款，当前状态: {payment.status}")
+
+    if amount is None:
+        amount = payment.payment_amount - payment.total_paid_amount
+
+    if amount <= 0:
+        raise ValueError("付款金额必须大于0")
+
+    remaining = payment.payment_amount - payment.total_paid_amount
+    if amount > remaining + 0.001:
+        raise ValueError(f"付款金额超过剩余应付金额。应付: {remaining}, 申请: {amount}")
+
+    lc = get_letter_of_credit_by_id(db, payment.lc_id)
+    if not lc.partial_shipment_allowed and abs(amount - remaining) > 0.001:
+        raise ValueError("信用证不允许分批装运，必须一次性全额付款")
+
+    partial_record = models.PartialPaymentRecord(
+        payment_id=payment.id,
+        amount=amount,
+        payment_date=payment_date,
+        reference=reference,
+        created_by=settled_by,
+    )
+    db.add(partial_record)
+    db.flush()
+
+    new_total_paid = payment.total_paid_amount + amount
+    payment.total_paid_amount = new_total_paid
+    payment.actual_payment_date = payment_date
+
+    old_status = payment.status
+    if abs(new_total_paid - payment.payment_amount) < 0.001:
+        payment.status = models.PAYMENT_STATUS_PAID
+        _add_payment_status_history(db, payment, old_status, models.PAYMENT_STATUS_PAID, changed_by=settled_by, remark="全额付款完成")
+    else:
+        _add_payment_status_history(db, payment, old_status, payment.status, changed_by=settled_by, remark=f"部分付款: {amount} {payment.currency}")
+
+    db.commit()
+    db.refresh(payment)
+    return payment
+
+
+def get_payment_by_number(db: Session, payment_number: str) -> Optional[models.Payment]:
+    return db.query(models.Payment).filter(models.Payment.payment_number == payment_number).first()
+
+
+def get_payments_by_lc(db: Session, lc_number: str) -> List[models.Payment]:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        raise ValueError(f"信用证 {lc_number} 不存在")
+    return db.query(models.Payment).filter(
+        models.Payment.lc_id == lc.id
+    ).order_by(models.Payment.created_at.desc()).all()
+
+
+def get_payments_by_status(db: Session, status: str, skip: int = 0, limit: int = 100) -> List[models.Payment]:
+    if status not in models.VALID_PAYMENT_STATUSES:
+        raise ValueError(f"无效的付款状态: {status}，允许值: {', '.join(models.VALID_PAYMENT_STATUSES)}")
+    return db.query(models.Payment).filter(
+        models.Payment.status == status
+    ).order_by(models.Payment.maturity_date.asc()).offset(skip).limit(limit).all()
+
+
+def get_payment_detail(db: Session, payment_number: str) -> Dict[str, Any]:
+    payment = get_payment_by_number(db, payment_number)
+    if not payment:
+        raise ValueError(f"付款申请 {payment_number} 不存在")
+
+    return {
+        "id": payment.id,
+        "payment_number": payment.payment_number,
+        "lc_id": payment.lc_id,
+        "submission_id": payment.submission_id,
+        "audit_record_id": payment.audit_record_id,
+        "payment_amount": payment.payment_amount,
+        "currency": payment.currency,
+        "payment_method": payment.payment_method,
+        "maturity_date": payment.maturity_date,
+        "status": payment.status,
+        "accepted_at": payment.accepted_at,
+        "rejection_reason": payment.rejection_reason,
+        "total_paid_amount": payment.total_paid_amount,
+        "actual_payment_date": payment.actual_payment_date,
+        "created_at": payment.created_at,
+        "status_history": payment.status_history,
+        "partial_payments": payment.partial_payments,
+    }
+
+
+def get_payment_status_history(db: Session, payment_number: str) -> List[models.PaymentStatusHistory]:
+    payment = get_payment_by_number(db, payment_number)
+    if not payment:
+        raise ValueError(f"付款申请 {payment_number} 不存在")
+    return payment.status_history
+
+
+def get_payment_stats_by_time_range(
+    db: Session,
+    start_date: date,
+    end_date: date,
+) -> Dict[str, Any]:
+    if start_date > end_date:
+        raise ValueError("开始日期不能大于结束日期")
+
+    payments = db.query(models.Payment).filter(
+        models.Payment.created_at >= datetime.combine(start_date, datetime.min.time()),
+        models.Payment.created_at <= datetime.combine(end_date, datetime.max.time()),
+    ).all()
+
+    by_currency = {}
+    for p in payments:
+        curr = p.currency
+        if curr not in by_currency:
+            by_currency[curr] = {"currency": curr, "total_amount": 0.0, "paid_amount": 0.0, "count": 0}
+        by_currency[curr]["total_amount"] += p.payment_amount
+        by_currency[curr]["paid_amount"] += p.total_paid_amount
+        by_currency[curr]["count"] += 1
+
+    total_count = len(payments)
+    total_amount = sum(p.payment_amount for p in payments)
+    total_paid_amount = sum(p.total_paid_amount for p in payments)
+
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "by_currency": list(by_currency.values()),
+        "total_count": total_count,
+        "total_amount": total_amount,
+        "total_paid_amount": total_paid_amount,
+    }
+
+
+def check_and_update_matured_payments(db: Session, lc_id: Optional[int] = None) -> int:
+    today = date.today()
+    query = db.query(models.Payment).filter(
+        models.Payment.status.in_([models.PAYMENT_STATUS_PENDING, models.PAYMENT_STATUS_ACCEPTED]),
+        models.Payment.maturity_date <= today,
+    )
+    if lc_id is not None:
+        query = query.filter(models.Payment.lc_id == lc_id)
+
+    payments = query.all()
+    count = 0
+    for p in payments:
+        if p.status == models.PAYMENT_STATUS_ACCEPTED or p.payment_method == models.PAYMENT_METHOD_SIGHT:
+            old_status = p.status
+            p.status = models.PAYMENT_STATUS_MATURED
+            _add_payment_status_history(db, p, old_status, models.PAYMENT_STATUS_MATURED, remark="自动到期")
+            count += 1
+
+    if count > 0:
+        db.commit()
+    return count
+
+
+def get_lc_payment_summary(db: Session, lc_number: str) -> Dict[str, Any]:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        raise ValueError(f"信用证 {lc_number} 不存在")
+
+    check_and_update_matured_payments(db, lc.id)
+
+    payments = get_payments_by_lc(db, lc_number)
+
+    total_amount = sum(p.payment_amount for p in payments)
+    paid_amount = sum(p.total_paid_amount for p in payments)
+    pending_amount = total_amount - paid_amount
+
+    return {
+        "lc_number": lc_number,
+        "total_payments": len(payments),
+        "total_amount": total_amount,
+        "paid_amount": paid_amount,
+        "pending_amount": pending_amount,
+        "payments": payments,
+    }
+
+
+def get_all_payments(db: Session, skip: int = 0, limit: int = 100) -> List[models.Payment]:
+    return db.query(models.Payment).order_by(models.Payment.created_at.desc()).offset(skip).limit(limit).all()

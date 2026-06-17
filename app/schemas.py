@@ -62,6 +62,26 @@ class Conclusion(str, Enum):
     DISCREPANT = "discrepant"
 
 
+class PaymentMethod(str, Enum):
+    SIGHT = "sight"
+    USANCE = "usance"
+    DEFERRED = "deferred"
+
+
+class UsanceBasis(str, Enum):
+    SHIPMENT_DATE = "shipment_date"
+    PRESENTATION_DATE = "presentation_date"
+    BL_DATE = "bl_date"
+
+
+class PaymentStatus(str, Enum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    MATURED = "matured"
+    PAID = "paid"
+    REJECTED = "rejected"
+
+
 class DocumentRequirementCreate(BaseModel):
     document_type: str
     original_copies: int = 0
@@ -96,6 +116,10 @@ class LetterOfCreditCreate(BaseModel):
     goods_description: str
     additional_terms: List[str] = []
     fee_tier: FeeTier = FeeTier.STANDARD
+    payment_method: PaymentMethod = PaymentMethod.SIGHT
+    usance_days: Optional[int] = None
+    usance_basis: Optional[UsanceBasis] = None
+    deferred_payment_date: Optional[date] = None
     document_requirements: List[DocumentRequirementCreate]
 
 
@@ -118,6 +142,10 @@ class LetterOfCreditResponse(BaseModel):
     goods_description: str
     additional_terms: List[str]
     fee_tier: str
+    payment_method: str
+    usance_days: Optional[int] = None
+    usance_basis: Optional[str] = None
+    deferred_payment_date: Optional[date] = None
     document_requirements: List[DocumentRequirementResponse]
     created_at: datetime
 
@@ -916,3 +944,100 @@ class SubmissionByRuleVersionResponse(BaseModel):
     rule_version_number: str
     total_count: int
     submissions: List[AuditRecordResponse]
+
+
+class PaymentCreateRequest(BaseModel):
+    submission_id: str
+
+
+class PaymentAcceptRequest(BaseModel):
+    accepted_by: Optional[str] = None
+
+
+class PaymentRejectRequest(BaseModel):
+    rejection_reason: str
+    rejected_by: Optional[str] = None
+
+
+class PaymentSettleRequest(BaseModel):
+    amount: Optional[float] = None
+    payment_date: date
+    reference: Optional[str] = None
+    settled_by: Optional[str] = None
+
+
+class PaymentStatusHistoryResponse(BaseModel):
+    id: int
+    payment_id: int
+    from_status: Optional[str] = None
+    to_status: str
+    changed_by: Optional[str] = None
+    changed_at: datetime
+    remark: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class PartialPaymentRecordResponse(BaseModel):
+    id: int
+    payment_id: int
+    amount: float
+    payment_date: date
+    reference: Optional[str] = None
+    created_by: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PaymentResponse(BaseModel):
+    id: int
+    payment_number: str
+    lc_id: int
+    submission_id: str
+    audit_record_id: int
+    payment_amount: float
+    currency: str
+    payment_method: str
+    maturity_date: date
+    status: str
+    accepted_at: Optional[datetime] = None
+    rejection_reason: Optional[str] = None
+    total_paid_amount: float
+    actual_payment_date: Optional[date] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PaymentDetailResponse(PaymentResponse):
+    status_history: List[PaymentStatusHistoryResponse] = []
+    partial_payments: List[PartialPaymentRecordResponse] = []
+
+
+class LcPaymentSummaryResponse(BaseModel):
+    lc_number: str
+    total_payments: int
+    total_amount: float
+    paid_amount: float
+    pending_amount: float
+    payments: List[PaymentResponse]
+
+
+class PaymentStatsByCurrencyResponse(BaseModel):
+    currency: str
+    total_amount: float
+    paid_amount: float
+    count: int
+
+
+class PaymentStatsResponse(BaseModel):
+    start_date: date
+    end_date: date
+    by_currency: List[PaymentStatsByCurrencyResponse]
+    total_count: int
+    total_amount: float
+    total_paid_amount: float

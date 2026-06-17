@@ -868,6 +868,122 @@ def create_app() -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"查询交单列表失败: {str(e)}")
 
+    @app.post("/api/payments", response_model=schemas.PaymentResponse, tags=["承兑与付款管理"], status_code=status.HTTP_201_CREATED)
+    async def create_payment(payment_req: schemas.PaymentCreateRequest, db: Session = Depends(get_db)):
+        try:
+            payment = crud.create_payment_application(db, payment_req.submission_id)
+            return payment
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"创建付款申请失败: {str(e)}")
+
+    @app.get("/api/payments/{payment_number}", response_model=schemas.PaymentDetailResponse, tags=["承兑与付款管理"])
+    async def get_payment_detail(payment_number: str, db: Session = Depends(get_db)):
+        try:
+            crud.check_and_update_matured_payments(db)
+            return crud.get_payment_detail(db, payment_number)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询付款详情失败: {str(e)}")
+
+    @app.post("/api/payments/{payment_number}/accept", response_model=schemas.PaymentResponse, tags=["承兑与付款管理"])
+    async def accept_payment(payment_number: str, accept_req: schemas.PaymentAcceptRequest, db: Session = Depends(get_db)):
+        try:
+            payment = crud.accept_payment(db, payment_number, accept_req.accepted_by)
+            return payment
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"承兑失败: {str(e)}")
+
+    @app.post("/api/payments/{payment_number}/reject", response_model=schemas.PaymentResponse, tags=["承兑与付款管理"])
+    async def reject_payment(payment_number: str, reject_req: schemas.PaymentRejectRequest, db: Session = Depends(get_db)):
+        try:
+            payment = crud.reject_payment(db, payment_number, reject_req.rejection_reason, reject_req.rejected_by)
+            return payment
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"拒付失败: {str(e)}")
+
+    @app.post("/api/payments/{payment_number}/settle", response_model=schemas.PaymentResponse, tags=["承兑与付款管理"])
+    async def settle_payment(payment_number: str, settle_req: schemas.PaymentSettleRequest, db: Session = Depends(get_db)):
+        try:
+            payment = crud.settle_payment(
+                db,
+                payment_number,
+                settle_req.payment_date,
+                settle_req.amount,
+                settle_req.reference,
+                settle_req.settled_by,
+            )
+            return payment
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"付款结算失败: {str(e)}")
+
+    @app.get("/api/payments/lc/{lc_number}", response_model=schemas.LcPaymentSummaryResponse, tags=["承兑与付款管理"])
+    async def get_lc_payments(lc_number: str, db: Session = Depends(get_db)):
+        try:
+            return crud.get_lc_payment_summary(db, lc_number)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询信用证付款记录失败: {str(e)}")
+
+    @app.get("/api/payments/status/{status}", response_model=List[schemas.PaymentResponse], tags=["承兑与付款管理"])
+    async def get_payments_by_status(status: str, skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+        try:
+            crud.check_and_update_matured_payments(db)
+            return crud.get_payments_by_status(db, status, skip, limit)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"按状态查询付款失败: {str(e)}")
+
+    @app.get("/api/payments/stats/summary", response_model=schemas.PaymentStatsResponse, tags=["承兑与付款管理"])
+    async def get_payment_stats(
+        start_date: date,
+        end_date: date,
+        db: Session = Depends(get_db)
+    ):
+        try:
+            if start_date > end_date:
+                raise HTTPException(status_code=400, detail="开始日期不能大于结束日期")
+            return crud.get_payment_stats_by_time_range(db, start_date, end_date)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询付款统计失败: {str(e)}")
+
+    @app.get("/api/payments/{payment_number}/status-history", response_model=List[schemas.PaymentStatusHistoryResponse], tags=["承兑与付款管理"])
+    async def get_payment_status_history(payment_number: str, db: Session = Depends(get_db)):
+        try:
+            return crud.get_payment_status_history(db, payment_number)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询状态历史失败: {str(e)}")
+
+    @app.post("/api/payments/maturity-check", tags=["承兑与付款管理"])
+    async def check_maturity(db: Session = Depends(get_db)):
+        try:
+            count = crud.check_and_update_matured_payments(db)
+            return {"matured_count": count, "message": f"已将 {count} 笔到期付款标记为 matured"}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"到期检查失败: {str(e)}")
+
+    @app.get("/api/payments", response_model=List[schemas.PaymentResponse], tags=["承兑与付款管理"])
+    async def list_all_payments(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+        try:
+            crud.check_and_update_matured_payments(db)
+            return crud.get_all_payments(db, skip, limit)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询付款列表失败: {str(e)}")
+
     return app
 
 

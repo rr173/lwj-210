@@ -3,16 +3,27 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from app.database import Base, engine, SessionLocal
 from app import models, schemas, crud
 from app.audit_engine import AuditEngine
-from app.models import FEE_TYPE_FIRST_SUBMISSION, REVIEW_STATUS_PENDING
+from app.models import (
+    FEE_TYPE_FIRST_SUBMISSION,
+    REVIEW_STATUS_PENDING,
+    PAYMENT_METHOD_SIGHT,
+    PAYMENT_METHOD_USANCE,
+    USANCE_BASIS_SHIPMENT_DATE,
+    PAYMENT_STATUS_PENDING,
+    PAYMENT_STATUS_MATURED,
+    PAYMENT_STATUS_ACCEPTED,
+)
 
 
 def init_db():
     Base.metadata.create_all(bind=engine)
     _migrate_rule_version_columns()
+    _migrate_payment_columns()
+    _create_payment_tables()
 
 
 def _migrate_rule_version_columns():
@@ -24,6 +35,44 @@ def _migrate_rule_version_columns():
             db.execute(text("SELECT rule_version_id FROM audit_records LIMIT 1"))
         except OperationalError:
             db.execute(text("ALTER TABLE audit_records ADD COLUMN rule_version_id INTEGER REFERENCES rule_versions(id)"))
+            db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _migrate_payment_columns():
+    from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+    db = SessionLocal()
+    try:
+        try:
+            db.execute(text("SELECT payment_method FROM letter_of_credits LIMIT 1"))
+        except OperationalError:
+            db.execute(text("ALTER TABLE letter_of_credits ADD COLUMN payment_method VARCHAR(20) DEFAULT 'sight' NOT NULL"))
+            db.execute(text("ALTER TABLE letter_of_credits ADD COLUMN usance_days INTEGER"))
+            db.execute(text("ALTER TABLE letter_of_credits ADD COLUMN usance_basis VARCHAR(30)"))
+            db.execute(text("ALTER TABLE letter_of_credits ADD COLUMN deferred_payment_date DATE"))
+            db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _create_payment_tables():
+    from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+    db = SessionLocal()
+    try:
+        try:
+            db.execute(text("SELECT 1 FROM payments LIMIT 1"))
+        except OperationalError:
+            conn = db.connection()
+            models.Payment.__table__.create(bind=conn)
+            models.PaymentStatusHistory.__table__.create(bind=conn)
+            models.PartialPaymentRecord.__table__.create(bind=conn)
             db.commit()
     except Exception:
         db.rollback()
@@ -65,6 +114,7 @@ def seed_data():
                 "提交清洁已装船提单"
             ],
             fee_tier=schemas.FeeTier.STANDARD,
+            payment_method=schemas.PaymentMethod.SIGHT,
             document_requirements=[
                 schemas.DocumentRequirementCreate(document_type="invoice", original_copies=3, copy_copies=2),
                 schemas.DocumentRequirementCreate(document_type="bill_of_lading", original_copies=3, copy_copies=3),
@@ -97,6 +147,9 @@ def seed_data():
                 "原产地证由中国国际贸易促进委员会签发"
             ],
             fee_tier=schemas.FeeTier.PREFERRED,
+            payment_method=schemas.PaymentMethod.USANCE,
+            usance_days=90,
+            usance_basis=schemas.UsanceBasis.SHIPMENT_DATE,
             document_requirements=[
                 schemas.DocumentRequirementCreate(document_type="invoice", original_copies=3, copy_copies=2),
                 schemas.DocumentRequirementCreate(document_type="bill_of_lading", original_copies=1, copy_copies=2),
@@ -352,6 +405,213 @@ def seed_data():
 
         crud.create_fee_record(db, lc2, audit2, FEE_TYPE_FIRST_SUBMISSION, len(docs2))
         print(f"创建收费记录2: 费用编号 FEE-{lc2.lc_number}-...")
+
+        print("\n" + "-" * 40)
+        print("创建付款申请预置数据")
+        print("-" * 40)
+
+        payment1_number = f"PAY-{lc1.lc_number}-20240308-0001"
+        maturity_date1 = crud.add_business_days(date(2024, 3, 8), 5)
+        payment1 = models.Payment(
+            payment_number=payment1_number,
+            lc_id=lc1.id,
+            submission_id=submission1_id,
+            audit_record_id=audit1.id,
+            payment_amount=50000.00,
+            currency=lc1.currency,
+            payment_method=PAYMENT_METHOD_SIGHT,
+            maturity_date=maturity_date1,
+            status=PAYMENT_STATUS_MATURED,
+            total_paid_amount=0.0,
+            created_at=datetime(2024, 3, 8, 10, 0, 0),
+        )
+        db.add(payment1)
+        db.flush()
+
+        history1_1 = models.PaymentStatusHistory(
+            payment_id=payment1.id,
+            from_status=None,
+            to_status=PAYMENT_STATUS_PENDING,
+            changed_by="system",
+            changed_at=datetime(2024, 3, 8, 10, 0, 0),
+            remark="付款申请创建",
+        )
+        db.add(history1_1)
+
+        history1_2 = models.PaymentStatusHistory(
+            payment_id=payment1.id,
+            from_status=PAYMENT_STATUS_PENDING,
+            to_status=PAYMENT_STATUS_MATURED,
+            changed_by="system",
+            changed_at=datetime.combine(maturity_date1, datetime.min.time()),
+            remark="自动到期",
+        )
+        db.add(history1_2)
+        print(f"创建付款申请1: {payment1_number} (即期, 已到期)")
+        print(f"    到期日: {maturity_date1}")
+
+        submission3_id = "SUB-LC2-20240418-COMPLIANT"
+        presentation_date3 = date(2024, 4, 18)
+
+        docs3 = [
+            models.Document(
+                lc_id=lc2.id, submission_id=submission3_id,
+                original_submission_id=submission3_id, resubmission_round=0,
+                document_type="invoice",
+                original_copies_submitted=3, copy_copies_submitted=2,
+                content={
+                    "invoice_number": "INV-2024-0418-001",
+                    "invoice_date": "2024-04-15",
+                    "beneficiary": "深圳电子科技有限公司 SHENZHEN ELECTRONICS TECHNOLOGY CO., LTD.",
+                    "applicant": "XYZ ELECTRONICS DISTRIBUTOR INC.",
+                    "currency": "EUR",
+                    "goods": [
+                        {"name": "WIRELESS BLUETOOTH EARPHONES", "specification": "MODEL X200", "quantity": 3500, "unit": "SETS", "unit_price": 5.00}
+                    ],
+                    "goods_description": "WIRELESS BLUETOOTH EARPHONES MODEL X200, 3500SETS AT EUR5.00 PER SET CFR FRANKFURT",
+                    "total_amount": 17500.00
+                }
+            ),
+            models.Document(
+                lc_id=lc2.id, submission_id=submission3_id,
+                original_submission_id=submission3_id, resubmission_round=0,
+                document_type="bill_of_lading",
+                original_copies_submitted=1, copy_copies_submitted=2,
+                content={
+                    "bl_number": "CAW-2024-0418-6677",
+                    "shipper": "深圳电子科技有限公司 SHENZHEN ELECTRONICS TECHNOLOGY CO., LTD.",
+                    "consignee": "TO ORDER",
+                    "notify_party": "XYZ ELECTRONICS DISTRIBUTOR INC. FRANKFURT, GERMANY",
+                    "flight_number": "CA1234 / LH5678",
+                    "port_of_loading": "SHENZHEN BAO'AN INTERNATIONAL AIRPORT",
+                    "port_of_discharge": "FRANKFURT AM MAIN AIRPORT",
+                    "shipment_date": "2024-04-18",
+                    "packages": 3500,
+                    "package_unit": "SETS",
+                    "freight_term": "FREIGHT COLLECT",
+                    "clean": True,
+                    "transshipment": True,
+                    "goods_description": "WIRELESS BLUETOOTH EARPHONES"
+                }
+            ),
+            models.Document(
+                lc_id=lc2.id, submission_id=submission3_id,
+                original_submission_id=submission3_id, resubmission_round=0,
+                document_type="packing_list",
+                original_copies_submitted=2, copy_copies_submitted=2,
+                content={
+                    "packing_number": "PL-2024-0418-001",
+                    "date": "2024-04-15",
+                    "total_packages": 175,
+                    "package_type": "CTNS",
+                    "gross_weight": 525.00,
+                    "net_weight": 490.00,
+                    "goods_description": "BLUETOOTH EARPHONES"
+                }
+            ),
+            models.Document(
+                lc_id=lc2.id, submission_id=submission3_id,
+                original_submission_id=submission3_id, resubmission_round=0,
+                document_type="origin_cert",
+                original_copies_submitted=1, copy_copies_submitted=1,
+                content={
+                    "cert_number": "CCO-2024-0417-022",
+                    "issue_date": "2024-04-17",
+                    "issuing_authority": "CCPIT SHENZHEN",
+                    "origin_country": "CHINA",
+                    "goods_description": "WIRELESS EARPHONES",
+                    "exporter": "SHENZHEN ELECTRONICS TECHNOLOGY CO., LTD."
+                }
+            ),
+            models.Document(
+                lc_id=lc2.id, submission_id=submission3_id,
+                original_submission_id=submission3_id, resubmission_round=0,
+                document_type="inspection_cert",
+                original_copies_submitted=1, copy_copies_submitted=1,
+                content={
+                    "cert_number": "SGS-2024-0417-066",
+                    "issue_date": "2024-04-17",
+                    "issuing_authority": "SGS SHENZHEN",
+                    "inspection_date": "2024-04-16",
+                    "result": "PASSED",
+                    "goods_description": "WIRELESS BLUETOOTH EARPHONES MODEL X200",
+                    "quantity": 3500
+                }
+            ),
+        ]
+
+        for d in docs3:
+            db.add(d)
+        db.flush()
+
+        engine3 = AuditEngine(lc2, docs3, presentation_date3)
+        conclusion3, discrepancies3 = engine3.run_audit()
+        critical3 = sum(1 for d in discrepancies3 if d["severity"] == "critical")
+        minor3 = sum(1 for d in discrepancies3 if d["severity"] == "minor")
+
+        audit3 = models.AuditRecord(
+            lc_id=lc2.id, submission_id=submission3_id,
+            original_submission_id=submission3_id, resubmission_round=0,
+            modification_remark=None,
+            conclusion=conclusion3,
+            auto_conclusion=conclusion3,
+            final_conclusion=None,
+            total_discrepancies=len(discrepancies3), critical_count=critical3,
+            minor_count=minor3, presentation_date=presentation_date3,
+            review_status=REVIEW_STATUS_PENDING
+        )
+        db.add(audit3)
+        db.flush()
+
+        for d in discrepancies3:
+            db.add(models.Discrepancy(audit_record_id=audit3.id, **d))
+        print(f"创建审核记录3 (远期付款交单): 结论={conclusion3}, 不符点数量={len(discrepancies3)}")
+
+        crud.create_fee_record(db, lc2, audit3, FEE_TYPE_FIRST_SUBMISSION, len(docs3))
+        print(f"创建收费记录3: 费用编号 FEE-{lc2.lc_number}-...")
+
+        payment2_number = f"PAY-{lc2.lc_number}-20240418-0001"
+        shipment_date3 = date(2024, 4, 18)
+        maturity_date2 = crud.add_business_days(shipment_date3, 90)
+        payment2 = models.Payment(
+            payment_number=payment2_number,
+            lc_id=lc2.id,
+            submission_id=submission3_id,
+            audit_record_id=audit3.id,
+            payment_amount=17500.00,
+            currency=lc2.currency,
+            payment_method=PAYMENT_METHOD_USANCE,
+            maturity_date=maturity_date2,
+            status=PAYMENT_STATUS_ACCEPTED,
+            accepted_at=datetime(2024, 4, 20, 14, 30, 0),
+            total_paid_amount=0.0,
+            created_at=datetime(2024, 4, 18, 10, 0, 0),
+        )
+        db.add(payment2)
+        db.flush()
+
+        history2_1 = models.PaymentStatusHistory(
+            payment_id=payment2.id,
+            from_status=None,
+            to_status=PAYMENT_STATUS_PENDING,
+            changed_by="system",
+            changed_at=datetime(2024, 4, 18, 10, 0, 0),
+            remark="付款申请创建",
+        )
+        db.add(history2_1)
+
+        history2_2 = models.PaymentStatusHistory(
+            payment_id=payment2.id,
+            from_status=PAYMENT_STATUS_PENDING,
+            to_status=PAYMENT_STATUS_ACCEPTED,
+            changed_by="bank_officer",
+            changed_at=datetime(2024, 4, 20, 14, 30, 0),
+            remark="银行承兑",
+        )
+        db.add(history2_2)
+        print(f"创建付款申请2: {payment2_number} (远期90天, 已承兑)")
+        print(f"    起算基准: 装船日 {shipment_date3}")
+        print(f"    到期日: {maturity_date2}")
 
         db.commit()
         print("预置数据初始化完成！")
