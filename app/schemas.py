@@ -1030,12 +1030,6 @@ class PaymentResponse(BaseModel):
         from_attributes = True
 
 
-class PaymentDetailResponse(PaymentResponse):
-    status_history: List[PaymentStatusHistoryResponse] = []
-    partial_payments: List[PartialPaymentRecordResponse] = []
-    collection_records: List["CollectionRecordResponse"] = []
-
-
 class CollectionRecordCreate(BaseModel):
     payment_number: str
     collection_method: CollectionMethod
@@ -1061,7 +1055,10 @@ class CollectionRecordResponse(BaseModel):
         from_attributes = True
 
 
-PaymentDetailResponse.model_rebuild()
+class PaymentDetailResponse(PaymentResponse):
+    status_history: List[PaymentStatusHistoryResponse] = []
+    partial_payments: List[PartialPaymentRecordResponse] = []
+    collection_records: List[CollectionRecordResponse] = []
 
 
 class PenaltyInterestResponse(BaseModel):
