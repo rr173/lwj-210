@@ -4527,3 +4527,207 @@ def create_submission_from_template(
     )
 
     return submit_documents_and_audit(db, submission)
+
+
+def _generate_batch_number() -> str:
+    return f"BATCH-{datetime.utcnow().strftime('%Y%m%d')}"
+
+
+def enqueue_submission(db: Session, queue_data: schemas.SubmissionQueueCreate) -> models.SubmissionQueue:
+    lc = get_letter_of_credit_by_number(db, queue_data.lc_number)
+    if not lc:
+        raise ValueError(f"信用证 {queue_data.lc_number} 不存在")
+
+    existing = db.query(models.SubmissionQueue).filter(
+        models.SubmissionQueue.submission_id == queue_data.submission_id
+    ).first()
+    if existing:
+        raise ValueError(f"交单 {queue_data.submission_id} 已在队列中")
+
+    priority = queue_data.priority.value if hasattr(queue_data.priority, 'value') else queue_data.priority
+    if priority not in models.VALID_PRIORITIES:
+        raise ValueError(f"无效的优先级: {priority}，允许值: {', '.join(models.VALID_PRIORITIES)}")
+
+    batch_number = _generate_batch_number()
+
+    entry = models.SubmissionQueue(
+        submission_id=queue_data.submission_id,
+        lc_id=lc.id,
+        batch_number=batch_number,
+        priority=priority,
+        deadline=queue_data.deadline,
+        queue_status=models.QUEUE_STATUS_WAITING,
+        timeout_release_count=0,
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    return entry
+
+
+def get_next_submission(db: Session) -> Optional[models.SubmissionQueue]:
+    release_timeout_submissions(db)
+
+    priority_order_case = None
+    if hasattr(models, 'PRIORITY_ORDER'):
+        from sqlalchemy import case
+        priority_order_case = case(
+            *[(models.SubmissionQueue.priority == p, o) for p, o in models.PRIORITY_ORDER.items()],
+            else_=99
+        )
+
+    query = db.query(models.SubmissionQueue).filter(
+        models.SubmissionQueue.queue_status == models.QUEUE_STATUS_WAITING
+    )
+
+    if priority_order_case is not None:
+        query = query.order_by(priority_order_case.asc(), models.SubmissionQueue.created_at.asc())
+    else:
+        query = query.order_by(models.SubmissionQueue.created_at.asc())
+
+    entry = query.first()
+    if not entry:
+        return None
+
+    entry.queue_status = models.QUEUE_STATUS_PROCESSING
+    entry.processing_started_at = datetime.utcnow()
+    db.commit()
+    db.refresh(entry)
+    return entry
+
+
+def complete_submission_in_queue(db: Session, submission_id: str) -> models.SubmissionQueue:
+    entry = db.query(models.SubmissionQueue).filter(
+        models.SubmissionQueue.submission_id == submission_id
+    ).first()
+    if not entry:
+        raise ValueError(f"交单 {submission_id} 不在队列中")
+
+    if entry.queue_status != models.QUEUE_STATUS_PROCESSING:
+        raise ValueError(f"交单 {submission_id} 当前状态为 {entry.queue_status}，只有 processing 状态的交单可以完成")
+
+    entry.queue_status = models.QUEUE_STATUS_COMPLETED
+    entry.processing_completed_at = datetime.utcnow()
+    db.commit()
+    db.refresh(entry)
+    return entry
+
+
+def release_timeout_submissions(db: Session) -> int:
+    now = datetime.utcnow()
+    timeout_threshold = now - timedelta(hours=models.QUEUE_TIMEOUT_HOURS)
+
+    timed_out = db.query(models.SubmissionQueue).filter(
+        models.SubmissionQueue.queue_status == models.QUEUE_STATUS_PROCESSING,
+        models.SubmissionQueue.processing_started_at < timeout_threshold,
+        models.SubmissionQueue.processing_completed_at.is_(None),
+    ).all()
+
+    count = 0
+    for entry in timed_out:
+        entry.queue_status = models.QUEUE_STATUS_WAITING
+        entry.processing_started_at = None
+        entry.timeout_release_count += 1
+        count += 1
+
+    if count > 0:
+        db.commit()
+
+    return count
+
+
+def get_batch_submissions(db: Session, batch_number: str) -> Dict[str, Any]:
+    entries = db.query(models.SubmissionQueue).filter(
+        models.SubmissionQueue.batch_number == batch_number
+    ).order_by(models.SubmissionQueue.created_at.asc()).all()
+
+    result_entries = []
+    for entry in entries:
+        lc = get_letter_of_credit_by_id(db, entry.lc_id)
+        audit_record = get_audit_record_by_submission(db, entry.submission_id)
+        result_entries.append({
+            "id": entry.id,
+            "submission_id": entry.submission_id,
+            "lc_id": entry.lc_id,
+            "batch_number": entry.batch_number,
+            "priority": entry.priority,
+            "deadline": entry.deadline,
+            "queue_status": entry.queue_status,
+            "processing_started_at": entry.processing_started_at,
+            "processing_completed_at": entry.processing_completed_at,
+            "timeout_release_count": entry.timeout_release_count,
+            "created_at": entry.created_at,
+            "lc_number": lc.lc_number if lc else None,
+            "audit_conclusion": audit_record.conclusion if audit_record else None,
+        })
+
+    return {
+        "batch_number": batch_number,
+        "total_count": len(entries),
+        "submissions": result_entries,
+    }
+
+
+def get_batch_stats(db: Session, batch_number: str) -> Dict[str, Any]:
+    entries = db.query(models.SubmissionQueue).filter(
+        models.SubmissionQueue.batch_number == batch_number
+    ).all()
+
+    if not entries:
+        return {
+            "batch_number": batch_number,
+            "total_count": 0,
+            "completed_count": 0,
+            "avg_processing_seconds": None,
+            "timeout_release_total_count": 0,
+        }
+
+    total_count = len(entries)
+    completed = [e for e in entries if e.queue_status == models.QUEUE_STATUS_COMPLETED]
+    completed_count = len(completed)
+
+    processing_times = []
+    for e in completed:
+        if e.processing_started_at and e.processing_completed_at:
+            delta = (e.processing_completed_at - e.processing_started_at).total_seconds()
+            processing_times.append(delta)
+
+    avg_processing = None
+    if processing_times:
+        avg_processing = round(sum(processing_times) / len(processing_times), 2)
+
+    timeout_release_total = sum(e.timeout_release_count for e in entries)
+
+    return {
+        "batch_number": batch_number,
+        "total_count": total_count,
+        "completed_count": completed_count,
+        "avg_processing_seconds": avg_processing,
+        "timeout_release_total_count": timeout_release_total,
+    }
+
+
+def get_queue_status(db: Session) -> Dict[str, Any]:
+    from sqlalchemy import func
+
+    waiting_entries = db.query(models.SubmissionQueue).filter(
+        models.SubmissionQueue.queue_status == models.QUEUE_STATUS_WAITING
+    ).all()
+
+    priority_counts = {}
+    for p in models.VALID_PRIORITIES:
+        priority_counts[p] = 0
+
+    for entry in waiting_entries:
+        if entry.priority in priority_counts:
+            priority_counts[entry.priority] += 1
+
+    by_priority = [
+        {"priority": p, "count": c}
+        for p, c in priority_counts.items()
+    ]
+
+    return {
+        "total_waiting": len(waiting_entries),
+        "by_priority": by_priority,
+    }

@@ -1156,6 +1156,65 @@ def create_app() -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"使用模板提交失败: {str(e)}")
 
+    @app.post("/api/queue/enqueue", response_model=schemas.SubmissionQueueResponse, tags=["交单批次与优先级调度"], status_code=status.HTTP_201_CREATED)
+    async def enqueue_submission(queue_data: schemas.SubmissionQueueCreate, db: Session = Depends(get_db)):
+        try:
+            entry = crud.enqueue_submission(db, queue_data)
+            return entry
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"入队失败: {str(e)}")
+
+    @app.get("/api/queue/next", response_model=schemas.NextSubmissionResponse, tags=["交单批次与优先级调度"])
+    async def get_next_submission(db: Session = Depends(get_db)):
+        try:
+            entry = crud.get_next_submission(db)
+            if not entry:
+                return {"queue_entry": None, "message": "当前没有待处理的交单"}
+            return {"queue_entry": entry, "message": f"已取出交单 {entry.submission_id}，状态已标记为 processing"}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"获取下一笔交单失败: {str(e)}")
+
+    @app.post("/api/queue/{submission_id}/complete", response_model=schemas.SubmissionQueueResponse, tags=["交单批次与优先级调度"])
+    async def complete_queue_submission(submission_id: str, db: Session = Depends(get_db)):
+        try:
+            entry = crud.complete_submission_in_queue(db, submission_id)
+            return entry
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"完成交单失败: {str(e)}")
+
+    @app.post("/api/queue/timeout-release", tags=["交单批次与优先级调度"])
+    async def timeout_release(db: Session = Depends(get_db)):
+        try:
+            count = crud.release_timeout_submissions(db)
+            return {"released_count": count, "message": f"已释放 {count} 笔超时交单回队列"}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"超时释放失败: {str(e)}")
+
+    @app.get("/api/queue/batch/{batch_number}", response_model=schemas.BatchQueryResponse, tags=["交单批次与优先级调度"])
+    async def get_batch_submissions(batch_number: str, db: Session = Depends(get_db)):
+        try:
+            return crud.get_batch_submissions(db, batch_number)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询批次交单失败: {str(e)}")
+
+    @app.get("/api/queue/batch/{batch_number}/stats", response_model=schemas.BatchStatsResponse, tags=["交单批次与优先级调度"])
+    async def get_batch_stats(batch_number: str, db: Session = Depends(get_db)):
+        try:
+            return crud.get_batch_stats(db, batch_number)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询批次统计失败: {str(e)}")
+
+    @app.get("/api/queue/status", response_model=schemas.QueueStatusResponse, tags=["交单批次与优先级调度"])
+    async def get_queue_status(db: Session = Depends(get_db)):
+        try:
+            return crud.get_queue_status(db)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询队列状态失败: {str(e)}")
+
     return app
 
 

@@ -771,6 +771,37 @@ class CreditLineTransaction(Base):
     credit_line = relationship("CreditLine", back_populates="transactions")
 
 
+PRIORITY_URGENT = "urgent"
+PRIORITY_NORMAL = "normal"
+PRIORITY_LOW = "low"
+VALID_PRIORITIES = [PRIORITY_URGENT, PRIORITY_NORMAL, PRIORITY_LOW]
+PRIORITY_ORDER = {PRIORITY_URGENT: 0, PRIORITY_NORMAL: 1, PRIORITY_LOW: 2}
+
+QUEUE_STATUS_WAITING = "waiting"
+QUEUE_STATUS_PROCESSING = "processing"
+QUEUE_STATUS_COMPLETED = "completed"
+VALID_QUEUE_STATUSES = [QUEUE_STATUS_WAITING, QUEUE_STATUS_PROCESSING, QUEUE_STATUS_COMPLETED]
+
+QUEUE_TIMEOUT_HOURS = 2
+
+
+class SubmissionQueue(Base):
+    __tablename__ = "submission_queue"
+
+    id = Column(Integer, primary_key=True, index=True)
+    submission_id = Column(String(100), index=True, nullable=False)
+    lc_id = Column(Integer, ForeignKey("letter_of_credits.id"), nullable=False)
+    batch_number = Column(String(50), index=True, nullable=False)
+    priority = Column(String(20), default=PRIORITY_NORMAL, nullable=False)
+    deadline = Column(DateTime, nullable=True)
+    queue_status = Column(String(20), default=QUEUE_STATUS_WAITING, nullable=False)
+    processing_started_at = Column(DateTime, nullable=True)
+    processing_completed_at = Column(DateTime, nullable=True)
+    timeout_release_count = Column(Integer, default=0, nullable=False)
+    lc = relationship("LetterOfCredit")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 MAX_TEMPLATES_PER_LC = 5
 
 

@@ -19,6 +19,23 @@ from app.models import (
 )
 
 
+def _create_submission_queue_table():
+    from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+    db = SessionLocal()
+    try:
+        try:
+            db.execute(text("SELECT 1 FROM submission_queue LIMIT 1"))
+        except OperationalError:
+            conn = db.connection()
+            models.SubmissionQueue.__table__.create(bind=conn)
+            db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
     _migrate_rule_version_columns()
@@ -27,6 +44,7 @@ def init_db():
     _migrate_overdue_penalty_columns()
     _create_collection_table()
     _create_template_table()
+    _create_submission_queue_table()
 
 
 def _migrate_rule_version_columns():

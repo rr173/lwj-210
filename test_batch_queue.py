@@ -1,0 +1,382 @@
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from datetime import date, datetime, timedelta
+from app.database import Base, engine, SessionLocal
+from app import models, schemas, crud
+from app.seed_data import init_db, seed_data
+
+
+def test_batch_queue_module():
+    print("=" * 60)
+    print("交单批次管理与优先级调度模块功能测试")
+    print("=" * 60)
+
+    init_db()
+    seed_data()
+
+    db = SessionLocal()
+
+    try:
+        db.query(models.SubmissionQueue).delete()
+        db.commit()
+
+        lc_number = "LC-SEA-CIF-2024-001"
+        lc = crud.get_letter_of_credit_by_number(db, lc_number)
+        assert lc is not None, f"信用证 {lc_number} 不存在"
+        print(f"\n[✓] 找到测试信用证: {lc_number}")
+
+        print("\n" + "-" * 40)
+        print("测试1: 交单入队 - 默认优先级(normal)")
+        print("-" * 40)
+
+        entry1_data = schemas.SubmissionQueueCreate(
+            submission_id="SUB-QUEUE-001",
+            lc_number=lc_number,
+        )
+        entry1 = crud.enqueue_submission(db, entry1_data)
+        assert entry1 is not None, "入队失败"
+        assert entry1.priority == "normal", f"默认优先级应为 normal，实际为 {entry1.priority}"
+        assert entry1.queue_status == "waiting", f"状态应为 waiting，实际为 {entry1.queue_status}"
+        assert entry1.batch_number.startswith("BATCH-"), f"批次号格式错误: {entry1.batch_number}"
+        assert entry1.timeout_release_count == 0, "初始超时释放次数应为0"
+        print(f"[✓] 入队成功")
+        print(f"    交单号: {entry1.submission_id}")
+        print(f"    优先级: {entry1.priority}")
+        print(f"    批次号: {entry1.batch_number}")
+        print(f"    状态: {entry1.queue_status}")
+
+        print("\n" + "-" * 40)
+        print("测试2: 交单入队 - urgent优先级和截止时间")
+        print("-" * 40)
+
+        deadline = datetime.utcnow() + timedelta(hours=4)
+        entry2_data = schemas.SubmissionQueueCreate(
+            submission_id="SUB-QUEUE-002",
+            lc_number=lc_number,
+            priority=schemas.SubmissionPriority.URGENT,
+            deadline=deadline,
+        )
+        entry2 = crud.enqueue_submission(db, entry2_data)
+        assert entry2.priority == "urgent", f"优先级应为 urgent，实际为 {entry2.priority}"
+        assert entry2.deadline is not None, "截止时间不应为空"
+        assert entry2.batch_number == entry1.batch_number, "同一天入队应为同一批次"
+        print(f"[✓] 紧急交单入队成功")
+        print(f"    优先级: {entry2.priority}")
+        print(f"    截止时间: {entry2.deadline}")
+        print(f"    批次号: {entry2.batch_number}")
+
+        print("\n" + "-" * 40)
+        print("测试3: 交单入队 - low优先级")
+        print("-" * 40)
+
+        entry3_data = schemas.SubmissionQueueCreate(
+            submission_id="SUB-QUEUE-003",
+            lc_number=lc_number,
+            priority=schemas.SubmissionPriority.LOW,
+        )
+        entry3 = crud.enqueue_submission(db, entry3_data)
+        assert entry3.priority == "low", f"优先级应为 low，实际为 {entry3.priority}"
+        print(f"[✓] 低优先级交单入队成功")
+        print(f"    优先级: {entry3.priority}")
+
+        print("\n" + "-" * 40)
+        print("测试4: 重复入队应被拒绝")
+        print("-" * 40)
+
+        try:
+            dup_data = schemas.SubmissionQueueCreate(
+                submission_id="SUB-QUEUE-001",
+                lc_number=lc_number,
+            )
+            crud.enqueue_submission(db, dup_data)
+            print("[✗] 应该拒绝重复入队")
+            assert False, "同一交单不应重复入队"
+        except ValueError as e:
+            print(f"[✓] 正确拒绝了重复入队")
+            print(f"    错误信息: {str(e)}")
+
+        print("\n" + "-" * 40)
+        print("测试5: 获取下一笔待处理交单 - urgent优先出队")
+        print("-" * 40)
+
+        next_entry = crud.get_next_submission(db)
+        assert next_entry is not None, "队列不应为空"
+        assert next_entry.submission_id == "SUB-QUEUE-002", f"应先取出 urgent 交单，实际取出 {next_entry.submission_id}"
+        assert next_entry.queue_status == "processing", f"状态应为 processing，实际为 {next_entry.queue_status}"
+        assert next_entry.processing_started_at is not None, "开始处理时间不应为空"
+        print(f"[✓] 正确取出 urgent 优先级交单")
+        print(f"    交单号: {next_entry.submission_id}")
+        print(f"    优先级: {next_entry.priority}")
+        print(f"    状态: {next_entry.queue_status}")
+        print(f"    开始处理时间: {next_entry.processing_started_at}")
+
+        print("\n" + "-" * 40)
+        print("测试6: 再取下一笔 - 应为normal优先级")
+        print("-" * 40)
+
+        next_entry2 = crud.get_next_submission(db)
+        assert next_entry2 is not None
+        assert next_entry2.submission_id == "SUB-QUEUE-001", f"应取出 normal 交单，实际取出 {next_entry2.submission_id}"
+        assert next_entry2.priority == "normal"
+        print(f"[✓] 正确取出 normal 优先级交单")
+        print(f"    交单号: {next_entry2.submission_id}")
+        print(f"    优先级: {next_entry2.priority}")
+
+        print("\n" + "-" * 40)
+        print("测试7: 再取下一笔 - 应为low优先级")
+        print("-" * 40)
+
+        next_entry3 = crud.get_next_submission(db)
+        assert next_entry3 is not None
+        assert next_entry3.submission_id == "SUB-QUEUE-003", f"应取出 low 交单，实际取出 {next_entry3.submission_id}"
+        assert next_entry3.priority == "low"
+        print(f"[✓] 正确取出 low 优先级交单")
+        print(f"    交单号: {next_entry3.submission_id}")
+        print(f"    优先级: {next_entry3.priority}")
+
+        print("\n" + "-" * 40)
+        print("测试8: 队列为空时获取下一笔")
+        print("-" * 40)
+
+        empty_next = crud.get_next_submission(db)
+        assert empty_next is None, "所有交单已取出，应为空"
+        print(f"[✓] 队列已空，返回 None")
+
+        print("\n" + "-" * 40)
+        print("测试9: 完成交单处理")
+        print("-" * 40)
+
+        completed = crud.complete_submission_in_queue(db, "SUB-QUEUE-002")
+        assert completed.queue_status == "completed", f"状态应为 completed，实际为 {completed.queue_status}"
+        assert completed.processing_completed_at is not None, "完成时间不应为空"
+        print(f"[✓] 交单处理完成")
+        print(f"    交单号: {completed.submission_id}")
+        print(f"    状态: {completed.queue_status}")
+        print(f"    完成时间: {completed.processing_completed_at}")
+
+        print("\n" + "-" * 40)
+        print("测试10: 完成非processing状态的交单应被拒绝")
+        print("-" * 40)
+
+        try:
+            crud.complete_submission_in_queue(db, "SUB-QUEUE-002")
+            print("[✗] 应该拒绝完成已完成的交单")
+            assert False
+        except ValueError as e:
+            print(f"[✓] 正确拒绝了完成已完成的交单")
+            print(f"    错误信息: {str(e)}")
+
+        print("\n" + "-" * 40)
+        print("测试11: 超时释放 - 处理超过2小时自动释放回队列")
+        print("-" * 40)
+
+        processing_entry = db.query(models.SubmissionQueue).filter(
+            models.SubmissionQueue.submission_id == "SUB-QUEUE-001"
+        ).first()
+        assert processing_entry is not None
+        assert processing_entry.queue_status == "processing"
+
+        processing_entry.processing_started_at = datetime.utcnow() - timedelta(hours=3)
+        db.commit()
+
+        released_count = crud.release_timeout_submissions(db)
+        assert released_count >= 1, f"应至少释放1笔超时交单，实际释放 {released_count}"
+
+        db.refresh(processing_entry)
+        assert processing_entry.queue_status == "waiting", f"释放后状态应为 waiting，实际为 {processing_entry.queue_status}"
+        assert processing_entry.processing_started_at is None, "释放后开始处理时间应为空"
+        assert processing_entry.timeout_release_count >= 1, f"超时释放次数应>=1，实际为 {processing_entry.timeout_release_count}"
+        print(f"[✓] 超时释放正常工作")
+        print(f"    释放数量: {released_count}")
+        print(f"    交单状态: {processing_entry.queue_status}")
+        print(f"    超时释放次数: {processing_entry.timeout_release_count}")
+
+        print("\n" + "-" * 40)
+        print("测试12: 释放后的交单可再次被取出")
+        print("-" * 40)
+
+        re_fetched = crud.get_next_submission(db)
+        assert re_fetched is not None, "释放后的交单应可再次取出"
+        assert re_fetched.submission_id == "SUB-QUEUE-001", f"应取出释放的交单，实际为 {re_fetched.submission_id}"
+        print(f"[✓] 释放后的交单可再次取出")
+        print(f"    交单号: {re_fetched.submission_id}")
+
+        crud.complete_submission_in_queue(db, "SUB-QUEUE-001")
+
+        print("\n" + "-" * 40)
+        print("测试13: 按批次查询交单")
+        print("-" * 40)
+
+        batch_result = crud.get_batch_submissions(db, entry1.batch_number)
+        assert batch_result["batch_number"] == entry1.batch_number
+        assert batch_result["total_count"] == 3, f"批次应有3笔交单，实际有 {batch_result['total_count']}"
+        assert len(batch_result["submissions"]) == 3
+        for sub in batch_result["submissions"]:
+            assert "lc_number" in sub, "应包含 lc_number"
+            assert "audit_conclusion" in sub, "应包含 audit_conclusion"
+        print(f"[✓] 批次查询成功")
+        print(f"    批次号: {batch_result['batch_number']}")
+        print(f"    总笔数: {batch_result['total_count']}")
+        for sub in batch_result["submissions"]:
+            print(f"    - {sub['submission_id']} 优先级:{sub['priority']} 状态:{sub['queue_status']}")
+
+        print("\n" + "-" * 40)
+        print("测试14: 批次效率统计")
+        print("-" * 40)
+
+        stats = crud.get_batch_stats(db, entry1.batch_number)
+        assert stats["batch_number"] == entry1.batch_number
+        assert stats["total_count"] == 3, f"总笔数应为3，实际为 {stats['total_count']}"
+        assert stats["completed_count"] == 2, f"已完成笔数应为2，实际为 {stats['completed_count']}"
+        assert stats["timeout_release_total_count"] >= 1, f"超时释放总次数应>=1，实际为 {stats['timeout_release_total_count']}"
+        print(f"[✓] 批次统计成功")
+        print(f"    总笔数: {stats['total_count']}")
+        print(f"    已完成: {stats['completed_count']}")
+        print(f"    平均处理耗时: {stats['avg_processing_seconds']}秒")
+        print(f"    超时释放次数: {stats['timeout_release_total_count']}")
+
+        print("\n" + "-" * 40)
+        print("测试15: 队列状态查询")
+        print("-" * 40)
+
+        queue_status = crud.get_queue_status(db)
+        assert "total_waiting" in queue_status
+        assert "by_priority" in queue_status
+        print(f"[✓] 队列状态查询成功")
+        print(f"    当前等待总数: {queue_status['total_waiting']}")
+        for item in queue_status["by_priority"]:
+            print(f"    {item['priority']}: {item['count']}笔")
+
+        print("\n" + "-" * 40)
+        print("测试16: 队列状态 - 加入新的urgent交单后查询")
+        print("-" * 40)
+
+        lc2_number = "LC-AIR-CFR-2024-002"
+        entry4_data = schemas.SubmissionQueueCreate(
+            submission_id="SUB-QUEUE-004",
+            lc_number=lc2_number,
+            priority=schemas.SubmissionPriority.URGENT,
+        )
+        entry4 = crud.enqueue_submission(db, entry4_data)
+
+        entry5_data = schemas.SubmissionQueueCreate(
+            submission_id="SUB-QUEUE-005",
+            lc_number=lc2_number,
+            priority=schemas.SubmissionPriority.NORMAL,
+        )
+        entry5 = crud.enqueue_submission(db, entry5_data)
+
+        queue_status2 = crud.get_queue_status(db)
+        urgent_count = next((item["count"] for item in queue_status2["by_priority"] if item["priority"] == "urgent"), 0)
+        normal_count = next((item["count"] for item in queue_status2["by_priority"] if item["priority"] == "normal"), 0)
+        assert urgent_count >= 1, f"urgent应>=1，实际为 {urgent_count}"
+        assert normal_count >= 1, f"normal应>=1，实际为 {normal_count}"
+        print(f"[✓] 队列状态查询正确")
+        print(f"    等待总数: {queue_status2['total_waiting']}")
+        for item in queue_status2["by_priority"]:
+            print(f"    {item['priority']}: {item['count']}笔")
+
+        print("\n" + "-" * 40)
+        print("测试17: 同优先级先进先出")
+        print("-" * 40)
+
+        entry6_data = schemas.SubmissionQueueCreate(
+            submission_id="SUB-QUEUE-006",
+            lc_number=lc2_number,
+            priority=schemas.SubmissionPriority.NORMAL,
+        )
+        entry6 = crud.enqueue_submission(db, entry6_data)
+
+        next_normal = crud.get_next_submission(db)
+        assert next_normal is not None
+        assert next_normal.priority == "urgent", f"应先取urgent，实际取到 {next_normal.priority}"
+        assert next_normal.submission_id == "SUB-QUEUE-004"
+        crud.complete_submission_in_queue(db, "SUB-QUEUE-004")
+
+        next_normal2 = crud.get_next_submission(db)
+        assert next_normal2 is not None
+        assert next_normal2.priority == "normal", f"应取normal，实际取到 {next_normal2.priority}"
+        assert next_normal2.submission_id == "SUB-QUEUE-005", f"同优先级应先进先出，应先取 SUB-QUEUE-005，实际取到 {next_normal2.submission_id}"
+        crud.complete_submission_in_queue(db, "SUB-QUEUE-005")
+
+        next_normal3 = crud.get_next_submission(db)
+        assert next_normal3 is not None
+        assert next_normal3.submission_id == "SUB-QUEUE-006", f"应取 SUB-QUEUE-006，实际取到 {next_normal3.submission_id}"
+        crud.complete_submission_in_queue(db, "SUB-QUEUE-006")
+
+        print(f"[✓] 同优先级先进先出验证通过")
+        print(f"    先取: SUB-QUEUE-004 (urgent)")
+        print(f"    次取: SUB-QUEUE-005 (normal, 先入队)")
+        print(f"    后取: SUB-QUEUE-006 (normal, 后入队)")
+
+        print("\n" + "-" * 40)
+        print("测试18: 不存在的信用证入队应被拒绝")
+        print("-" * 40)
+
+        try:
+            bad_data = schemas.SubmissionQueueCreate(
+                submission_id="SUB-QUEUE-BAD",
+                lc_number="LC-NOT-EXIST",
+            )
+            crud.enqueue_submission(db, bad_data)
+            print("[✗] 应该拒绝不存在的信用证")
+            assert False
+        except ValueError as e:
+            print(f"[✓] 正确拒绝了不存在的信用证")
+            print(f"    错误信息: {str(e)}")
+
+        print("\n" + "-" * 40)
+        print("测试19: 空批次统计")
+        print("-" * 40)
+
+        empty_stats = crud.get_batch_stats(db, "BATCH-20990101")
+        assert empty_stats["total_count"] == 0, f"空批次笔数应为0，实际为 {empty_stats['total_count']}"
+        assert empty_stats["avg_processing_seconds"] is None, "空批次平均耗时应为None"
+        print(f"[✓] 空批次统计正确")
+        print(f"    总笔数: {empty_stats['total_count']}")
+
+        print("\n" + "-" * 40)
+        print("测试20: 完成SUB-QUEUE-003并验证统计")
+        print("-" * 40)
+
+        sub3 = db.query(models.SubmissionQueue).filter(
+            models.SubmissionQueue.submission_id == "SUB-QUEUE-003"
+        ).first()
+        assert sub3.queue_status == "processing"
+        crud.complete_submission_in_queue(db, "SUB-QUEUE-003")
+
+        final_stats = crud.get_batch_stats(db, entry1.batch_number)
+        assert final_stats["total_count"] == 6, f"批次应有6笔交单，实际为 {final_stats['total_count']}"
+        assert final_stats["completed_count"] == 6, f"全部完成应为6，实际为 {final_stats['completed_count']}"
+        assert final_stats["avg_processing_seconds"] is not None, "全部完成后应有平均耗时"
+        print(f"[✓] 全部完成后统计正确")
+        print(f"    总笔数: {final_stats['total_count']}")
+        print(f"    已完成: {final_stats['completed_count']}")
+        print(f"    平均处理耗时: {final_stats['avg_processing_seconds']}秒")
+        print(f"    超时释放总次数: {final_stats['timeout_release_total_count']}")
+
+        print("\n" + "=" * 60)
+        print("所有测试通过! ✓")
+        print("=" * 60)
+
+    except AssertionError as e:
+        print(f"\n[✗] 测试失败: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        db.rollback()
+        raise
+    except Exception as e:
+        print(f"\n[✗] 发生异常: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    test_batch_queue_module()

@@ -1213,3 +1213,73 @@ class TemplatePreviewResponse(BaseModel):
     template_name: str
     lc_number: str
     documents: List[TemplateDocumentData]
+
+
+class SubmissionPriority(str, Enum):
+    URGENT = "urgent"
+    NORMAL = "normal"
+    LOW = "low"
+
+
+class QueueStatus(str, Enum):
+    WAITING = "waiting"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+
+
+class SubmissionQueueCreate(BaseModel):
+    submission_id: str
+    lc_number: str
+    priority: SubmissionPriority = SubmissionPriority.NORMAL
+    deadline: Optional[datetime] = None
+
+
+class SubmissionQueueResponse(BaseModel):
+    id: int
+    submission_id: str
+    lc_id: int
+    batch_number: str
+    priority: str
+    deadline: Optional[datetime] = None
+    queue_status: str
+    processing_started_at: Optional[datetime] = None
+    processing_completed_at: Optional[datetime] = None
+    timeout_release_count: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class SubmissionQueueDetailResponse(SubmissionQueueResponse):
+    lc_number: Optional[str] = None
+    audit_conclusion: Optional[str] = None
+
+
+class NextSubmissionResponse(BaseModel):
+    queue_entry: SubmissionQueueResponse
+    message: str
+
+
+class BatchQueryResponse(BaseModel):
+    batch_number: str
+    total_count: int
+    submissions: List[SubmissionQueueDetailResponse]
+
+
+class BatchStatsResponse(BaseModel):
+    batch_number: str
+    total_count: int
+    completed_count: int
+    avg_processing_seconds: Optional[float] = None
+    timeout_release_total_count: int
+
+
+class QueuePriorityCount(BaseModel):
+    priority: str
+    count: int
+
+
+class QueueStatusResponse(BaseModel):
+    total_waiting: int
+    by_priority: List[QueuePriorityCount]
