@@ -332,7 +332,7 @@ def seed_data():
         print(f"创建收费记录1: 费用编号 FEE-{lc1.lc_number}-...")
 
         submission2_id = "SUB-LC2-20240420-DISCREPANT"
-        presentation_date2 = date(2024, 4, 25)
+        presentation_date2 = date(2026, 7, 25)
 
         docs2 = [
             models.Document(
@@ -342,7 +342,7 @@ def seed_data():
                 original_copies_submitted=3, copy_copies_submitted=2,
                 content={
                     "invoice_number": "INV-2024-0420-007",
-                    "invoice_date": "2024-04-18",
+                    "invoice_date": "2026-07-18",
                     "beneficiary": "深圳电子科技有限公司 shenzhen electronics technology co., ltd.",
                     "applicant": "XYZ Electronics Distributor Inc.",
                     "currency": "EUR",
@@ -366,7 +366,7 @@ def seed_data():
                     "flight_number": "CA1234 / LH5678",
                     "port_of_loading": "SHENZHEN BAO'AN INTERNATIONAL AIRPORT",
                     "port_of_discharge": "FRANKFURT AM MAIN AIRPORT",
-                    "shipment_date": "2024-04-20",
+                    "shipment_date": "2026-07-20",
                     "packages": 7000,
                     "package_unit": "SETS",
                     "freight_term": "FREIGHT COLLECT",
@@ -513,10 +513,10 @@ def seed_data():
                     "applicant": "XYZ ELECTRONICS DISTRIBUTOR INC.",
                     "currency": "EUR",
                     "goods": [
-                        {"name": "WIRELESS BLUETOOTH EARPHONES", "specification": "MODEL X200", "quantity": 3500, "unit": "SETS", "unit_price": 5.00}
+                        {"name": "WIRELESS BLUETOOTH EARPHONES", "specification": "MODEL X200", "quantity": 7000, "unit": "SETS", "unit_price": 5.00}
                     ],
-                    "goods_description": "WIRELESS BLUETOOTH EARPHONES MODEL X200, 3500SETS AT EUR5.00 PER SET CFR FRANKFURT",
-                    "total_amount": 17500.00
+                    "goods_description": "WIRELESS BLUETOOTH EARPHONES MODEL X200, 7000SETS AT EUR5.00 PER SET CFR FRANKFURT",
+                    "total_amount": 35000.00
                 }
             ),
             models.Document(
@@ -533,7 +533,7 @@ def seed_data():
                     "port_of_loading": "SHENZHEN BAO'AN INTERNATIONAL AIRPORT",
                     "port_of_discharge": "FRANKFURT AM MAIN AIRPORT",
                     "shipment_date": "2026-06-10",
-                    "packages": 3500,
+                    "packages": 7000,
                     "package_unit": "SETS",
                     "freight_term": "FREIGHT COLLECT",
                     "clean": True,
@@ -582,7 +582,7 @@ def seed_data():
                     "inspection_date": "2026-06-08",
                     "result": "PASSED",
                     "goods_description": "WIRELESS BLUETOOTH EARPHONES MODEL X200",
-                    "quantity": 3500
+                    "quantity": 7000
                 }
             ),
         ]
@@ -625,7 +625,7 @@ def seed_data():
             lc_id=lc2.id,
             submission_id=submission3_id,
             audit_record_id=audit3.id,
-            payment_amount=17500.00,
+            payment_amount=35000.00,
             currency=lc2.currency,
             payment_method=PAYMENT_METHOD_USANCE,
             maturity_date=maturity_date2,
