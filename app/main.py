@@ -1176,10 +1176,10 @@ def create_app() -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"获取下一笔交单失败: {str(e)}")
 
-    @app.post("/api/queue/{submission_id}/complete", response_model=schemas.SubmissionQueueResponse, tags=["交单批次与优先级调度"])
-    async def complete_queue_submission(submission_id: str, db: Session = Depends(get_db)):
+    @app.post("/api/queue/entry/{queue_entry_id}/complete", response_model=schemas.SubmissionQueueResponse, tags=["交单批次与优先级调度"])
+    async def complete_queue_submission(queue_entry_id: int, db: Session = Depends(get_db)):
         try:
-            entry = crud.complete_submission_in_queue(db, submission_id)
+            entry = crud.complete_submission_in_queue(db, queue_entry_id)
             return entry
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))

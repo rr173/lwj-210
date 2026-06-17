@@ -20,16 +20,31 @@ from app.models import (
 
 
 def _create_submission_queue_table():
-    from sqlalchemy import text
-    from sqlalchemy.exc import OperationalError
+    from sqlalchemy import text, inspect
+    from sqlalchemy.exc import OperationalError, ProgrammingError
     db = SessionLocal()
     try:
+        created = False
         try:
             db.execute(text("SELECT 1 FROM submission_queue LIMIT 1"))
         except OperationalError:
             conn = db.connection()
             models.SubmissionQueue.__table__.create(bind=conn)
             db.commit()
+            created = True
+        if not created:
+            insp = inspect(engine)
+            cols = [c["name"] for c in insp.get_columns("submission_queue")]
+            if "original_submission_id" not in cols:
+                db.execute(text(
+                    "ALTER TABLE submission_queue ADD COLUMN original_submission_id VARCHAR(100) NOT NULL DEFAULT ''"
+                ))
+                db.execute(text(
+                    "CREATE INDEX IF NOT EXISTS ix_submission_queue_original_submission_id ON submission_queue (original_submission_id)"
+                ))
+                db.commit()
+    except (ProgrammingError, OperationalError):
+        db.rollback()
     except Exception:
         db.rollback()
     finally:

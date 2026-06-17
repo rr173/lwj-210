@@ -780,7 +780,8 @@ PRIORITY_ORDER = {PRIORITY_URGENT: 0, PRIORITY_NORMAL: 1, PRIORITY_LOW: 2}
 QUEUE_STATUS_WAITING = "waiting"
 QUEUE_STATUS_PROCESSING = "processing"
 QUEUE_STATUS_COMPLETED = "completed"
-VALID_QUEUE_STATUSES = [QUEUE_STATUS_WAITING, QUEUE_STATUS_PROCESSING, QUEUE_STATUS_COMPLETED]
+QUEUE_STATUS_OBSOLETE = "obsolete"
+VALID_QUEUE_STATUSES = [QUEUE_STATUS_WAITING, QUEUE_STATUS_PROCESSING, QUEUE_STATUS_COMPLETED, QUEUE_STATUS_OBSOLETE]
 
 QUEUE_TIMEOUT_HOURS = 2
 
@@ -790,6 +791,7 @@ class SubmissionQueue(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     submission_id = Column(String(100), index=True, nullable=False)
+    original_submission_id = Column(String(100), index=True, nullable=False, default="")
     lc_id = Column(Integer, ForeignKey("letter_of_credits.id"), nullable=False)
     batch_number = Column(String(50), index=True, nullable=False)
     priority = Column(String(20), default=PRIORITY_NORMAL, nullable=False)

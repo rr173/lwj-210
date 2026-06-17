@@ -4538,6 +4538,15 @@ def enqueue_submission(db: Session, queue_data: schemas.SubmissionQueueCreate) -
     if not lc:
         raise ValueError(f"信用证 {queue_data.lc_number} 不存在")
 
+    audit_record = get_audit_record_by_submission(db, queue_data.submission_id)
+    if not audit_record:
+        raise ValueError(f"交单 {queue_data.submission_id} 不存在（未找到对应的审核记录）")
+
+    if audit_record.lc_id != lc.id:
+        raise ValueError(
+            f"交单 {queue_data.submission_id} 所属信用证为 {audit_record.lc_id}，与入队指定的 {queue_data.lc_number} 不匹配"
+        )
+
     existing = db.query(models.SubmissionQueue).filter(
         models.SubmissionQueue.submission_id == queue_data.submission_id
     ).first()
@@ -4548,10 +4557,24 @@ def enqueue_submission(db: Session, queue_data: schemas.SubmissionQueueCreate) -
     if priority not in models.VALID_PRIORITIES:
         raise ValueError(f"无效的优先级: {priority}，允许值: {', '.join(models.VALID_PRIORITIES)}")
 
+    original_submission_id = audit_record.original_submission_id
+
+    old_entries = db.query(models.SubmissionQueue).filter(
+        models.SubmissionQueue.original_submission_id == original_submission_id,
+        models.SubmissionQueue.submission_id != queue_data.submission_id,
+        models.SubmissionQueue.queue_status.in_([
+            models.QUEUE_STATUS_WAITING,
+            models.QUEUE_STATUS_PROCESSING,
+        ])
+    ).all()
+    for old_entry in old_entries:
+        old_entry.queue_status = models.QUEUE_STATUS_OBSOLETE
+
     batch_number = _generate_batch_number()
 
     entry = models.SubmissionQueue(
         submission_id=queue_data.submission_id,
+        original_submission_id=original_submission_id,
         lc_id=lc.id,
         batch_number=batch_number,
         priority=priority,
@@ -4596,15 +4619,23 @@ def get_next_submission(db: Session) -> Optional[models.SubmissionQueue]:
     return entry
 
 
-def complete_submission_in_queue(db: Session, submission_id: str) -> models.SubmissionQueue:
+def complete_submission_in_queue(db: Session, queue_entry_id: int) -> models.SubmissionQueue:
     entry = db.query(models.SubmissionQueue).filter(
-        models.SubmissionQueue.submission_id == submission_id
+        models.SubmissionQueue.id == queue_entry_id
     ).first()
     if not entry:
-        raise ValueError(f"交单 {submission_id} 不在队列中")
+        raise ValueError(f"队列条目 {queue_entry_id} 不存在")
+
+    if entry.queue_status == models.QUEUE_STATUS_OBSOLETE:
+        raise ValueError(f"队列条目 {queue_entry_id} 已被标记为废弃（该交单已有新的修改重提版本入队）")
+
+    if entry.queue_status == models.QUEUE_STATUS_COMPLETED:
+        raise ValueError(f"队列条目 {queue_entry_id} 已经是完成状态")
 
     if entry.queue_status != models.QUEUE_STATUS_PROCESSING:
-        raise ValueError(f"交单 {submission_id} 当前状态为 {entry.queue_status}，只有 processing 状态的交单可以完成")
+        raise ValueError(
+            f"队列条目 {queue_entry_id} 当前状态为 {entry.queue_status}，只有 processing 状态的交单可以完成"
+        )
 
     entry.queue_status = models.QUEUE_STATUS_COMPLETED
     entry.processing_completed_at = datetime.utcnow()
@@ -4648,6 +4679,7 @@ def get_batch_submissions(db: Session, batch_number: str) -> Dict[str, Any]:
         result_entries.append({
             "id": entry.id,
             "submission_id": entry.submission_id,
+            "original_submission_id": entry.original_submission_id,
             "lc_id": entry.lc_id,
             "batch_number": entry.batch_number,
             "priority": entry.priority,
@@ -4669,6 +4701,8 @@ def get_batch_submissions(db: Session, batch_number: str) -> Dict[str, Any]:
 
 
 def get_batch_stats(db: Session, batch_number: str) -> Dict[str, Any]:
+    release_timeout_submissions(db)
+
     entries = db.query(models.SubmissionQueue).filter(
         models.SubmissionQueue.batch_number == batch_number
     ).all()
@@ -4708,7 +4742,7 @@ def get_batch_stats(db: Session, batch_number: str) -> Dict[str, Any]:
 
 
 def get_queue_status(db: Session) -> Dict[str, Any]:
-    from sqlalchemy import func
+    release_timeout_submissions(db)
 
     waiting_entries = db.query(models.SubmissionQueue).filter(
         models.SubmissionQueue.queue_status == models.QUEUE_STATUS_WAITING

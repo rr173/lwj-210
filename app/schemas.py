@@ -1225,6 +1225,7 @@ class QueueStatus(str, Enum):
     WAITING = "waiting"
     PROCESSING = "processing"
     COMPLETED = "completed"
+    OBSOLETE = "obsolete"
 
 
 class SubmissionQueueCreate(BaseModel):
@@ -1237,6 +1238,7 @@ class SubmissionQueueCreate(BaseModel):
 class SubmissionQueueResponse(BaseModel):
     id: int
     submission_id: str
+    original_submission_id: str
     lc_id: int
     batch_number: str
     priority: str
