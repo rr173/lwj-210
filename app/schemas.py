@@ -1162,3 +1162,54 @@ class CreditLineQueryResponse(BaseModel):
     used_amount: float
     available_amount: float
     occupancy_details: List[LcOccupancyDetail]
+
+
+class TemplateCreateRequest(BaseModel):
+    submission_id: str
+    template_name: str
+
+
+class TemplateDocumentData(BaseModel):
+    document_type: str
+    original_copies_submitted: int = 0
+    copy_copies_submitted: int = 0
+    content: Dict[str, Any]
+
+
+class TemplateResponse(BaseModel):
+    id: int
+    template_number: str
+    template_name: str
+    lc_id: int
+    lc_number: str
+    based_on_submission_id: str
+    documents: List[TemplateDocumentData]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class TemplateFieldOverride(BaseModel):
+    document_type: str
+    content_overrides: Optional[Dict[str, Any]] = None
+    original_copies_submitted: Optional[int] = None
+    copy_copies_submitted: Optional[int] = None
+
+
+class TemplateUseRequest(BaseModel):
+    lc_number: str
+    submission_id: str
+    presentation_date: date
+    field_overrides: List[TemplateFieldOverride] = []
+
+
+class TemplatePreviewRequest(BaseModel):
+    field_overrides: List[TemplateFieldOverride] = []
+
+
+class TemplatePreviewResponse(BaseModel):
+    template_number: str
+    template_name: str
+    lc_number: str
+    documents: List[TemplateDocumentData]

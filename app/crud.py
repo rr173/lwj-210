@@ -4337,3 +4337,193 @@ def get_credit_line_transactions(
     ).order_by(
         models.CreditLineTransaction.created_at.desc()
     ).offset(skip).limit(limit).all()
+
+
+def get_next_template_sequence(db: Session, lc_id: int) -> int:
+    from sqlalchemy import func
+    max_seq = db.query(func.max(models.DocumentTemplate.id)).filter(
+        models.DocumentTemplate.lc_id == lc_id
+    ).scalar()
+    count = db.query(func.count(models.DocumentTemplate.id)).filter(
+        models.DocumentTemplate.lc_id == lc_id
+    ).scalar()
+    return (count or 0) + 1
+
+
+def create_template_from_submission(
+    db: Session,
+    submission_id: str,
+    template_name: str,
+) -> models.DocumentTemplate:
+    audit_record = get_audit_record_by_submission(db, submission_id)
+    if not audit_record:
+        raise ValueError(f"交单记录 {submission_id} 不存在")
+
+    if audit_record.conclusion not in ["compliant", "minor_discrepancy"]:
+        raise ValueError(
+            f"只有结论为 compliant 或 minor_discrepancy 的交单才能保存为模板，"
+            f"当前交单结论为 {audit_record.conclusion}"
+        )
+
+    lc = get_letter_of_credit_by_id(db, audit_record.lc_id)
+    if not lc:
+        raise ValueError("关联信用证不存在")
+
+    current_count = db.query(models.DocumentTemplate).filter(
+        models.DocumentTemplate.lc_id == lc.id
+    ).count()
+
+    if current_count >= models.MAX_TEMPLATES_PER_LC:
+        raise ValueError(
+            f"同一份信用证最多保存 {models.MAX_TEMPLATES_PER_LC} 个模板，"
+            f"当前已有 {current_count} 个模板"
+        )
+
+    documents = get_documents_by_submission(db, submission_id)
+    if not documents:
+        raise ValueError(f"交单 {submission_id} 没有找到单据")
+
+    doc_snapshots = []
+    for doc in documents:
+        doc_snapshots.append({
+            "document_type": doc.document_type,
+            "original_copies_submitted": doc.original_copies_submitted,
+            "copy_copies_submitted": doc.copy_copies_submitted,
+            "content": copy.deepcopy(doc.content),
+        })
+
+    sequence = get_next_template_sequence(db, lc.id)
+    template_number = f"{lc.lc_number}-TPL-{sequence:03d}"
+
+    template = models.DocumentTemplate(
+        template_number=template_number,
+        template_name=template_name,
+        lc_id=lc.id,
+        lc_number=lc.lc_number,
+        based_on_submission_id=submission_id,
+        documents=doc_snapshots,
+    )
+
+    db.add(template)
+    db.commit()
+    db.refresh(template)
+    return template
+
+
+def get_template_by_number(db: Session, template_number: str) -> Optional[models.DocumentTemplate]:
+    return db.query(models.DocumentTemplate).filter(
+        models.DocumentTemplate.template_number == template_number
+    ).first()
+
+
+def get_templates_by_lc(db: Session, lc_number: str) -> List[models.DocumentTemplate]:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        raise ValueError(f"信用证 {lc_number} 不存在")
+    return db.query(models.DocumentTemplate).filter(
+        models.DocumentTemplate.lc_id == lc.id
+    ).order_by(models.DocumentTemplate.created_at.desc()).all()
+
+
+def delete_template(db: Session, template_number: str) -> bool:
+    template = get_template_by_number(db, template_number)
+    if not template:
+        raise ValueError(f"模板 {template_number} 不存在")
+    db.delete(template)
+    db.commit()
+    return True
+
+
+def _deep_merge_dict(base: dict, overrides: dict) -> dict:
+    result = copy.deepcopy(base)
+    for key, value in overrides.items():
+        if isinstance(value, dict) and key in result and isinstance(result[key], dict):
+            result[key] = _deep_merge_dict(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def _apply_overrides_to_documents(
+    template_docs: List[dict],
+    field_overrides: List[schemas.TemplateFieldOverride],
+) -> List[dict]:
+    result_docs = copy.deepcopy(template_docs)
+
+    override_map = {}
+    for override in field_overrides:
+        override_map[override.document_type] = override
+
+    for doc in result_docs:
+        doc_type = doc["document_type"]
+        if doc_type in override_map:
+            override = override_map[doc_type]
+            if override.content_overrides:
+                doc["content"] = _deep_merge_dict(doc["content"], override.content_overrides)
+            if override.original_copies_submitted is not None:
+                doc["original_copies_submitted"] = override.original_copies_submitted
+            if override.copy_copies_submitted is not None:
+                doc["copy_copies_submitted"] = override.copy_copies_submitted
+
+    return result_docs
+
+
+def preview_template(
+    db: Session,
+    template_number: str,
+    field_overrides: List[schemas.TemplateFieldOverride],
+) -> Dict[str, Any]:
+    template = get_template_by_number(db, template_number)
+    if not template:
+        raise ValueError(f"模板 {template_number} 不存在")
+
+    merged_docs = _apply_overrides_to_documents(template.documents, field_overrides)
+
+    return {
+        "template_number": template.template_number,
+        "template_name": template.template_name,
+        "lc_number": template.lc_number,
+        "documents": merged_docs,
+    }
+
+
+def create_submission_from_template(
+    db: Session,
+    template_number: str,
+    use_request: schemas.TemplateUseRequest,
+) -> models.AuditRecord:
+    template = get_template_by_number(db, template_number)
+    if not template:
+        raise ValueError(f"模板 {template_number} 不存在")
+
+    lc = get_letter_of_credit_by_number(db, use_request.lc_number)
+    if not lc:
+        raise ValueError(f"信用证 {use_request.lc_number} 不存在")
+
+    if lc.id != template.lc_id:
+        raise ValueError(
+            f"模板 {template_number} 属于信用证 {template.lc_number}，"
+            f"不能用于信用证 {use_request.lc_number}"
+        )
+
+    merged_docs = _apply_overrides_to_documents(template.documents, use_request.field_overrides)
+
+    documents_submit = []
+    for doc_data in merged_docs:
+        documents_submit.append(schemas.DocumentSubmit(
+            lc_number=use_request.lc_number,
+            submission_id=use_request.submission_id,
+            document_type=doc_data["document_type"],
+            original_copies_submitted=doc_data["original_copies_submitted"],
+            copy_copies_submitted=doc_data["copy_copies_submitted"],
+            content=doc_data["content"],
+        ))
+
+    submission = schemas.SubmissionSubmit(
+        lc_number=use_request.lc_number,
+        submission_id=use_request.submission_id,
+        presentation_date=use_request.presentation_date,
+        documents=documents_submit,
+    )
+
+    return submit_documents_and_audit(db, submission)

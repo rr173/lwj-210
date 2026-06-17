@@ -142,6 +142,7 @@ class LetterOfCredit(Base):
     alerts = relationship("LCAlert", back_populates="lc", cascade="all, delete-orphan", order_by="LCAlert.created_at.desc()")
     freeze_records = relationship("LCFreezeRecord", back_populates="lc", cascade="all, delete-orphan", order_by="LCFreezeRecord.created_at.desc()")
     payments = relationship("Payment", back_populates="lc", cascade="all, delete-orphan", order_by="Payment.created_at.desc()")
+    templates = relationship("DocumentTemplate", back_populates="lc", cascade="all, delete-orphan", order_by="DocumentTemplate.created_at.desc()")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -768,3 +769,21 @@ class CreditLineTransaction(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     credit_line = relationship("CreditLine", back_populates="transactions")
+
+
+MAX_TEMPLATES_PER_LC = 5
+
+
+class DocumentTemplate(Base):
+    __tablename__ = "document_templates"
+
+    id = Column(Integer, primary_key=True, index=True)
+    template_number = Column(String(150), unique=True, index=True, nullable=False)
+    template_name = Column(String(255), nullable=False)
+    lc_id = Column(Integer, ForeignKey("letter_of_credits.id"), nullable=False)
+    lc_number = Column(String(100), index=True, nullable=False)
+    based_on_submission_id = Column(String(100), nullable=False)
+    documents = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    lc = relationship("LetterOfCredit", back_populates="templates")

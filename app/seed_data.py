@@ -26,6 +26,7 @@ def init_db():
     _create_payment_tables()
     _migrate_overdue_penalty_columns()
     _create_collection_table()
+    _create_template_table()
 
 
 def _migrate_rule_version_columns():
@@ -120,6 +121,23 @@ def _create_collection_table():
         except OperationalError:
             conn = db.connection()
             models.CollectionRecord.__table__.create(bind=conn)
+            db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _create_template_table():
+    from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+    db = SessionLocal()
+    try:
+        try:
+            db.execute(text("SELECT 1 FROM document_templates LIMIT 1"))
+        except OperationalError:
+            conn = db.connection()
+            models.DocumentTemplate.__table__.create(bind=conn)
             db.commit()
     except Exception:
         db.rollback()

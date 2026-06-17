@@ -1090,6 +1090,72 @@ def create_app() -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"查询额度流水失败: {str(e)}")
 
+    @app.post("/api/templates", response_model=schemas.TemplateResponse, tags=["单据模板管理"], status_code=status.HTTP_201_CREATED)
+    async def create_template(template_req: schemas.TemplateCreateRequest, db: Session = Depends(get_db)):
+        try:
+            template = crud.create_template_from_submission(
+                db, template_req.submission_id, template_req.template_name
+            )
+            return template
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"创建模板失败: {str(e)}")
+
+    @app.get("/api/templates/{template_number}", response_model=schemas.TemplateResponse, tags=["单据模板管理"])
+    async def get_template(template_number: str, db: Session = Depends(get_db)):
+        template = crud.get_template_by_number(db, template_number)
+        if not template:
+            raise HTTPException(status_code=404, detail=f"模板 {template_number} 不存在")
+        return template
+
+    @app.get("/api/lc/{lc_number}/templates", response_model=List[schemas.TemplateResponse], tags=["单据模板管理"])
+    async def get_lc_templates(lc_number: str, db: Session = Depends(get_db)):
+        try:
+            return crud.get_templates_by_lc(db, lc_number)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询模板列表失败: {str(e)}")
+
+    @app.delete("/api/templates/{template_number}", tags=["单据模板管理"])
+    async def delete_template(template_number: str, db: Session = Depends(get_db)):
+        try:
+            crud.delete_template(db, template_number)
+            return {"message": f"模板 {template_number} 已删除"}
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"删除模板失败: {str(e)}")
+
+    @app.post("/api/templates/{template_number}/preview", response_model=schemas.TemplatePreviewResponse, tags=["单据模板管理"])
+    async def preview_template_with_overrides(
+        template_number: str,
+        preview_req: schemas.TemplatePreviewRequest,
+        db: Session = Depends(get_db)
+    ):
+        try:
+            result = crud.preview_template(db, template_number, preview_req.field_overrides)
+            return result
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"模板预览失败: {str(e)}")
+
+    @app.post("/api/templates/{template_number}/use", response_model=schemas.AuditRecordResponse, tags=["单据模板管理"], status_code=status.HTTP_201_CREATED)
+    async def use_template_to_submit(
+        template_number: str,
+        use_req: schemas.TemplateUseRequest,
+        db: Session = Depends(get_db)
+    ):
+        try:
+            audit_record = crud.create_submission_from_template(db, template_number, use_req)
+            return audit_record
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"使用模板提交失败: {str(e)}")
+
     return app
 
 
