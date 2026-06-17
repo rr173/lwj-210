@@ -3613,11 +3613,8 @@ def settle_payment(
     check_and_update_matured_payments(db, payment.lc_id)
     db.refresh(payment)
 
-    if payment.status not in [models.PAYMENT_STATUS_MATURED, models.PAYMENT_STATUS_PENDING]:
-        raise ValueError(f"只有到期(matured)或即期待到期(pending)的付款可以结算，当前状态: {payment.status}")
-
-    if payment.status == models.PAYMENT_STATUS_PENDING and payment.payment_method != models.PAYMENT_METHOD_SIGHT:
-        raise ValueError(f"非即期付款需要先承兑或到期后才能付款，当前状态: {payment.status}")
+    if payment.status != models.PAYMENT_STATUS_MATURED:
+        raise ValueError(f"只有到期(matured)的付款可以结算，当前状态: {payment.status}。请等待付款到期后再操作。")
 
     if amount is None:
         amount = payment.payment_amount - payment.total_paid_amount

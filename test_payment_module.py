@@ -201,6 +201,55 @@ def test_payment_module():
             print(f"[✓] 正确拒绝即期付款的承兑操作: {str(e)}")
 
         print("\n" + "-" * 40)
+        print("测试9.5: 未到期付款不能结算")
+        print("-" * 40)
+
+        assert payment2.status == PAYMENT_STATUS_ACCEPTED
+        assert payment2.maturity_date > date.today(), f"远期付款到期日 {payment2.maturity_date} 应在未来"
+        try:
+            crud.settle_payment(
+                db,
+                payment2.payment_number,
+                payment_date=date.today(),
+                settled_by="cashier_test",
+            )
+            print("[✗] 未到期的远期付款不应能结算")
+            assert False
+        except ValueError as e:
+            print(f"[✓] 正确拒绝未到期远期付款的结算操作: {str(e)}")
+
+        test_sight_pending_number = f"PAY-TEST-SIGHT-PENDING-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        test_sight_pending = models.Payment(
+            payment_number=test_sight_pending_number,
+            lc_id=lc1.id,
+            submission_id="SUB-TEST-SIGHT-PENDING-001",
+            audit_record_id=0,
+            payment_amount=5000.00,
+            currency=lc1.currency,
+            payment_method=PAYMENT_METHOD_SIGHT,
+            maturity_date=date.today() + timedelta(days=30),
+            status=PAYMENT_STATUS_PENDING,
+            total_paid_amount=0.0,
+            created_at=datetime.now(),
+        )
+        db.add(test_sight_pending)
+        db.flush()
+        db.refresh(test_sight_pending)
+        print(f"    创建了测试用即期待到期付款，到期日: {test_sight_pending.maturity_date}")
+
+        try:
+            crud.settle_payment(
+                db,
+                test_sight_pending_number,
+                payment_date=date.today(),
+                settled_by="cashier_test",
+            )
+            print("[✗] 未到期的即期付款不应能结算")
+            assert False
+        except ValueError as e:
+            print(f"[✓] 正确拒绝未到期即期付款的结算操作: {str(e)}")
+
+        print("\n" + "-" * 40)
         print("测试10: 拒付功能")
         print("-" * 40)
 
@@ -257,7 +306,7 @@ def test_payment_module():
         stats = crud.get_payment_stats_by_time_range(
             db,
             start_date=date(2024, 1, 1),
-            end_date=date(2024, 12, 31),
+            end_date=date(2027, 12, 31),
         )
         assert stats["total_count"] >= 2, f"总付款笔数应至少为2，实际为 {stats['total_count']}"
         assert len(stats["by_currency"]) >= 2, f"应至少有2种币种，实际为 {len(stats['by_currency'])}"

@@ -133,9 +133,9 @@ def seed_data():
             applicant_name="XYZ ELECTRONICS DISTRIBUTOR INC.",
             currency=schemas.Currency.EUR,
             amount=35000.00,
-            latest_shipment_date=date(2024, 4, 15),
-            latest_presentation_date=date(2024, 5, 5),
-            expiry_date=date(2024, 5, 15),
+            latest_shipment_date=date(2026, 7, 15),
+            latest_presentation_date=date(2026, 8, 5),
+            expiry_date=date(2026, 8, 15),
             transport_mode=schemas.TransportMode.AIR,
             port_of_loading="SHENZHEN BAO'AN INTERNATIONAL AIRPORT",
             port_of_discharge="FRANKFURT AM MAIN AIRPORT",
@@ -451,7 +451,7 @@ def seed_data():
         print(f"    到期日: {maturity_date1}")
 
         submission3_id = "SUB-LC2-20240418-COMPLIANT"
-        presentation_date3 = date(2024, 4, 18)
+        presentation_date3 = date(2026, 6, 12)
 
         docs3 = [
             models.Document(
@@ -460,8 +460,8 @@ def seed_data():
                 document_type="invoice",
                 original_copies_submitted=3, copy_copies_submitted=2,
                 content={
-                    "invoice_number": "INV-2024-0418-001",
-                    "invoice_date": "2024-04-15",
+                    "invoice_number": "INV-2026-0610-001",
+                    "invoice_date": "2026-06-10",
                     "beneficiary": "深圳电子科技有限公司 SHENZHEN ELECTRONICS TECHNOLOGY CO., LTD.",
                     "applicant": "XYZ ELECTRONICS DISTRIBUTOR INC.",
                     "currency": "EUR",
@@ -478,14 +478,14 @@ def seed_data():
                 document_type="bill_of_lading",
                 original_copies_submitted=1, copy_copies_submitted=2,
                 content={
-                    "bl_number": "CAW-2024-0418-6677",
+                    "bl_number": "CAW-2026-0610-6677",
                     "shipper": "深圳电子科技有限公司 SHENZHEN ELECTRONICS TECHNOLOGY CO., LTD.",
                     "consignee": "TO ORDER",
                     "notify_party": "XYZ ELECTRONICS DISTRIBUTOR INC. FRANKFURT, GERMANY",
                     "flight_number": "CA1234 / LH5678",
                     "port_of_loading": "SHENZHEN BAO'AN INTERNATIONAL AIRPORT",
                     "port_of_discharge": "FRANKFURT AM MAIN AIRPORT",
-                    "shipment_date": "2024-04-18",
+                    "shipment_date": "2026-06-10",
                     "packages": 3500,
                     "package_unit": "SETS",
                     "freight_term": "FREIGHT COLLECT",
@@ -500,8 +500,8 @@ def seed_data():
                 document_type="packing_list",
                 original_copies_submitted=2, copy_copies_submitted=2,
                 content={
-                    "packing_number": "PL-2024-0418-001",
-                    "date": "2024-04-15",
+                    "packing_number": "PL-2026-0610-001",
+                    "date": "2026-06-08",
                     "total_packages": 175,
                     "package_type": "CTNS",
                     "gross_weight": 525.00,
@@ -515,8 +515,8 @@ def seed_data():
                 document_type="origin_cert",
                 original_copies_submitted=1, copy_copies_submitted=1,
                 content={
-                    "cert_number": "CCO-2024-0417-022",
-                    "issue_date": "2024-04-17",
+                    "cert_number": "CCO-2026-0609-022",
+                    "issue_date": "2026-06-09",
                     "issuing_authority": "CCPIT SHENZHEN",
                     "origin_country": "CHINA",
                     "goods_description": "WIRELESS EARPHONES",
@@ -529,10 +529,10 @@ def seed_data():
                 document_type="inspection_cert",
                 original_copies_submitted=1, copy_copies_submitted=1,
                 content={
-                    "cert_number": "SGS-2024-0417-066",
-                    "issue_date": "2024-04-17",
+                    "cert_number": "SGS-2026-0609-066",
+                    "issue_date": "2026-06-09",
                     "issuing_authority": "SGS SHENZHEN",
-                    "inspection_date": "2024-04-16",
+                    "inspection_date": "2026-06-08",
                     "result": "PASSED",
                     "goods_description": "WIRELESS BLUETOOTH EARPHONES MODEL X200",
                     "quantity": 3500
@@ -571,7 +571,7 @@ def seed_data():
         print(f"创建收费记录3: 费用编号 FEE-{lc2.lc_number}-...")
 
         payment2_number = f"PAY-{lc2.lc_number}-20240418-0001"
-        shipment_date3 = date(2024, 4, 18)
+        shipment_date3 = date(2026, 6, 10)
         maturity_date2 = crud.add_business_days(shipment_date3, 90)
         payment2 = models.Payment(
             payment_number=payment2_number,
@@ -583,9 +583,9 @@ def seed_data():
             payment_method=PAYMENT_METHOD_USANCE,
             maturity_date=maturity_date2,
             status=PAYMENT_STATUS_ACCEPTED,
-            accepted_at=datetime(2024, 4, 20, 14, 30, 0),
+            accepted_at=datetime(2026, 6, 14, 14, 30, 0),
             total_paid_amount=0.0,
-            created_at=datetime(2024, 4, 18, 10, 0, 0),
+            created_at=datetime(2026, 6, 12, 10, 0, 0),
         )
         db.add(payment2)
         db.flush()
@@ -595,7 +595,7 @@ def seed_data():
             from_status=None,
             to_status=PAYMENT_STATUS_PENDING,
             changed_by="system",
-            changed_at=datetime(2024, 4, 18, 10, 0, 0),
+            changed_at=datetime(2026, 6, 12, 10, 0, 0),
             remark="付款申请创建",
         )
         db.add(history2_1)
@@ -605,7 +605,7 @@ def seed_data():
             from_status=PAYMENT_STATUS_PENDING,
             to_status=PAYMENT_STATUS_ACCEPTED,
             changed_by="bank_officer",
-            changed_at=datetime(2024, 4, 20, 14, 30, 0),
+            changed_at=datetime(2026, 6, 14, 14, 30, 0),
             remark="银行承兑",
         )
         db.add(history2_2)
