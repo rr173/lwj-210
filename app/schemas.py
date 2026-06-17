@@ -1061,6 +1061,9 @@ class CollectionRecordResponse(BaseModel):
         from_attributes = True
 
 
+PaymentDetailResponse.model_rebuild()
+
+
 class PenaltyInterestResponse(BaseModel):
     payment_number: str
     payment_amount: float
