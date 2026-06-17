@@ -68,12 +68,17 @@ def create_letter_of_credit(db: Session, lc_data: schemas.LetterOfCreditCreate) 
     if penalty_rate < 0:
         raise ValueError("罚息利率不能为负数")
 
+    currency_value = lc_data.currency.value if hasattr(lc_data.currency, 'value') else lc_data.currency
+    check_and_occupy_credit_line(
+        db, lc_data.applicant_name, currency_value, lc_data.amount, lc_data.lc_number
+    )
+
     db_lc = models.LetterOfCredit(
         lc_number=lc_data.lc_number,
         issuing_bank=lc_data.issuing_bank,
         beneficiary_name=lc_data.beneficiary_name,
         applicant_name=lc_data.applicant_name,
-        currency=lc_data.currency.value,
+        currency=currency_value,
         amount=lc_data.amount,
         latest_shipment_date=lc_data.latest_shipment_date,
         latest_presentation_date=lc_data.latest_presentation_date,
@@ -105,6 +110,7 @@ def create_letter_of_credit(db: Session, lc_data: schemas.LetterOfCreditCreate) 
         db.add(db_req)
 
     db.flush()
+
     associate_lc_parties(db, db_lc)
     dispatch_notifications(db, db_lc, models.EVENT_TYPE_LC_CREATED)
 
@@ -1022,7 +1028,41 @@ def accept_amendment(db: Session, amendment_number: str) -> models.LCAmendment:
     if not lc:
         raise ValueError("关联信用证不存在")
 
+    old_amount = lc.amount
+    new_amount = None
+    amount_changed = False
+    for change in amendment.field_changes:
+        if change.get("field_name") == "amount":
+            amount_changed = True
+            new_amount = change.get("new_value")
+            break
+
+    if amount_changed and new_amount is not None and new_amount > old_amount:
+        credit_line = get_credit_line_by_applicant_and_currency(
+            db, lc.applicant_name, lc.currency
+        )
+        if credit_line:
+            today = date.today()
+            if lc.expiry_date >= today:
+                used_info = calculate_used_amount(db, lc.applicant_name, lc.currency)
+                current_used = used_info["used_amount"]
+                available_before = credit_line.total_amount - current_used
+                increase_amount = new_amount - old_amount
+                if increase_amount > available_before + 0.01:
+                    raise ValueError(
+                        f"授信额度不足，无法增加信用证金额。申请人: {lc.applicant_name}, "
+                        f"币种: {lc.currency}, 可用额度: {round(available_before, 2)}, "
+                        f"需增加金额: {round(increase_amount, 2)}"
+                    )
+
     apply_amendment_to_lc(db, lc, amendment.field_changes)
+
+    db.flush()
+
+    if amount_changed and new_amount is not None:
+        adjust_credit_line_for_amendment(
+            db, lc, old_amount, new_amount, amendment.amendment_number
+        )
 
     check_back_to_back_conflicts(db, amendment.lc_id, amendment.field_changes)
 
@@ -2690,12 +2730,17 @@ def _create_lc_from_swift_mt700(
             f"完整缺失字段列表: {', '.join(missing_fields)}"
         )
 
+    currency = lc_data.get("currency", "USD")
+    check_and_occupy_credit_line(
+        db, lc_data["applicant_name"], currency, lc_data["amount"], lc_data["lc_number"]
+    )
+
     lc = models.LetterOfCredit(
         lc_number=lc_data["lc_number"],
         issuing_bank=lc_data.get("issuing_bank", ""),
         beneficiary_name=lc_data["beneficiary_name"],
         applicant_name=lc_data["applicant_name"],
-        currency=lc_data.get("currency", "USD"),
+        currency=currency,
         amount=lc_data["amount"],
         latest_shipment_date=lc_data["latest_shipment_date"],
         latest_presentation_date=lc_data["latest_presentation_date"],
@@ -4054,3 +4099,241 @@ def get_lc_payment_summary(db: Session, lc_number: str) -> Dict[str, Any]:
 def get_all_payments(db: Session, skip: int = 0, limit: int = 100) -> List[models.Payment]:
     check_and_update_overdue_payments(db, None)
     return db.query(models.Payment).order_by(models.Payment.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def generate_credit_line_transaction_number(db: Session, applicant_name: str, currency: str) -> str:
+    from sqlalchemy import func
+    date_str = datetime.utcnow().strftime("%Y%m%d")
+    prefix = f"CLT-{applicant_name[:20]}-{currency}-{date_str}-"
+    count = db.query(func.count(models.CreditLineTransaction.id)).filter(
+        models.CreditLineTransaction.transaction_number.like(f"{prefix}%")
+    ).scalar() or 0
+    return f"{prefix}{count + 1:04d}"
+
+
+def create_credit_line(db: Session, credit_line_data: schemas.CreditLineCreate) -> models.CreditLine:
+    currency_value = credit_line_data.currency.value if hasattr(credit_line_data.currency, 'value') else credit_line_data.currency
+
+    if credit_line_data.total_amount <= 0:
+        raise ValueError("授信总额度必须大于0")
+
+    existing = db.query(models.CreditLine).filter(
+        models.CreditLine.applicant_name == credit_line_data.applicant_name,
+        models.CreditLine.currency == currency_value
+    ).first()
+    if existing:
+        raise ValueError(
+            f"申请人 {credit_line_data.applicant_name} 在 {currency_value} 币种下已有授信额度记录，"
+            f"总额度为 {existing.total_amount}"
+        )
+
+    credit_line = models.CreditLine(
+        applicant_name=credit_line_data.applicant_name,
+        currency=currency_value,
+        total_amount=credit_line_data.total_amount,
+    )
+    db.add(credit_line)
+    db.commit()
+    db.refresh(credit_line)
+    return credit_line
+
+
+def get_credit_line_by_id(db: Session, credit_line_id: int) -> Optional[models.CreditLine]:
+    return db.query(models.CreditLine).filter(models.CreditLine.id == credit_line_id).first()
+
+
+def get_credit_line_by_applicant_and_currency(
+    db: Session, applicant_name: str, currency: str
+) -> Optional[models.CreditLine]:
+    return db.query(models.CreditLine).filter(
+        models.CreditLine.applicant_name == applicant_name,
+        models.CreditLine.currency == currency
+    ).first()
+
+
+def get_all_credit_lines(db: Session, skip: int = 0, limit: int = 100) -> List[models.CreditLine]:
+    return db.query(models.CreditLine).order_by(models.CreditLine.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def calculate_used_amount(db: Session, applicant_name: str, currency: str) -> Dict[str, Any]:
+    today = date.today()
+
+    active_lcs = db.query(models.LetterOfCredit).filter(
+        models.LetterOfCredit.applicant_name == applicant_name,
+        models.LetterOfCredit.currency == currency,
+        models.LetterOfCredit.expiry_date >= today
+    ).all()
+
+    used_amount = 0.0
+    occupancy_details = []
+    for lc in active_lcs:
+        used_amount += lc.amount
+        occupancy_details.append({
+            "lc_number": lc.lc_number,
+            "amount": lc.amount,
+            "expiry_date": lc.expiry_date,
+        })
+
+    return {
+        "used_amount": used_amount,
+        "occupancy_details": occupancy_details,
+    }
+
+
+def get_credit_line_detail(
+    db: Session, applicant_name: str, currency: str
+) -> Dict[str, Any]:
+    credit_line = get_credit_line_by_applicant_and_currency(db, applicant_name, currency)
+    if not credit_line:
+        raise ValueError(f"申请人 {applicant_name} 在 {currency} 币种下没有授信额度记录")
+
+    used_info = calculate_used_amount(db, applicant_name, currency)
+    used_amount = used_info["used_amount"]
+    occupancy_details = used_info["occupancy_details"]
+    available_amount = credit_line.total_amount - used_amount
+    if available_amount < 0:
+        available_amount = 0.0
+
+    return {
+        "applicant_name": applicant_name,
+        "currency": currency,
+        "total_amount": credit_line.total_amount,
+        "used_amount": round(used_amount, 2),
+        "available_amount": round(available_amount, 2),
+        "occupancy_details": occupancy_details,
+    }
+
+
+def _create_credit_line_transaction(
+    db: Session,
+    credit_line: models.CreditLine,
+    transaction_type: str,
+    change_amount: float,
+    balance_before: float,
+    balance_after: float,
+    lc_number: Optional[str] = None,
+    remark: Optional[str] = None,
+) -> models.CreditLineTransaction:
+    transaction_number = generate_credit_line_transaction_number(
+        db, credit_line.applicant_name, credit_line.currency
+    )
+
+    transaction = models.CreditLineTransaction(
+        credit_line_id=credit_line.id,
+        transaction_number=transaction_number,
+        transaction_type=transaction_type,
+        change_amount=change_amount,
+        balance_before=balance_before,
+        balance_after=balance_after,
+        lc_number=lc_number,
+        remark=remark,
+    )
+    db.add(transaction)
+    db.flush()
+    return transaction
+
+
+def check_and_occupy_credit_line(
+    db: Session, applicant_name: str, currency: str, amount: float, lc_number: str
+) -> None:
+    credit_line = get_credit_line_by_applicant_and_currency(db, applicant_name, currency)
+    if not credit_line:
+        return
+
+    used_info = calculate_used_amount(db, applicant_name, currency)
+    used_amount = used_info["used_amount"]
+    available = credit_line.total_amount - used_amount
+
+    if amount > available + 0.01:
+        raise ValueError(
+            f"授信额度不足。申请人: {applicant_name}, 币种: {currency}, "
+            f"总额度: {credit_line.total_amount}, 已用额度: {round(used_amount, 2)}, "
+            f"可用额度: {round(available, 2)}, 本次开证金额: {amount}"
+        )
+
+    balance_before = credit_line.total_amount - used_amount
+    balance_after = balance_before - amount
+    _create_credit_line_transaction(
+        db,
+        credit_line,
+        models.CREDIT_LINE_TRANSACTION_TYPE_OCCUPY,
+        amount,
+        balance_before,
+        balance_after,
+        lc_number=lc_number,
+        remark=f"开立信用证占用额度",
+    )
+
+
+def adjust_credit_line_for_amendment(
+    db: Session,
+    lc: models.LetterOfCredit,
+    old_amount: float,
+    new_amount: float,
+    amendment_number: str,
+) -> None:
+    credit_line = get_credit_line_by_applicant_and_currency(
+        db, lc.applicant_name, lc.currency
+    )
+    if not credit_line:
+        return
+
+    today = date.today()
+    if lc.expiry_date < today:
+        return
+
+    amount_diff = new_amount - old_amount
+
+    used_info = calculate_used_amount(db, lc.applicant_name, lc.currency)
+    current_used_amount = used_info["used_amount"]
+
+    used_before = current_used_amount - amount_diff
+    available_before = credit_line.total_amount - used_before
+
+    if amount_diff > 0:
+        if amount_diff > available_before + 0.01:
+            raise ValueError(
+                f"授信额度不足，无法增加信用证金额。申请人: {lc.applicant_name}, "
+                f"币种: {lc.currency}, 可用额度: {round(available_before, 2)}, "
+                f"需增加金额: {round(amount_diff, 2)}"
+            )
+
+    balance_before = available_before
+    balance_after = balance_before - amount_diff
+
+    remark = f"修改{amendment_number}调整额度: 金额从{old_amount:.2f}变更为{new_amount:.2f}"
+
+    _create_credit_line_transaction(
+        db,
+        credit_line,
+        models.CREDIT_LINE_TRANSACTION_TYPE_ADJUST,
+        amount_diff,
+        balance_before,
+        balance_after,
+        lc_number=lc.lc_number,
+        remark=remark,
+    )
+
+
+def get_credit_line_transactions(
+    db: Session,
+    applicant_name: str,
+    currency: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+) -> List[models.CreditLineTransaction]:
+    credit_lines = db.query(models.CreditLine).filter(
+        models.CreditLine.applicant_name == applicant_name
+    )
+    if currency:
+        credit_lines = credit_lines.filter(models.CreditLine.currency == currency)
+
+    credit_line_ids = [cl.id for cl in credit_lines.all()]
+    if not credit_line_ids:
+        return []
+
+    return db.query(models.CreditLineTransaction).filter(
+        models.CreditLineTransaction.credit_line_id.in_(credit_line_ids)
+    ).order_by(
+        models.CreditLineTransaction.created_at.desc()
+    ).offset(skip).limit(limit).all()

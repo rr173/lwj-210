@@ -728,3 +728,43 @@ class CollectionRecord(Base):
     created_by = Column(String(100), nullable=True)
     payment = relationship("Payment", back_populates="collection_records")
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+CREDIT_LINE_TRANSACTION_TYPE_OCCUPY = "occupy"
+CREDIT_LINE_TRANSACTION_TYPE_RELEASE = "release"
+CREDIT_LINE_TRANSACTION_TYPE_ADJUST = "adjust"
+VALID_CREDIT_LINE_TRANSACTION_TYPES = [
+    CREDIT_LINE_TRANSACTION_TYPE_OCCUPY,
+    CREDIT_LINE_TRANSACTION_TYPE_RELEASE,
+    CREDIT_LINE_TRANSACTION_TYPE_ADJUST,
+]
+
+
+class CreditLine(Base):
+    __tablename__ = "credit_lines"
+
+    id = Column(Integer, primary_key=True, index=True)
+    applicant_name = Column(String(255), nullable=False, index=True)
+    currency = Column(String(10), nullable=False, index=True)
+    total_amount = Column(Float, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    transactions = relationship("CreditLineTransaction", back_populates="credit_line", cascade="all, delete-orphan")
+
+
+class CreditLineTransaction(Base):
+    __tablename__ = "credit_line_transactions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    credit_line_id = Column(Integer, ForeignKey("credit_lines.id"), nullable=False)
+    transaction_number = Column(String(150), unique=True, index=True, nullable=False)
+    transaction_type = Column(String(20), nullable=False)
+    change_amount = Column(Float, nullable=False)
+    balance_before = Column(Float, nullable=False)
+    balance_after = Column(Float, nullable=False)
+    lc_number = Column(String(100), nullable=True, index=True)
+    remark = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    credit_line = relationship("CreditLine", back_populates="transactions")

@@ -1052,6 +1052,44 @@ def create_app() -> FastAPI:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"查询付款列表失败: {str(e)}")
 
+    @app.post("/api/credit-lines", response_model=schemas.CreditLineResponse, tags=["授信额度管理"], status_code=status.HTTP_201_CREATED)
+    async def create_credit_line(credit_line_data: schemas.CreditLineCreate, db: Session = Depends(get_db)):
+        try:
+            return crud.create_credit_line(db, credit_line_data)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"创建授信额度失败: {str(e)}")
+
+    @app.get("/api/credit-lines", response_model=List[schemas.CreditLineResponse], tags=["授信额度管理"])
+    async def list_credit_lines(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+        try:
+            return crud.get_all_credit_lines(db, skip, limit)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询授信额度列表失败: {str(e)}")
+
+    @app.get("/api/credit-lines/{applicant_name}/{currency}", response_model=schemas.CreditLineQueryResponse, tags=["授信额度管理"])
+    async def get_credit_line_detail(applicant_name: str, currency: str, db: Session = Depends(get_db)):
+        try:
+            return crud.get_credit_line_detail(db, applicant_name, currency)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询授信额度详情失败: {str(e)}")
+
+    @app.get("/api/credit-lines/{applicant_name}/transactions", response_model=List[schemas.CreditLineTransactionResponse], tags=["授信额度管理"])
+    async def get_credit_line_transactions(
+        applicant_name: str,
+        currency: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 100,
+        db: Session = Depends(get_db)
+    ):
+        try:
+            return crud.get_credit_line_transactions(db, applicant_name, currency, skip, limit)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询额度流水失败: {str(e)}")
+
     return app
 
 

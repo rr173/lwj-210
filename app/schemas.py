@@ -1107,3 +1107,58 @@ class PaymentStatsResponse(BaseModel):
     total_count: int
     total_amount: float
     total_paid_amount: float
+
+
+class CreditLineCreate(BaseModel):
+    applicant_name: str
+    total_amount: float
+    currency: Currency
+
+
+class CreditLineResponse(BaseModel):
+    id: int
+    applicant_name: str
+    currency: str
+    total_amount: float
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class CreditLineTransactionType(str, Enum):
+    OCCUPY = "occupy"
+    RELEASE = "release"
+    ADJUST = "adjust"
+
+
+class CreditLineTransactionResponse(BaseModel):
+    id: int
+    credit_line_id: int
+    transaction_number: str
+    transaction_type: str
+    change_amount: float
+    balance_before: float
+    balance_after: float
+    lc_number: Optional[str] = None
+    remark: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class LcOccupancyDetail(BaseModel):
+    lc_number: str
+    amount: float
+    expiry_date: date
+
+
+class CreditLineQueryResponse(BaseModel):
+    applicant_name: str
+    currency: str
+    total_amount: float
+    used_amount: float
+    available_amount: float
+    occupancy_details: List[LcOccupancyDetail]
