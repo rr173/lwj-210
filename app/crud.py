@@ -3622,7 +3622,6 @@ def settle_payment(
     if payment.status == models.PAYMENT_STATUS_REJECTED:
         raise ValueError(f"付款申请 {payment_number} 已被拒付，无法付款")
 
-    check_and_update_matured_payments(db, payment.lc_id)
     check_and_update_overdue_payments(db, payment.lc_id)
     db.refresh(payment)
 
@@ -3705,10 +3704,14 @@ def calculate_penalty_interest(
     penalty_rate = lc.penalty_interest_rate if lc.penalty_interest_rate is not None else models.DEFAULT_PENALTY_RATE
     unpaid_amount = payment.payment_amount - payment.total_paid_amount
 
+    penalty_start_date = add_business_days(payment.maturity_date, models.OVERDUE_GRACE_WORKING_DAYS)
+
     if payment.maturity_date >= calc_date:
         overdue_days = 0
+    elif calc_date <= penalty_start_date:
+        overdue_days = 0
     else:
-        overdue_days = (calc_date - payment.maturity_date).days
+        overdue_days = (calc_date - penalty_start_date).days
 
     if overdue_days <= 0 or unpaid_amount <= 0:
         current_penalty = 0.0
@@ -3724,6 +3727,7 @@ def calculate_penalty_interest(
         "unpaid_amount": round(unpaid_amount, 2),
         "penalty_interest_rate": penalty_rate,
         "maturity_date": payment.maturity_date,
+        "penalty_start_date": penalty_start_date,
         "calc_date": calc_date,
         "overdue_days": overdue_days,
         "current_penalty": current_penalty,
@@ -3737,15 +3741,18 @@ def get_penalty_interest(db: Session, payment_number: str, calc_date: Optional[d
     if not payment:
         raise ValueError(f"付款申请 {payment_number} 不存在")
 
-    check_and_update_matured_payments(db, payment.lc_id)
     check_and_update_overdue_payments(db, payment.lc_id)
     db.refresh(payment)
 
     return calculate_penalty_interest(db, payment, calc_date)
 
 
-def check_and_update_overdue_payments(db: Session, lc_id: Optional[int] = None) -> int:
+def check_and_update_overdue_payments(db: Session, lc_id: Optional[int] = None, _skip_matured_check: bool = False) -> int:
     today = date.today()
+
+    if not _skip_matured_check:
+        check_and_update_matured_payments(db, lc_id, _skip_overdue_check=True)
+
     query = db.query(models.Payment).filter(
         models.Payment.status == models.PAYMENT_STATUS_MATURED,
     )
@@ -3803,7 +3810,6 @@ def create_manual_collection_record(
     if not payment:
         raise ValueError(f"付款申请 {collection_data.payment_number} 不存在")
 
-    check_and_update_matured_payments(db, payment.lc_id)
     check_and_update_overdue_payments(db, payment.lc_id)
     db.refresh(payment)
 
@@ -3905,6 +3911,7 @@ def get_payments_by_lc(db: Session, lc_number: str) -> List[models.Payment]:
     lc = get_letter_of_credit_by_number(db, lc_number)
     if not lc:
         raise ValueError(f"信用证 {lc_number} 不存在")
+    check_and_update_overdue_payments(db, lc.id)
     return db.query(models.Payment).filter(
         models.Payment.lc_id == lc.id
     ).order_by(models.Payment.created_at.desc()).all()
@@ -3913,6 +3920,7 @@ def get_payments_by_lc(db: Session, lc_number: str) -> List[models.Payment]:
 def get_payments_by_status(db: Session, status: str, skip: int = 0, limit: int = 100) -> List[models.Payment]:
     if status not in models.VALID_PAYMENT_STATUSES:
         raise ValueError(f"无效的付款状态: {status}，允许值: {', '.join(models.VALID_PAYMENT_STATUSES)}")
+    check_and_update_overdue_payments(db, None)
     return db.query(models.Payment).filter(
         models.Payment.status == status
     ).order_by(models.Payment.maturity_date.asc()).offset(skip).limit(limit).all()
@@ -3923,7 +3931,6 @@ def get_payment_detail(db: Session, payment_number: str) -> Dict[str, Any]:
     if not payment:
         raise ValueError(f"付款申请 {payment_number} 不存在")
 
-    check_and_update_matured_payments(db, payment.lc_id)
     check_and_update_overdue_payments(db, payment.lc_id)
     db.refresh(payment)
 
@@ -3995,7 +4002,7 @@ def get_payment_stats_by_time_range(
     }
 
 
-def check_and_update_matured_payments(db: Session, lc_id: Optional[int] = None) -> int:
+def check_and_update_matured_payments(db: Session, lc_id: Optional[int] = None, _skip_overdue_check: bool = False) -> int:
     today = date.today()
     query = db.query(models.Payment).filter(
         models.Payment.status.in_([models.PAYMENT_STATUS_PENDING, models.PAYMENT_STATUS_ACCEPTED]),
@@ -4016,7 +4023,8 @@ def check_and_update_matured_payments(db: Session, lc_id: Optional[int] = None) 
     if count > 0:
         db.commit()
 
-    check_and_update_overdue_payments(db, lc_id)
+    if not _skip_overdue_check:
+        check_and_update_overdue_payments(db, lc_id, _skip_matured_check=True)
     return count
 
 
@@ -4044,4 +4052,5 @@ def get_lc_payment_summary(db: Session, lc_number: str) -> Dict[str, Any]:
 
 
 def get_all_payments(db: Session, skip: int = 0, limit: int = 100) -> List[models.Payment]:
+    check_and_update_overdue_payments(db, None)
     return db.query(models.Payment).order_by(models.Payment.created_at.desc()).offset(skip).limit(limit).all()

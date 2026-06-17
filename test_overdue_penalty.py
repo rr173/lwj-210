@@ -112,34 +112,39 @@ def test_overdue_penalty_and_collection():
         print(f"    状态: {test_payment.status}")
 
         print("\n" + "-" * 50)
-        print("测试3: 罚息计算 - 刚到期时罚息应为0")
+        print("测试3: 罚息计算 - 刚到期时罚息应为0 (宽限期内)")
         print("-" * 50)
+
+        from app.crud import add_business_days
+        grace_deadline = add_business_days(test_payment.maturity_date, models.OVERDUE_GRACE_WORKING_DAYS)
 
         penalty_info_today = crud.calculate_penalty_interest(db, test_payment, today)
         print(f"    计算日期: {today}")
         print(f"    到期日: {test_payment.maturity_date}")
+        print(f"    宽限截止日: {grace_deadline}")
+        print(f"    罚息起算日: {penalty_info_today['penalty_start_date']}")
         print(f"    逾期天数: {penalty_info_today['overdue_days']}")
         print(f"    当前罚息: {penalty_info_today['current_penalty']}")
-        assert penalty_info_today["overdue_days"] == 1, f"逾期天数应为 1，实际为 {penalty_info_today['overdue_days']}"
-        expected_penalty_1day = round(100000.00 * (6.0 / 100.0) / 365.0 * 1, 2)
-        print(f"    预期罚息(1天): {expected_penalty_1day}")
-        assert abs(penalty_info_today["current_penalty"] - expected_penalty_1day) < 0.01, f"罚息计算不正确"
-        print(f"[✓] 罚息计算正确: {penalty_info_today['current_penalty']} USD")
+        assert penalty_info_today["overdue_days"] == 0, f"宽限期内逾期天数应为 0，实际为 {penalty_info_today['overdue_days']}"
+        assert penalty_info_today["current_penalty"] == 0.0, f"宽限期内罚息应为 0，实际为 {penalty_info_today['current_penalty']}"
+        print(f"[✓] 宽限期内罚息为0，正确")
 
         print("\n" + "-" * 50)
-        print("测试4: 罚息计算 - 逾期30天")
+        print("测试4: 罚息计算 - 逾期30天 (已过宽限期)")
         print("-" * 50)
 
         calc_date_30 = today + timedelta(days=29)
         penalty_info_30 = crud.calculate_penalty_interest(db, test_payment, calc_date_30)
         print(f"    计算日期: {calc_date_30}")
+        print(f"    罚息起算日: {penalty_info_30['penalty_start_date']}")
         print(f"    逾期天数: {penalty_info_30['overdue_days']}")
-        expected_penalty_30day = round(100000.00 * (6.0 / 100.0) / 365.0 * 30, 2)
-        print(f"    预期罚息(30天): {expected_penalty_30day}")
+        expected_overdue_days = (calc_date_30 - grace_deadline).days
+        expected_penalty_30day = round(100000.00 * (6.0 / 100.0) / 365.0 * expected_overdue_days, 2) if expected_overdue_days > 0 else 0.0
+        print(f"    预期罚息(扣除宽限期): {expected_penalty_30day}")
         print(f"    实际罚息: {penalty_info_30['current_penalty']}")
-        assert penalty_info_30["overdue_days"] == 30
+        assert penalty_info_30["overdue_days"] == expected_overdue_days
         assert abs(penalty_info_30["current_penalty"] - expected_penalty_30day) < 0.01
-        print(f"[✓] 30天罚息计算正确")
+        print(f"[✓] 罚息计算正确 (已扣除宽限期)")
 
         print("\n" + "-" * 50)
         print("测试5: 罚息计算API接口 (get_penalty_interest)")
@@ -308,15 +313,19 @@ def test_overdue_penalty_and_collection():
 
         partial_penalty = crud.calculate_penalty_interest(db, partial_test_payment, today)
         unpaid = 200000.00 - 80000.00
-        expected_partial_penalty = round(unpaid * (8.5 / 100.0) / 365.0 * 15, 2)
+        penalty_start = partial_penalty['penalty_start_date']
+        actual_overdue_days = partial_penalty['overdue_days']
+        expected_partial_penalty = round(unpaid * (8.5 / 100.0) / 365.0 * actual_overdue_days, 2)
         print(f"    总金额: 200000.00 USD, 已付本金: 80000.00 USD")
         print(f"    未付本金: {unpaid} USD")
-        print(f"    罚息利率: 8.5%, 逾期天数: 15天")
+        print(f"    罚息利率: 8.5%")
+        print(f"    到期日: {partial_test_payment.maturity_date}, 罚息起算日: {penalty_start}")
+        print(f"    实际逾期天数(扣除宽限期): {actual_overdue_days}天")
         print(f"    预期罚息: {expected_partial_penalty} USD")
         print(f"    实际罚息: {partial_penalty['current_penalty']} USD")
         assert abs(partial_penalty["current_penalty"] - expected_partial_penalty) < 0.01
         assert partial_penalty["unpaid_amount"] == unpaid
-        print(f"[✓] 部分付款后罚息计算正确 (基于未付本金)")
+        print(f"[✓] 部分付款后罚息计算正确 (基于未付本金,已扣除宽限期)")
 
         print("\n" + "-" * 50)
         print("测试12: 逾期统计接口")

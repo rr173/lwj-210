@@ -1068,6 +1068,8 @@ class PenaltyInterestResponse(BaseModel):
     unpaid_amount: float
     penalty_interest_rate: float
     maturity_date: date
+    penalty_start_date: date
+    calc_date: date
     overdue_days: int
     current_penalty: float
     total_penalty_paid: float
