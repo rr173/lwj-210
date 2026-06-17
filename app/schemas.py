@@ -78,8 +78,20 @@ class PaymentStatus(str, Enum):
     PENDING = "pending"
     ACCEPTED = "accepted"
     MATURED = "matured"
+    OVERDUE = "overdue"
     PAID = "paid"
     REJECTED = "rejected"
+
+
+class CollectionType(str, Enum):
+    SYSTEM_AUTO = "system_auto"
+    MANUAL = "manual"
+
+
+class CollectionMethod(str, Enum):
+    PHONE = "phone"
+    EMAIL = "email"
+    LETTER = "letter"
 
 
 class DocumentRequirementCreate(BaseModel):
@@ -120,6 +132,7 @@ class LetterOfCreditCreate(BaseModel):
     usance_days: Optional[int] = None
     usance_basis: Optional[UsanceBasis] = None
     deferred_payment_date: Optional[date] = None
+    penalty_interest_rate: float = 6.0
     document_requirements: List[DocumentRequirementCreate]
 
 
@@ -146,6 +159,7 @@ class LetterOfCreditResponse(BaseModel):
     usance_days: Optional[int] = None
     usance_basis: Optional[str] = None
     deferred_payment_date: Optional[date] = None
+    penalty_interest_rate: float
     document_requirements: List[DocumentRequirementResponse]
     created_at: datetime
 
@@ -961,6 +975,7 @@ class PaymentRejectRequest(BaseModel):
 
 class PaymentSettleRequest(BaseModel):
     amount: Optional[float] = None
+    penalty_amount: Optional[float] = None
     payment_date: date
     reference: Optional[str] = None
     settled_by: Optional[str] = None
@@ -983,6 +998,7 @@ class PartialPaymentRecordResponse(BaseModel):
     id: int
     payment_id: int
     amount: float
+    penalty_amount: float
     payment_date: date
     reference: Optional[str] = None
     created_by: Optional[str] = None
@@ -1006,6 +1022,7 @@ class PaymentResponse(BaseModel):
     accepted_at: Optional[datetime] = None
     rejection_reason: Optional[str] = None
     total_paid_amount: float
+    total_penalty_paid: float
     actual_payment_date: Optional[date] = None
     created_at: datetime
 
@@ -1016,6 +1033,53 @@ class PaymentResponse(BaseModel):
 class PaymentDetailResponse(PaymentResponse):
     status_history: List[PaymentStatusHistoryResponse] = []
     partial_payments: List[PartialPaymentRecordResponse] = []
+    collection_records: List["CollectionRecordResponse"] = []
+
+
+class CollectionRecordCreate(BaseModel):
+    payment_number: str
+    collection_method: CollectionMethod
+    contact_person: str
+    collection_content: str
+    created_by: Optional[str] = None
+
+
+class CollectionRecordResponse(BaseModel):
+    id: int
+    collection_number: str
+    payment_id: int
+    payment_number: Optional[str] = None
+    collection_type: str
+    collection_method: Optional[str] = None
+    contact_person: Optional[str] = None
+    collection_content: str
+    collection_time: datetime
+    created_by: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PenaltyInterestResponse(BaseModel):
+    payment_number: str
+    payment_amount: float
+    total_paid_amount: float
+    unpaid_amount: float
+    penalty_interest_rate: float
+    maturity_date: date
+    overdue_days: int
+    current_penalty: float
+    total_penalty_paid: float
+    remaining_penalty: float
+
+
+class OverdueStatsResponse(BaseModel):
+    start_date: date
+    end_date: date
+    overdue_count: int
+    overdue_total_amount: float
+    overdue_currency_details: List[Dict[str, Any]]
 
 
 class LcPaymentSummaryResponse(BaseModel):

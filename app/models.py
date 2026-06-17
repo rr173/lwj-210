@@ -87,11 +87,23 @@ VALID_USANCE_BASES = [USANCE_BASIS_SHIPMENT_DATE, USANCE_BASIS_PRESENTATION_DATE
 PAYMENT_STATUS_PENDING = "pending"
 PAYMENT_STATUS_ACCEPTED = "accepted"
 PAYMENT_STATUS_MATURED = "matured"
+PAYMENT_STATUS_OVERDUE = "overdue"
 PAYMENT_STATUS_PAID = "paid"
 PAYMENT_STATUS_REJECTED = "rejected"
-VALID_PAYMENT_STATUSES = [PAYMENT_STATUS_PENDING, PAYMENT_STATUS_ACCEPTED, PAYMENT_STATUS_MATURED, PAYMENT_STATUS_PAID, PAYMENT_STATUS_REJECTED]
+VALID_PAYMENT_STATUSES = [PAYMENT_STATUS_PENDING, PAYMENT_STATUS_ACCEPTED, PAYMENT_STATUS_MATURED, PAYMENT_STATUS_OVERDUE, PAYMENT_STATUS_PAID, PAYMENT_STATUS_REJECTED]
 
 SIGHT_PROCESSING_DAYS = 5
+DEFAULT_PENALTY_RATE = 6.0
+OVERDUE_GRACE_WORKING_DAYS = 3
+
+COLLECTION_TYPE_SYSTEM_AUTO = "system_auto"
+COLLECTION_TYPE_MANUAL = "manual"
+VALID_COLLECTION_TYPES = [COLLECTION_TYPE_SYSTEM_AUTO, COLLECTION_TYPE_MANUAL]
+
+COLLECTION_METHOD_PHONE = "phone"
+COLLECTION_METHOD_EMAIL = "email"
+COLLECTION_METHOD_LETTER = "letter"
+VALID_COLLECTION_METHODS = [COLLECTION_METHOD_PHONE, COLLECTION_METHOD_EMAIL, COLLECTION_METHOD_LETTER]
 
 
 class LetterOfCredit(Base):
@@ -119,6 +131,7 @@ class LetterOfCredit(Base):
     usance_days = Column(Integer, nullable=True)
     usance_basis = Column(String(30), nullable=True)
     deferred_payment_date = Column(Date, nullable=True)
+    penalty_interest_rate = Column(Float, default=DEFAULT_PENALTY_RATE, nullable=False)
     document_requirements = relationship("DocumentRequirement", back_populates="lc", cascade="all, delete-orphan")
     documents = relationship("Document", back_populates="lc", cascade="all, delete-orphan")
     audit_records = relationship("AuditRecord", back_populates="lc", cascade="all, delete-orphan")
@@ -664,11 +677,13 @@ class Payment(Base):
     accepted_at = Column(DateTime, nullable=True)
     rejection_reason = Column(Text, nullable=True)
     total_paid_amount = Column(Float, default=0.0, nullable=False)
+    total_penalty_paid = Column(Float, default=0.0, nullable=False)
     actual_payment_date = Column(Date, nullable=True)
     lc = relationship("LetterOfCredit", back_populates="payments")
     audit_record = relationship("AuditRecord")
     status_history = relationship("PaymentStatusHistory", back_populates="payment", cascade="all, delete-orphan", order_by="PaymentStatusHistory.changed_at.asc()")
     partial_payments = relationship("PartialPaymentRecord", back_populates="payment", cascade="all, delete-orphan", order_by="PartialPaymentRecord.created_at.asc()")
+    collection_records = relationship("CollectionRecord", back_populates="payment", cascade="all, delete-orphan", order_by="CollectionRecord.created_at.desc()")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -691,8 +706,25 @@ class PartialPaymentRecord(Base):
     id = Column(Integer, primary_key=True, index=True)
     payment_id = Column(Integer, ForeignKey("payments.id"), nullable=False)
     amount = Column(Float, nullable=False)
+    penalty_amount = Column(Float, default=0.0, nullable=False)
     payment_date = Column(Date, nullable=False)
     reference = Column(String(200), nullable=True)
     created_by = Column(String(100), nullable=True)
     payment = relationship("Payment", back_populates="partial_payments")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class CollectionRecord(Base):
+    __tablename__ = "collection_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    collection_number = Column(String(150), unique=True, index=True, nullable=False)
+    payment_id = Column(Integer, ForeignKey("payments.id"), nullable=False)
+    collection_type = Column(String(30), nullable=False)
+    collection_method = Column(String(30), nullable=True)
+    contact_person = Column(String(200), nullable=True)
+    collection_content = Column(Text, nullable=False)
+    collection_time = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_by = Column(String(100), nullable=True)
+    payment = relationship("Payment", back_populates="collection_records")
     created_at = Column(DateTime, default=datetime.utcnow)

@@ -24,6 +24,8 @@ def init_db():
     _migrate_rule_version_columns()
     _migrate_payment_columns()
     _create_payment_tables()
+    _migrate_overdue_penalty_columns()
+    _create_collection_table()
 
 
 def _migrate_rule_version_columns():
@@ -61,6 +63,34 @@ def _migrate_payment_columns():
         db.close()
 
 
+def _migrate_overdue_penalty_columns():
+    from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+    db = SessionLocal()
+    try:
+        try:
+            db.execute(text("SELECT penalty_interest_rate FROM letter_of_credits LIMIT 1"))
+        except OperationalError:
+            db.execute(text("ALTER TABLE letter_of_credits ADD COLUMN penalty_interest_rate FLOAT DEFAULT 6.0 NOT NULL"))
+            db.commit()
+
+        try:
+            db.execute(text("SELECT total_penalty_paid FROM payments LIMIT 1"))
+        except OperationalError:
+            db.execute(text("ALTER TABLE payments ADD COLUMN total_penalty_paid FLOAT DEFAULT 0.0 NOT NULL"))
+            db.commit()
+
+        try:
+            db.execute(text("SELECT penalty_amount FROM partial_payment_records LIMIT 1"))
+        except OperationalError:
+            db.execute(text("ALTER TABLE partial_payment_records ADD COLUMN penalty_amount FLOAT DEFAULT 0.0 NOT NULL"))
+            db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
 def _create_payment_tables():
     from sqlalchemy import text
     from sqlalchemy.exc import OperationalError
@@ -73,6 +103,23 @@ def _create_payment_tables():
             models.Payment.__table__.create(bind=conn)
             models.PaymentStatusHistory.__table__.create(bind=conn)
             models.PartialPaymentRecord.__table__.create(bind=conn)
+            db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _create_collection_table():
+    from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+    db = SessionLocal()
+    try:
+        try:
+            db.execute(text("SELECT 1 FROM collection_records LIMIT 1"))
+        except OperationalError:
+            conn = db.connection()
+            models.CollectionRecord.__table__.create(bind=conn)
             db.commit()
     except Exception:
         db.rollback()

@@ -916,6 +916,7 @@ def create_app() -> FastAPI:
                 payment_number,
                 settle_req.payment_date,
                 settle_req.amount,
+                settle_req.penalty_amount,
                 settle_req.reference,
                 settle_req.settled_by,
             )
@@ -924,6 +925,73 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"付款结算失败: {str(e)}")
+
+    @app.get("/api/payments/{payment_number}/penalty", response_model=schemas.PenaltyInterestResponse, tags=["逾期罚息与催收管理"])
+    async def get_penalty(payment_number: str, calc_date: Optional[date] = None, db: Session = Depends(get_db)):
+        try:
+            return crud.get_penalty_interest(db, payment_number, calc_date)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询罚息失败: {str(e)}")
+
+    @app.post("/api/payments/overdue-check", tags=["逾期罚息与催收管理"])
+    async def check_overdue(db: Session = Depends(get_db)):
+        try:
+            count = crud.check_and_update_overdue_payments(db)
+            return {"overdue_count": count, "message": f"已将 {count} 笔到期超过3个工作日的付款标记为 overdue"}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"逾期检查失败: {str(e)}")
+
+    @app.post("/api/collections", response_model=schemas.CollectionRecordResponse, tags=["逾期罚息与催收管理"], status_code=status.HTTP_201_CREATED)
+    async def create_collection(collection_req: schemas.CollectionRecordCreate, db: Session = Depends(get_db)):
+        try:
+            record = crud.create_manual_collection_record(db, collection_req)
+            result = {
+                "id": record.id,
+                "collection_number": record.collection_number,
+                "payment_id": record.payment_id,
+                "payment_number": collection_req.payment_number,
+                "collection_type": record.collection_type,
+                "collection_method": record.collection_method,
+                "contact_person": record.contact_person,
+                "collection_content": record.collection_content,
+                "collection_time": record.collection_time,
+                "created_by": record.created_by,
+                "created_at": record.created_at,
+            }
+            return result
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"创建催收记录失败: {str(e)}")
+
+    @app.get("/api/collections/payment/{payment_number}", response_model=List[schemas.CollectionRecordResponse], tags=["逾期罚息与催收管理"])
+    async def get_collections_by_payment(payment_number: str, db: Session = Depends(get_db)):
+        try:
+            return crud.get_collection_records_by_payment(db, payment_number)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询催收记录失败: {str(e)}")
+
+    @app.get("/api/collections/stats/overdue", response_model=schemas.OverdueStatsResponse, tags=["逾期罚息与催收管理"])
+    async def get_overdue_stats(
+        start_date: date,
+        end_date: date,
+        db: Session = Depends(get_db)
+    ):
+        try:
+            if start_date > end_date:
+                raise HTTPException(status_code=400, detail="开始日期不能大于结束日期")
+            crud.check_and_update_matured_payments(db)
+            return crud.get_overdue_stats_by_time_range(db, start_date, end_date)
+        except HTTPException:
+            raise
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询逾期统计失败: {str(e)}")
 
     @app.get("/api/payments/lc/{lc_number}", response_model=schemas.LcPaymentSummaryResponse, tags=["承兑与付款管理"])
     async def get_lc_payments(lc_number: str, db: Session = Depends(get_db)):

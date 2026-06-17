@@ -64,6 +64,10 @@ def create_letter_of_credit(db: Session, lc_data: schemas.LetterOfCreditCreate) 
         if deferred_payment_date is None:
             raise ValueError("延期付款必须指定付款日期")
 
+    penalty_rate = lc_data.penalty_interest_rate
+    if penalty_rate < 0:
+        raise ValueError("罚息利率不能为负数")
+
     db_lc = models.LetterOfCredit(
         lc_number=lc_data.lc_number,
         issuing_bank=lc_data.issuing_bank,
@@ -86,6 +90,7 @@ def create_letter_of_credit(db: Session, lc_data: schemas.LetterOfCreditCreate) 
         usance_days=usance_days,
         usance_basis=usance_basis,
         deferred_payment_date=deferred_payment_date,
+        penalty_interest_rate=penalty_rate,
     )
     db.add(db_lc)
     db.flush()
@@ -146,6 +151,10 @@ def update_letter_of_credit(db: Session, lc_id: int, lc_data: schemas.LetterOfCr
         if new_deferred_payment_date is None:
             raise ValueError("延期付款必须指定付款日期")
 
+    new_penalty_rate = lc_data.penalty_interest_rate
+    if new_penalty_rate < 0:
+        raise ValueError("罚息利率不能为负数")
+
     db_lc.lc_number = lc_data.lc_number
     db_lc.issuing_bank = lc_data.issuing_bank
     db_lc.beneficiary_name = lc_data.beneficiary_name
@@ -166,6 +175,7 @@ def update_letter_of_credit(db: Session, lc_id: int, lc_data: schemas.LetterOfCr
     db_lc.usance_days = new_usance_days
     db_lc.usance_basis = new_usance_basis
     db_lc.deferred_payment_date = new_deferred_payment_date
+    db_lc.penalty_interest_rate = new_penalty_rate
 
     db.query(models.DocumentRequirement).filter(models.DocumentRequirement.lc_id == lc_id).delete()
     for req in lc_data.document_requirements:
@@ -632,6 +642,7 @@ def lc_to_snapshot_dict(lc: models.LetterOfCredit) -> Dict[str, Any]:
         "transshipment_allowed": lc.transshipment_allowed,
         "goods_description": lc.goods_description,
         "additional_terms": copy.deepcopy(lc.additional_terms) if lc.additional_terms else [],
+        "penalty_interest_rate": lc.penalty_interest_rate,
         "created_at": lc.created_at.isoformat() if lc.created_at else None
     }
 
@@ -3597,6 +3608,7 @@ def settle_payment(
     payment_number: str,
     payment_date: date,
     amount: Optional[float] = None,
+    penalty_amount: Optional[float] = None,
     reference: Optional[str] = None,
     settled_by: Optional[str] = None,
 ) -> models.Payment:
@@ -3611,10 +3623,11 @@ def settle_payment(
         raise ValueError(f"付款申请 {payment_number} 已被拒付，无法付款")
 
     check_and_update_matured_payments(db, payment.lc_id)
+    check_and_update_overdue_payments(db, payment.lc_id)
     db.refresh(payment)
 
-    if payment.status != models.PAYMENT_STATUS_MATURED:
-        raise ValueError(f"只有到期(matured)的付款可以结算，当前状态: {payment.status}。请等待付款到期后再操作。")
+    if payment.status not in [models.PAYMENT_STATUS_MATURED, models.PAYMENT_STATUS_OVERDUE]:
+        raise ValueError(f"只有到期(matured)或逾期(overdue)的付款可以结算，当前状态: {payment.status}。请等待付款到期后再操作。")
 
     if amount is None:
         amount = payment.payment_amount - payment.total_paid_amount
@@ -3624,15 +3637,34 @@ def settle_payment(
 
     remaining = payment.payment_amount - payment.total_paid_amount
     if amount > remaining + 0.001:
-        raise ValueError(f"付款金额超过剩余应付金额。应付: {remaining}, 申请: {amount}")
+        raise ValueError(f"付款金额超过剩余应付本金。应付本金: {remaining}, 申请: {amount}")
 
     lc = get_letter_of_credit_by_id(db, payment.lc_id)
     if not lc.partial_shipment_allowed and abs(amount - remaining) > 0.001:
         raise ValueError("信用证不允许分批装运，必须一次性全额付款")
 
+    penalty_info = calculate_penalty_interest(db, payment, payment_date)
+    remaining_penalty = penalty_info["remaining_penalty"]
+
+    if payment.status == models.PAYMENT_STATUS_OVERDUE or remaining_penalty > 0.001:
+        if penalty_amount is None:
+            raise ValueError(f"该付款已逾期，必须同时支付罚息。当前应付罚息: {remaining_penalty:.2f}")
+        if penalty_amount < remaining_penalty - 0.001:
+            raise ValueError(f"传入的罚息金额不足。应付罚息: {remaining_penalty:.2f}, 传入罚息: {penalty_amount:.2f}，允许多付不允许少付")
+        if penalty_amount < 0:
+            raise ValueError("罚息金额不能为负数")
+    else:
+        if penalty_amount is None:
+            penalty_amount = 0.0
+        if penalty_amount < 0:
+            raise ValueError("罚息金额不能为负数")
+
+    actual_penalty = penalty_amount
+
     partial_record = models.PartialPaymentRecord(
         payment_id=payment.id,
         amount=amount,
+        penalty_amount=actual_penalty,
         payment_date=payment_date,
         reference=reference,
         created_by=settled_by,
@@ -3641,19 +3673,228 @@ def settle_payment(
     db.flush()
 
     new_total_paid = payment.total_paid_amount + amount
+    new_total_penalty_paid = payment.total_penalty_paid + actual_penalty
     payment.total_paid_amount = new_total_paid
+    payment.total_penalty_paid = new_total_penalty_paid
     payment.actual_payment_date = payment_date
 
     old_status = payment.status
     if abs(new_total_paid - payment.payment_amount) < 0.001:
         payment.status = models.PAYMENT_STATUS_PAID
-        _add_payment_status_history(db, payment, old_status, models.PAYMENT_STATUS_PAID, changed_by=settled_by, remark="全额付款完成")
+        _add_payment_status_history(db, payment, old_status, models.PAYMENT_STATUS_PAID, changed_by=settled_by, remark=f"全额付款完成(本金:{amount:.2f}, 罚息:{actual_penalty:.2f})")
     else:
-        _add_payment_status_history(db, payment, old_status, payment.status, changed_by=settled_by, remark=f"部分付款: {amount} {payment.currency}")
+        _add_payment_status_history(db, payment, old_status, payment.status, changed_by=settled_by, remark=f"部分付款: 本金{amount:.2f} {payment.currency}, 罚息{actual_penalty:.2f}")
 
     db.commit()
     db.refresh(payment)
     return payment
+
+
+def calculate_penalty_interest(
+    db: Session,
+    payment: models.Payment,
+    calc_date: Optional[date] = None,
+) -> Dict[str, Any]:
+    if calc_date is None:
+        calc_date = date.today()
+
+    lc = get_letter_of_credit_by_id(db, payment.lc_id)
+    if not lc:
+        raise ValueError("关联信用证不存在")
+
+    penalty_rate = lc.penalty_interest_rate if lc.penalty_interest_rate is not None else models.DEFAULT_PENALTY_RATE
+    unpaid_amount = payment.payment_amount - payment.total_paid_amount
+
+    if payment.maturity_date >= calc_date:
+        overdue_days = 0
+    else:
+        overdue_days = (calc_date - payment.maturity_date).days
+
+    if overdue_days <= 0 or unpaid_amount <= 0:
+        current_penalty = 0.0
+    else:
+        current_penalty = round(unpaid_amount * (penalty_rate / 100.0) / 365.0 * overdue_days, 2)
+
+    remaining_penalty = max(0.0, round(current_penalty - payment.total_penalty_paid, 2))
+
+    return {
+        "payment_number": payment.payment_number,
+        "payment_amount": payment.payment_amount,
+        "total_paid_amount": payment.total_paid_amount,
+        "unpaid_amount": round(unpaid_amount, 2),
+        "penalty_interest_rate": penalty_rate,
+        "maturity_date": payment.maturity_date,
+        "calc_date": calc_date,
+        "overdue_days": overdue_days,
+        "current_penalty": current_penalty,
+        "total_penalty_paid": payment.total_penalty_paid,
+        "remaining_penalty": remaining_penalty,
+    }
+
+
+def get_penalty_interest(db: Session, payment_number: str, calc_date: Optional[date] = None) -> Dict[str, Any]:
+    payment = get_payment_by_number(db, payment_number)
+    if not payment:
+        raise ValueError(f"付款申请 {payment_number} 不存在")
+
+    check_and_update_matured_payments(db, payment.lc_id)
+    check_and_update_overdue_payments(db, payment.lc_id)
+    db.refresh(payment)
+
+    return calculate_penalty_interest(db, payment, calc_date)
+
+
+def check_and_update_overdue_payments(db: Session, lc_id: Optional[int] = None) -> int:
+    today = date.today()
+    query = db.query(models.Payment).filter(
+        models.Payment.status == models.PAYMENT_STATUS_MATURED,
+    )
+    if lc_id is not None:
+        query = query.filter(models.Payment.lc_id == lc_id)
+
+    payments = query.all()
+    count = 0
+    for p in payments:
+        grace_deadline = add_business_days(p.maturity_date, models.OVERDUE_GRACE_WORKING_DAYS)
+        if today > grace_deadline:
+            old_status = p.status
+            p.status = models.PAYMENT_STATUS_OVERDUE
+            _add_payment_status_history(db, p, old_status, models.PAYMENT_STATUS_OVERDUE, remark="自动逾期(到期超过3个工作日未付款)")
+            _create_auto_collection_record(db, p)
+            count += 1
+
+    if count > 0:
+        db.commit()
+    return count
+
+
+def generate_collection_number(db: Session, payment_number: str) -> str:
+    from sqlalchemy import func
+    date_str = datetime.utcnow().strftime("%Y%m%d")
+    prefix = f"COL-{payment_number}-{date_str}-"
+    count = db.query(func.count(models.CollectionRecord.id)).filter(
+        models.CollectionRecord.collection_number.like(f"{prefix}%")
+    ).scalar() or 0
+    return f"{prefix}{count + 1:04d}"
+
+
+def _create_auto_collection_record(db: Session, payment: models.Payment) -> models.CollectionRecord:
+    collection_number = generate_collection_number(db, payment.payment_number)
+    record = models.CollectionRecord(
+        collection_number=collection_number,
+        payment_id=payment.id,
+        collection_type=models.COLLECTION_TYPE_SYSTEM_AUTO,
+        collection_method=None,
+        contact_person=None,
+        collection_content="付款已逾期,请尽快安排付款",
+        collection_time=datetime.utcnow(),
+        created_by="system",
+    )
+    db.add(record)
+    db.flush()
+    return record
+
+
+def create_manual_collection_record(
+    db: Session,
+    collection_data: schemas.CollectionRecordCreate,
+) -> models.CollectionRecord:
+    payment = get_payment_by_number(db, collection_data.payment_number)
+    if not payment:
+        raise ValueError(f"付款申请 {collection_data.payment_number} 不存在")
+
+    check_and_update_matured_payments(db, payment.lc_id)
+    check_and_update_overdue_payments(db, payment.lc_id)
+    db.refresh(payment)
+
+    if payment.status not in [models.PAYMENT_STATUS_OVERDUE, models.PAYMENT_STATUS_MATURED]:
+        raise ValueError(f"只有到期或逾期的付款才能添加催收记录，当前状态: {payment.status}")
+
+    method_value = collection_data.collection_method.value if hasattr(collection_data.collection_method, 'value') else collection_data.collection_method
+    if method_value not in models.VALID_COLLECTION_METHODS:
+        raise ValueError(f"无效的催收方式: {method_value}，允许值: {', '.join(models.VALID_COLLECTION_METHODS)}")
+
+    collection_number = generate_collection_number(db, payment.payment_number)
+    record = models.CollectionRecord(
+        collection_number=collection_number,
+        payment_id=payment.id,
+        collection_type=models.COLLECTION_TYPE_MANUAL,
+        collection_method=method_value,
+        contact_person=collection_data.contact_person,
+        collection_content=collection_data.collection_content,
+        collection_time=datetime.utcnow(),
+        created_by=collection_data.created_by,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def get_collection_records_by_payment(db: Session, payment_number: str) -> List[Dict[str, Any]]:
+    payment = get_payment_by_number(db, payment_number)
+    if not payment:
+        raise ValueError(f"付款申请 {payment_number} 不存在")
+
+    records = db.query(models.CollectionRecord).filter(
+        models.CollectionRecord.payment_id == payment.id
+    ).order_by(models.CollectionRecord.collection_time.desc()).all()
+
+    result = []
+    for r in records:
+        result.append({
+            "id": r.id,
+            "collection_number": r.collection_number,
+            "payment_id": r.payment_id,
+            "payment_number": payment.payment_number,
+            "collection_type": r.collection_type,
+            "collection_method": r.collection_method,
+            "contact_person": r.contact_person,
+            "collection_content": r.collection_content,
+            "collection_time": r.collection_time,
+            "created_by": r.created_by,
+            "created_at": r.created_at,
+        })
+    return result
+
+
+def get_overdue_stats_by_time_range(
+    db: Session,
+    start_date: date,
+    end_date: date,
+) -> Dict[str, Any]:
+    if start_date > end_date:
+        raise ValueError("开始日期不能大于结束日期")
+
+    start_dt = datetime.combine(start_date, datetime.min.time())
+    end_dt = datetime.combine(end_date, datetime.max.time())
+
+    query = db.query(models.Payment).filter(
+        models.Payment.status == models.PAYMENT_STATUS_OVERDUE,
+        models.Payment.created_at >= start_dt,
+        models.Payment.created_at <= end_dt,
+    )
+    overdue_payments = query.all()
+
+    by_currency = {}
+    total_amount = 0.0
+    for p in overdue_payments:
+        curr = p.currency
+        unpaid = p.payment_amount - p.total_paid_amount
+        if curr not in by_currency:
+            by_currency[curr] = {"currency": curr, "count": 0, "total_amount": 0.0, "unpaid_amount": 0.0}
+        by_currency[curr]["count"] += 1
+        by_currency[curr]["total_amount"] += p.payment_amount
+        by_currency[curr]["unpaid_amount"] += unpaid
+        total_amount += unpaid
+
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "overdue_count": len(overdue_payments),
+        "overdue_total_amount": round(total_amount, 2),
+        "overdue_currency_details": list(by_currency.values()),
+    }
 
 
 def get_payment_by_number(db: Session, payment_number: str) -> Optional[models.Payment]:
@@ -3682,6 +3923,12 @@ def get_payment_detail(db: Session, payment_number: str) -> Dict[str, Any]:
     if not payment:
         raise ValueError(f"付款申请 {payment_number} 不存在")
 
+    check_and_update_matured_payments(db, payment.lc_id)
+    check_and_update_overdue_payments(db, payment.lc_id)
+    db.refresh(payment)
+
+    collection_records = get_collection_records_by_payment(db, payment_number)
+
     return {
         "id": payment.id,
         "payment_number": payment.payment_number,
@@ -3696,10 +3943,12 @@ def get_payment_detail(db: Session, payment_number: str) -> Dict[str, Any]:
         "accepted_at": payment.accepted_at,
         "rejection_reason": payment.rejection_reason,
         "total_paid_amount": payment.total_paid_amount,
+        "total_penalty_paid": payment.total_penalty_paid,
         "actual_payment_date": payment.actual_payment_date,
         "created_at": payment.created_at,
         "status_history": payment.status_history,
         "partial_payments": payment.partial_payments,
+        "collection_records": collection_records,
     }
 
 
@@ -3766,6 +4015,8 @@ def check_and_update_matured_payments(db: Session, lc_id: Optional[int] = None) 
 
     if count > 0:
         db.commit()
+
+    check_and_update_overdue_payments(db, lc_id)
     return count
 
 
