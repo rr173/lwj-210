@@ -392,6 +392,7 @@ def submit_documents_and_audit(db: Session, submission: schemas.SubmissionSubmit
             )
 
     documents = []
+    doc_signatures = []
     for doc_data in submission.documents:
         db_doc = models.Document(
             lc_id=lc.id,
@@ -405,11 +406,23 @@ def submit_documents_and_audit(db: Session, submission: schemas.SubmissionSubmit
         )
         db.add(db_doc)
         documents.append(db_doc)
+        doc_signatures.append(doc_data.signature)
 
     db.flush()
 
+    for i, sig_data in enumerate(doc_signatures):
+        if sig_data is not None:
+            _save_document_signature(db, documents[i].id, sig_data)
+
+    db.flush()
+
+    signature_results = {}
+    for doc in documents:
+        sig_result = verify_document_signature(db, doc)
+        signature_results[doc.id] = sig_result
+
     rule_version = resolve_rule_version_for_audit(db)
-    engine = AuditEngine(lc, documents, submission.presentation_date, rule_version=rule_version)
+    engine = AuditEngine(lc, documents, submission.presentation_date, rule_version=rule_version, signature_results=signature_results)
     conclusion, discrepancies = engine.run_audit()
 
     critical_count = sum(1 for d in discrepancies if d["severity"] == "critical")
@@ -519,6 +532,7 @@ def resubmit_documents_and_audit(db: Session, original_submission_id: str, resub
         raise ValueError(f"信用证已被冻结，无法修改重提：{freeze_reason}")
 
     documents = []
+    doc_signatures = []
     for doc_data in resubmit.documents:
         db_doc = models.Document(
             lc_id=lc.id,
@@ -532,11 +546,23 @@ def resubmit_documents_and_audit(db: Session, original_submission_id: str, resub
         )
         db.add(db_doc)
         documents.append(db_doc)
+        doc_signatures.append(doc_data.signature)
+
+    db.flush()
+
+    for i, sig_data in enumerate(doc_signatures):
+        if sig_data is not None:
+            _save_document_signature(db, documents[i].id, sig_data)
 
     db.flush()
 
     rule_version = resolve_rule_version_for_audit(db)
-    engine = AuditEngine(lc, documents, resubmit.presentation_date, rule_version=rule_version)
+    signature_results = {}
+    for doc in documents:
+        sig_result = verify_document_signature(db, doc)
+        signature_results[doc.id] = sig_result
+
+    engine = AuditEngine(lc, documents, resubmit.presentation_date, rule_version=rule_version, signature_results=signature_results)
     conclusion, discrepancies = engine.run_audit()
 
     critical_count = sum(1 for d in discrepancies if d["severity"] == "critical")
@@ -5313,6 +5339,227 @@ def migrate_fee_split_tables(db: Session) -> int:
             db.commit()
             columns_added_fee = True
             created += 2
+
+        db.commit()
+    except Exception as e:
+        db.rollback()
+    return created
+
+
+def create_signature_subject(db: Session, subject_data: schemas.SignatureSubjectCreate) -> models.SignatureSubject:
+    subject_type_value = subject_data.subject_type.value if hasattr(subject_data.subject_type, 'value') else subject_data.subject_type
+    if subject_type_value not in models.VALID_SIGNATURE_SUBJECT_TYPES:
+        raise ValueError(f"无效的主体类型: {subject_type_value}，允许值: {', '.join(models.VALID_SIGNATURE_SUBJECT_TYPES)}")
+
+    existing = db.query(models.SignatureSubject).filter(
+        models.SignatureSubject.subject_name == subject_data.subject_name
+    ).first()
+    if existing:
+        raise ValueError(f"签章主体名称已存在: {subject_data.subject_name}")
+
+    db_subject = models.SignatureSubject(
+        subject_name=subject_data.subject_name,
+        subject_type=subject_type_value,
+        public_key=subject_data.public_key,
+        status=models.SIGNATURE_SUBJECT_STATUS_ACTIVE,
+    )
+    db.add(db_subject)
+    db.commit()
+    db.refresh(db_subject)
+    return db_subject
+
+
+def get_signature_subject_by_name(db: Session, subject_name: str) -> Optional[models.SignatureSubject]:
+    return db.query(models.SignatureSubject).filter(
+        models.SignatureSubject.subject_name == subject_name
+    ).first()
+
+
+def get_signature_subject_by_id(db: Session, subject_id: int) -> Optional[models.SignatureSubject]:
+    return db.query(models.SignatureSubject).filter(
+        models.SignatureSubject.id == subject_id
+    ).first()
+
+
+def get_all_signature_subjects(
+    db: Session,
+    skip: int = 0,
+    limit: int = 100,
+    status: Optional[str] = None,
+    subject_type: Optional[str] = None,
+) -> List[models.SignatureSubject]:
+    query = db.query(models.SignatureSubject)
+    if status:
+        if status not in models.VALID_SIGNATURE_SUBJECT_STATUSES:
+            raise ValueError(f"无效的状态: {status}，允许值: {', '.join(models.VALID_SIGNATURE_SUBJECT_STATUSES)}")
+        query = query.filter(models.SignatureSubject.status == status)
+    if subject_type:
+        if subject_type not in models.VALID_SIGNATURE_SUBJECT_TYPES:
+            raise ValueError(f"无效的主体类型: {subject_type}，允许值: {', '.join(models.VALID_SIGNATURE_SUBJECT_TYPES)}")
+        query = query.filter(models.SignatureSubject.subject_type == subject_type)
+    return query.order_by(models.SignatureSubject.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def revoke_signature_subject(db: Session, subject_name: str, reason: str) -> models.SignatureSubject:
+    subject = get_signature_subject_by_name(db, subject_name)
+    if not subject:
+        raise ValueError(f"签章主体不存在: {subject_name}")
+    if subject.status == models.SIGNATURE_SUBJECT_STATUS_REVOKED:
+        raise ValueError(f"签章主体已被吊销: {subject_name}")
+
+    subject.status = models.SIGNATURE_SUBJECT_STATUS_REVOKED
+    subject.revoked_at = datetime.utcnow()
+    subject.revoked_reason = reason
+    db.commit()
+    db.refresh(subject)
+    return subject
+
+
+def _calculate_document_signature_hash(content: Dict[str, Any]) -> str:
+    import json
+    import hashlib
+    content_str = json.dumps(content, sort_keys=True, ensure_ascii=False)
+    md5_hash = hashlib.md5(content_str.encode('utf-8')).hexdigest()
+    return md5_hash[:16]
+
+
+def verify_document_signature(db: Session, document: models.Document) -> Dict[str, Any]:
+    if not document.signature:
+        return {
+            "document_id": document.id,
+            "document_type": document.document_type,
+            "verify_status": models.SIGNATURE_VERIFY_STATUS_UNSIGNED,
+            "failure_reason": None,
+            "subject_name": None,
+        }
+
+    sig = document.signature
+    subject = get_signature_subject_by_name(db, sig.subject_name)
+
+    if not subject:
+        return {
+            "document_id": document.id,
+            "document_type": document.document_type,
+            "verify_status": models.SIGNATURE_VERIFY_STATUS_INVALID,
+            "failure_reason": f"签章主体不存在: {sig.subject_name}",
+            "subject_name": sig.subject_name,
+        }
+
+    if subject.status == models.SIGNATURE_SUBJECT_STATUS_REVOKED:
+        return {
+            "document_id": document.id,
+            "document_type": document.document_type,
+            "verify_status": models.SIGNATURE_VERIFY_STATUS_INVALID,
+            "failure_reason": f"签章主体已被吊销: {sig.subject_name}",
+            "subject_name": sig.subject_name,
+        }
+
+    expected_hash = _calculate_document_signature_hash(document.content)
+    actual_prefix = sig.signature_value[:16]
+
+    if expected_hash != actual_prefix:
+        return {
+            "document_id": document.id,
+            "document_type": document.document_type,
+            "verify_status": models.SIGNATURE_VERIFY_STATUS_INVALID,
+            "failure_reason": "签名值与单据内容不匹配",
+            "subject_name": sig.subject_name,
+        }
+
+    return {
+        "document_id": document.id,
+        "document_type": document.document_type,
+        "verify_status": models.SIGNATURE_VERIFY_STATUS_VALID,
+        "failure_reason": None,
+        "subject_name": sig.subject_name,
+    }
+
+
+def verify_submission_signatures(db: Session, submission_id: str) -> Dict[str, Any]:
+    documents = get_documents_by_submission(db, submission_id)
+    if not documents:
+        raise ValueError(f"交单不存在: {submission_id}")
+
+    results = []
+    for doc in documents:
+        result = verify_document_signature(db, doc)
+        results.append(result)
+
+    return {
+        "submission_id": submission_id,
+        "results": results,
+    }
+
+
+def get_lc_signature_summary(db: Session, lc_number: str) -> Dict[str, Any]:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        raise ValueError(f"信用证不存在: {lc_number}")
+
+    audit_records = get_audit_records_by_lc(db, lc_number)
+    submission_list = []
+
+    for audit in audit_records:
+        documents = get_documents_by_submission(db, audit.submission_id)
+        doc_items = []
+        for doc in documents:
+            verify_result = verify_document_signature(db, doc)
+            doc_items.append({
+                "document_id": doc.id,
+                "document_type": doc.document_type,
+                "has_signature": doc.signature is not None,
+                "verify_status": verify_result["verify_status"],
+                "failure_reason": verify_result.get("failure_reason"),
+                "subject_name": verify_result.get("subject_name"),
+            })
+        submission_list.append({
+            "submission_id": audit.submission_id,
+            "documents": doc_items,
+        })
+
+    return {
+        "lc_number": lc_number,
+        "submissions": submission_list,
+    }
+
+
+def _save_document_signature(
+    db: Session,
+    document_id: int,
+    signature_data: Optional[schemas.DocumentSignatureCreate],
+) -> Optional[models.DocumentSignature]:
+    if not signature_data:
+        return None
+
+    db_sig = models.DocumentSignature(
+        document_id=document_id,
+        subject_name=signature_data.subject_name,
+        signature_value=signature_data.signature_value,
+        signed_at=signature_data.signed_at,
+    )
+    db.add(db_sig)
+    db.flush()
+    return db_sig
+
+
+def migrate_signature_tables(db: Session) -> int:
+    from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+
+    created = 0
+    try:
+        conn = db.connection()
+        try:
+            db.execute(text("SELECT 1 FROM signature_subjects LIMIT 1"))
+        except OperationalError:
+            models.SignatureSubject.__table__.create(bind=conn)
+            created += 1
+
+        try:
+            db.execute(text("SELECT 1 FROM document_signatures LIMIT 1"))
+        except OperationalError:
+            models.DocumentSignature.__table__.create(bind=conn)
+            created += 1
 
         db.commit()
     except Exception as e:

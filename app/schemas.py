@@ -174,6 +174,7 @@ class DocumentSubmit(BaseModel):
     original_copies_submitted: int = 0
     copy_copies_submitted: int = 0
     content: Dict[str, Any]
+    signature: Optional["DocumentSignatureCreate"] = None
 
 
 class DocumentResponse(BaseModel):
@@ -184,6 +185,7 @@ class DocumentResponse(BaseModel):
     original_copies_submitted: int
     copy_copies_submitted: int
     content: Dict[str, Any]
+    signature: Optional["DocumentSignatureResponse"] = None
 
     class Config:
         from_attributes = True
@@ -1444,3 +1446,94 @@ class MonthlyReconciliationResponse(BaseModel):
 
 
 FeeSplitDetailWithAdjustmentsResponse.model_rebuild()
+
+
+class SignatureSubjectType(str, Enum):
+    BENEFICIARY = "beneficiary"
+    BANK = "bank"
+    THIRD_PARTY = "third_party"
+
+
+class SignatureSubjectStatus(str, Enum):
+    ACTIVE = "active"
+    REVOKED = "revoked"
+
+
+class SignatureVerifyStatus(str, Enum):
+    UNSIGNED = "unsigned"
+    VALID = "valid"
+    INVALID = "invalid"
+
+
+class SignatureSubjectCreate(BaseModel):
+    subject_name: str
+    subject_type: SignatureSubjectType
+    public_key: str
+
+
+class SignatureSubjectResponse(BaseModel):
+    id: int
+    subject_name: str
+    subject_type: str
+    public_key: str
+    status: str
+    revoked_at: Optional[datetime] = None
+    revoked_reason: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class DocumentSignatureCreate(BaseModel):
+    subject_name: str
+    signature_value: str
+    signed_at: datetime
+
+
+class DocumentSignatureResponse(BaseModel):
+    id: int
+    document_id: int
+    subject_name: str
+    signature_value: str
+    signed_at: datetime
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class DocumentSignatureVerifyResult(BaseModel):
+    document_id: int
+    document_type: str
+    verify_status: str
+    failure_reason: Optional[str] = None
+    subject_name: Optional[str] = None
+
+
+class SubmissionSignatureVerifyResponse(BaseModel):
+    submission_id: str
+    results: List[DocumentSignatureVerifyResult]
+
+
+class SignatureSubjectRevokeRequest(BaseModel):
+    revoked_reason: str
+
+
+class DocumentSignatureSummaryItem(BaseModel):
+    document_id: int
+    document_type: str
+    has_signature: bool
+    verify_status: str
+    failure_reason: Optional[str] = None
+    subject_name: Optional[str] = None
+
+
+class SubmissionSignatureSummaryResponse(BaseModel):
+    submission_id: str
+    documents: List[DocumentSignatureSummaryItem]
+
+
+class LcSignatureSummaryResponse(BaseModel):
+    lc_number: str
+    submissions: List[SubmissionSignatureSummaryResponse]

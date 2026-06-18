@@ -226,6 +226,7 @@ class Document(Base):
     copy_copies_submitted = Column(Integer, default=0)
     content = Column(JSON, nullable=False)
     lc = relationship("LetterOfCredit", back_populates="documents")
+    signature = relationship("DocumentSignature", back_populates="document", uselist=False, cascade="all, delete-orphan")
 
 
 RULE_VERSION_STATUS_DRAFT = "draft"
@@ -921,3 +922,55 @@ class FeeSplitAdjustment(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     split_detail = relationship("FeeSplitDetail", back_populates="adjustments")
+
+
+SIGNATURE_SUBJECT_TYPE_BENEFICIARY = "beneficiary"
+SIGNATURE_SUBJECT_TYPE_BANK = "bank"
+SIGNATURE_SUBJECT_TYPE_THIRD_PARTY = "third_party"
+VALID_SIGNATURE_SUBJECT_TYPES = [
+    SIGNATURE_SUBJECT_TYPE_BENEFICIARY,
+    SIGNATURE_SUBJECT_TYPE_BANK,
+    SIGNATURE_SUBJECT_TYPE_THIRD_PARTY,
+]
+
+SIGNATURE_SUBJECT_STATUS_ACTIVE = "active"
+SIGNATURE_SUBJECT_STATUS_REVOKED = "revoked"
+VALID_SIGNATURE_SUBJECT_STATUSES = [
+    SIGNATURE_SUBJECT_STATUS_ACTIVE,
+    SIGNATURE_SUBJECT_STATUS_REVOKED,
+]
+
+SIGNATURE_VERIFY_STATUS_UNSIGNED = "unsigned"
+SIGNATURE_VERIFY_STATUS_VALID = "valid"
+SIGNATURE_VERIFY_STATUS_INVALID = "invalid"
+VALID_SIGNATURE_VERIFY_STATUSES = [
+    SIGNATURE_VERIFY_STATUS_UNSIGNED,
+    SIGNATURE_VERIFY_STATUS_VALID,
+    SIGNATURE_VERIFY_STATUS_INVALID,
+]
+
+
+class SignatureSubject(Base):
+    __tablename__ = "signature_subjects"
+
+    id = Column(Integer, primary_key=True, index=True)
+    subject_name = Column(String(255), unique=True, index=True, nullable=False)
+    subject_type = Column(String(30), nullable=False)
+    public_key = Column(Text, nullable=False)
+    status = Column(String(20), default=SIGNATURE_SUBJECT_STATUS_ACTIVE, nullable=False)
+    revoked_at = Column(DateTime, nullable=True)
+    revoked_reason = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class DocumentSignature(Base):
+    __tablename__ = "document_signatures"
+
+    id = Column(Integer, primary_key=True, index=True)
+    document_id = Column(Integer, ForeignKey("documents.id"), nullable=False)
+    subject_name = Column(String(255), nullable=False)
+    signature_value = Column(Text, nullable=False)
+    signed_at = Column(DateTime, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    document = relationship("Document", back_populates="signature")

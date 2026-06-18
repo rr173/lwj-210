@@ -20,12 +20,13 @@ class AuditResult:
 
 class AuditEngine:
     def __init__(self, lc: LetterOfCredit, documents: List[Document], presentation_date: date,
-                 rule_version=None):
+                 rule_version=None, signature_results: Optional[Dict[int, Dict[str, Any]]] = None):
         self.lc = lc
         self.documents = documents
         self.presentation_date = presentation_date
         self.result = AuditResult()
         self.doc_map = {d.document_type: d for d in documents}
+        self.signature_results = signature_results or {}
 
         if rule_version and hasattr(rule_version, 'rules') and rule_version.rules:
             self.rules = rule_version.rules
@@ -389,9 +390,17 @@ class AuditEngine:
 
     def check_special_terms(self):
         has_insurance_110_checked = False
+        all_docs_must_sign = False
+        all_docs_sign_term_idx = -1
+        all_docs_sign_term = ""
 
         for idx, term in enumerate(self.lc.additional_terms):
             term_lower = term.lower()
+
+            if "所有单据必须签章" in term or "all documents must be signed" in term_lower:
+                all_docs_must_sign = True
+                all_docs_sign_term_idx = idx
+                all_docs_sign_term = term
 
             if "指示抬头" in term or "to order" in term_lower:
                 bl = self._get_doc_content("bill_of_lading")
@@ -480,6 +489,25 @@ class AuditEngine:
                             "提单未填写通知方信息",
                             f"附加条款第{idx + 1}条: {term}"
                         )
+
+        if all_docs_must_sign:
+            for doc in self.documents:
+                sig_result = self.signature_results.get(doc.id)
+                if sig_result is None:
+                    severity = self._apply_severity_override("special", "unsigned_document", "minor")
+                    self.result.add(
+                        "special", severity, doc.document_type,
+                        f"单据{doc.document_type}未按要求签章",
+                        f"附加条款第{all_docs_sign_term_idx + 1}条: {all_docs_sign_term}"
+                    )
+                elif sig_result.get("verify_status") != "valid":
+                    failure_reason = sig_result.get("failure_reason", "签章无效")
+                    severity = self._apply_severity_override("special", "invalid_signature", "minor")
+                    self.result.add(
+                        "special", severity, doc.document_type,
+                        f"单据{doc.document_type}签章无效: {failure_reason}",
+                        f"附加条款第{all_docs_sign_term_idx + 1}条: {all_docs_sign_term}"
+                    )
 
     def run_audit(self) -> Tuple[str, List[Dict[str, Any]]]:
         category_check_map = {

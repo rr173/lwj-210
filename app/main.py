@@ -30,6 +30,7 @@ def create_app() -> FastAPI:
         db = next(get_db())
         try:
             crud.migrate_fee_split_tables(db)
+            crud.migrate_signature_tables(db)
         finally:
             db.close()
         seed_data()
@@ -1314,6 +1315,69 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"月度对账查询失败: {str(e)}")
+
+    @app.post("/api/signature/subjects", response_model=schemas.SignatureSubjectResponse, tags=["电子签章与验签"], status_code=status.HTTP_201_CREATED)
+    async def create_signature_subject(subject_req: schemas.SignatureSubjectCreate, db: Session = Depends(get_db)):
+        try:
+            subject = crud.create_signature_subject(db, subject_req)
+            return subject
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"创建签章主体失败: {str(e)}")
+
+    @app.get("/api/signature/subjects", response_model=List[schemas.SignatureSubjectResponse], tags=["电子签章与验签"])
+    async def list_signature_subjects(
+        subject_type: Optional[str] = None,
+        status: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 100,
+        db: Session = Depends(get_db),
+    ):
+        try:
+            return crud.list_signature_subjects(db, subject_type=subject_type, status=status, skip=skip, limit=limit)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询签章主体列表失败: {str(e)}")
+
+    @app.get("/api/signature/subjects/{subject_name}", response_model=schemas.SignatureSubjectResponse, tags=["电子签章与验签"])
+    async def get_signature_subject(subject_name: str, db: Session = Depends(get_db)):
+        subject = crud.get_signature_subject_by_name(db, subject_name)
+        if not subject:
+            raise HTTPException(status_code=404, detail=f"签章主体 {subject_name} 不存在")
+        return subject
+
+    @app.post("/api/signature/subjects/{subject_name}/revoke", response_model=schemas.SignatureSubjectResponse, tags=["电子签章与验签"])
+    async def revoke_signature_subject(
+        subject_name: str,
+        revoke_req: schemas.SignatureSubjectRevokeRequest,
+        db: Session = Depends(get_db),
+    ):
+        try:
+            subject = crud.revoke_signature_subject(db, subject_name, revoke_req.revoked_reason)
+            return subject
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"吊销签章主体失败: {str(e)}")
+
+    @app.post("/api/submissions/{submission_id}/verify-signatures", response_model=schemas.SubmissionSignatureVerifyResponse, tags=["电子签章与验签"])
+    async def verify_submission_signatures(submission_id: str, db: Session = Depends(get_db)):
+        try:
+            result = crud.verify_submission_signatures(db, submission_id)
+            return result
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"验签失败: {str(e)}")
+
+    @app.get("/api/lc/{lc_number}/signature-summary", response_model=schemas.LcSignatureSummaryResponse, tags=["电子签章与验签"])
+    async def get_lc_signature_summary(lc_number: str, db: Session = Depends(get_db)):
+        try:
+            return crud.get_lc_signature_summary(db, lc_number)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询签章状态汇总失败: {str(e)}")
 
     return app
 
