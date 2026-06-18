@@ -68,6 +68,25 @@ def create_letter_of_credit(db: Session, lc_data: schemas.LetterOfCreditCreate) 
     if penalty_rate < 0:
         raise ValueError("罚息利率不能为负数")
 
+    screening_result = screen_lc_parties_for_creation(
+        db,
+        applicant_name=lc_data.applicant_name,
+        beneficiary_name=lc_data.beneficiary_name,
+        lc_number=lc_data.lc_number,
+    )
+    if screening_result["has_hits"]:
+        hit_details = []
+        for hit in screening_result["hits"]:
+            hit_details.append({
+                "party_name": hit["party_name"],
+                "party_role": hit["party_role"],
+                "hit_blacklist_numbers": hit["hit_blacklist_numbers"],
+                "hit_details": hit["hit_details"],
+            })
+        raise ValueError(
+            f"合规筛查未通过，涉及当事人命中黑名单。命中详情: {hit_details}"
+        )
+
     currency_value = lc_data.currency.value if hasattr(lc_data.currency, 'value') else lc_data.currency
     check_and_occupy_credit_line(
         db, lc_data.applicant_name, currency_value, lc_data.amount, lc_data.lc_number
@@ -365,7 +384,7 @@ def migrate_existing_audit_records(db: Session) -> int:
     return migrated
 
 
-def submit_documents_and_audit(db: Session, submission: schemas.SubmissionSubmit):
+def submit_documents_and_audit(db: Session, submission: schemas.SubmissionSubmit) -> Dict[str, Any]:
     lc = get_letter_of_credit_by_number(db, submission.lc_number)
     if not lc:
         raise ValueError(f"信用证 {submission.lc_number} 不存在")
@@ -463,9 +482,15 @@ def submit_documents_and_audit(db: Session, submission: schemas.SubmissionSubmit
     db.flush()
     dispatch_notifications(db, lc, models.EVENT_TYPE_SUBMISSION_CREATED, event_ref_id=submission.submission_id)
 
+    compliance_result = screen_submission_parties(db, submission, lc)
+
     db.commit()
     db.refresh(audit_record)
-    return audit_record
+
+    return {
+        "audit_record": audit_record,
+        "compliance_alerts": compliance_result["compliance_alerts"],
+    }
 
 
 def get_audit_records_by_lc(db: Session, lc_number: str) -> List[models.AuditRecord]:
@@ -498,7 +523,7 @@ def get_latest_audit_record_by_original_submission(db: Session, original_submiss
 MAX_RESUBMISSION_ROUNDS = 3
 
 
-def resubmit_documents_and_audit(db: Session, original_submission_id: str, resubmit: schemas.SubmissionResubmitRequest):
+def resubmit_documents_and_audit(db: Session, original_submission_id: str, resubmit: schemas.SubmissionResubmitRequest) -> Dict[str, Any]:
     latest_record = get_latest_audit_record_by_original_submission(db, original_submission_id)
     if not latest_record:
         raise ValueError(f"交单编号 {original_submission_id} 不存在")
@@ -603,9 +628,56 @@ def resubmit_documents_and_audit(db: Session, original_submission_id: str, resub
     db.flush()
     dispatch_notifications(db, lc, models.EVENT_TYPE_SUBMISSION_CREATED, event_ref_id=resubmit.new_submission_id)
 
+    compliance_alerts = []
+    for doc in resubmit.documents:
+        if doc.document_type == "invoice":
+            content = doc.content or {}
+
+            invoice_beneficiary = content.get("beneficiary") or content.get("seller") or content.get("exporter")
+            if invoice_beneficiary:
+                result = screen_party_against_blacklist(
+                    db,
+                    party_name=invoice_beneficiary,
+                    party_role="invoice_beneficiary",
+                    screening_scene=models.SCREENING_SCENE_SUBMISSION,
+                    lc_id=lc.id,
+                    lc_number=lc.lc_number,
+                    submission_id=resubmit.new_submission_id,
+                )
+                if result["screening_result"] == models.SCREENING_RESULT_HIT:
+                    compliance_alerts.append({
+                        "party_name": invoice_beneficiary,
+                        "party_role": "invoice_beneficiary",
+                        "hit_details": result["hit_details"],
+                        "hit_blacklist_numbers": result["hit_blacklist_numbers"],
+                    })
+
+            invoice_applicant = content.get("applicant") or content.get("buyer") or content.get("importer")
+            if invoice_applicant:
+                result = screen_party_against_blacklist(
+                    db,
+                    party_name=invoice_applicant,
+                    party_role="invoice_applicant",
+                    screening_scene=models.SCREENING_SCENE_SUBMISSION,
+                    lc_id=lc.id,
+                    lc_number=lc.lc_number,
+                    submission_id=resubmit.new_submission_id,
+                )
+                if result["screening_result"] == models.SCREENING_RESULT_HIT:
+                    compliance_alerts.append({
+                        "party_name": invoice_applicant,
+                        "party_role": "invoice_applicant",
+                        "hit_details": result["hit_details"],
+                        "hit_blacklist_numbers": result["hit_blacklist_numbers"],
+                    })
+
     db.commit()
     db.refresh(audit_record)
-    return audit_record
+
+    return {
+        "audit_record": audit_record,
+        "compliance_alerts": compliance_alerts,
+    }
 
 
 def get_discrepancy_statistics(db: Session) -> List[dict]:
@@ -5559,6 +5631,709 @@ def migrate_signature_tables(db: Session) -> int:
             db.execute(text("SELECT 1 FROM document_signatures LIMIT 1"))
         except OperationalError:
             models.DocumentSignature.__table__.create(bind=conn)
+            created += 1
+
+        db.commit()
+    except Exception as e:
+        db.rollback()
+    return created
+
+
+def generate_blacklist_number(db: Session) -> str:
+    from sqlalchemy import func
+    db.flush()
+    date_str = datetime.utcnow().strftime("%Y%m%d")
+    prefix = f"BL-{date_str}-"
+    max_num = db.query(func.max(func.substr(models.BlacklistEntry.blacklist_number, len(prefix) + 1))).filter(
+        models.BlacklistEntry.blacklist_number.like(f"{prefix}%")
+    ).scalar()
+    count = int(max_num) if max_num else 0
+    return f"{prefix}{count + 1:06d}"
+
+
+def generate_screening_number(db: Session) -> str:
+    from sqlalchemy import func
+    db.flush()
+    date_str = datetime.utcnow().strftime("%Y%m%d")
+    prefix = f"SCR-{date_str}-"
+    max_num = db.query(func.max(func.substr(models.ComplianceScreeningRecord.screening_number, len(prefix) + 1))).filter(
+        models.ComplianceScreeningRecord.screening_number.like(f"{prefix}%")
+    ).scalar()
+    count = int(max_num) if max_num else 0
+    return f"{prefix}{count + 1:06d}"
+
+
+def generate_compliance_event_number(db: Session) -> str:
+    from sqlalchemy import func
+    db.flush()
+    date_str = datetime.utcnow().strftime("%Y%m%d")
+    prefix = f"CEV-{date_str}-"
+    max_num = db.query(func.max(func.substr(models.ComplianceEvent.event_number, len(prefix) + 1))).filter(
+        models.ComplianceEvent.event_number.like(f"{prefix}%")
+    ).scalar()
+    count = int(max_num) if max_num else 0
+    return f"{prefix}{count + 1:06d}"
+
+
+def create_blacklist_entry(
+    db: Session,
+    entry_data: schemas.BlacklistEntryCreate,
+) -> models.BlacklistEntry:
+    blacklist_type = entry_data.blacklist_type.value if hasattr(entry_data.blacklist_type, 'value') else entry_data.blacklist_type
+    if blacklist_type not in models.VALID_BLACKLIST_TYPES:
+        raise ValueError(f"无效的黑名单类型: {blacklist_type}，允许值: {', '.join(models.VALID_BLACKLIST_TYPES)}")
+
+    if not entry_data.name or not entry_data.name.strip():
+        raise ValueError("名称不能为空")
+
+    if not entry_data.source_organization or not entry_data.source_organization.strip():
+        raise ValueError("来源机构不能为空")
+
+    if entry_data.expiry_date and entry_data.expiry_date < entry_data.effective_date:
+        raise ValueError("失效日期不能早于生效日期")
+
+    blacklist_number = generate_blacklist_number(db)
+
+    entry = models.BlacklistEntry(
+        blacklist_number=blacklist_number,
+        name=entry_data.name.strip(),
+        name_aliases=[alias.strip() for alias in entry_data.name_aliases if alias.strip()],
+        blacklist_type=blacklist_type,
+        source_organization=entry_data.source_organization.strip(),
+        effective_date=entry_data.effective_date,
+        expiry_date=entry_data.expiry_date,
+        is_active=entry_data.is_active,
+        remarks=entry_data.remarks.strip() if entry_data.remarks else None,
+    )
+
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+    return entry
+
+
+def get_blacklist_entry_by_number(db: Session, blacklist_number: str) -> Optional[models.BlacklistEntry]:
+    return db.query(models.BlacklistEntry).filter(
+        models.BlacklistEntry.blacklist_number == blacklist_number
+    ).first()
+
+
+def get_blacklist_entry_by_id(db: Session, entry_id: int) -> Optional[models.BlacklistEntry]:
+    return db.query(models.BlacklistEntry).filter(
+        models.BlacklistEntry.id == entry_id
+    ).first()
+
+
+def get_all_blacklist_entries(
+    db: Session,
+    skip: int = 0,
+    limit: int = 100,
+    blacklist_type: Optional[str] = None,
+    is_active: Optional[bool] = None,
+    search_name: Optional[str] = None,
+) -> List[models.BlacklistEntry]:
+    query = db.query(models.BlacklistEntry)
+
+    if blacklist_type:
+        if blacklist_type not in models.VALID_BLACKLIST_TYPES:
+            raise ValueError(f"无效的黑名单类型: {blacklist_type}，允许值: {', '.join(models.VALID_BLACKLIST_TYPES)}")
+        query = query.filter(models.BlacklistEntry.blacklist_type == blacklist_type)
+
+    if is_active is not None:
+        query = query.filter(models.BlacklistEntry.is_active == is_active)
+
+    if search_name:
+        search_pattern = f"%{search_name.strip()}%"
+        query = query.filter(
+            models.BlacklistEntry.name.like(search_pattern)
+        )
+
+    return query.order_by(models.BlacklistEntry.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def update_blacklist_entry(
+    db: Session,
+    blacklist_number: str,
+    update_data: schemas.BlacklistEntryUpdate,
+) -> models.BlacklistEntry:
+    entry = get_blacklist_entry_by_number(db, blacklist_number)
+    if not entry:
+        raise ValueError(f"黑名单记录 {blacklist_number} 不存在")
+
+    update_dict = update_data.model_dump(exclude_unset=True)
+
+    if "blacklist_type" in update_dict:
+        blacklist_type = update_dict["blacklist_type"]
+        if hasattr(blacklist_type, 'value'):
+            blacklist_type = blacklist_type.value
+        if blacklist_type not in models.VALID_BLACKLIST_TYPES:
+            raise ValueError(f"无效的黑名单类型: {blacklist_type}")
+        update_dict["blacklist_type"] = blacklist_type
+
+    if "name" in update_dict and update_dict["name"]:
+        update_dict["name"] = update_dict["name"].strip()
+
+    if "name_aliases" in update_dict and update_dict["name_aliases"]:
+        update_dict["name_aliases"] = [alias.strip() for alias in update_dict["name_aliases"] if alias.strip()]
+
+    if "source_organization" in update_dict and update_dict["source_organization"]:
+        update_dict["source_organization"] = update_dict["source_organization"].strip()
+
+    if "remarks" in update_dict and update_dict["remarks"]:
+        update_dict["remarks"] = update_dict["remarks"].strip()
+
+    effective_date = update_dict.get("effective_date") or entry.effective_date
+    expiry_date = update_dict.get("expiry_date") if "expiry_date" in update_dict else entry.expiry_date
+
+    if expiry_date and effective_date and expiry_date < effective_date:
+        raise ValueError("失效日期不能早于生效日期")
+
+    for key, value in update_dict.items():
+        setattr(entry, key, value)
+
+    entry.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(entry)
+    return entry
+
+
+def delete_blacklist_entry(db: Session, blacklist_number: str) -> bool:
+    entry = get_blacklist_entry_by_number(db, blacklist_number)
+    if not entry:
+        raise ValueError(f"黑名单记录 {blacklist_number} 不存在")
+
+    db.delete(entry)
+    db.commit()
+    return True
+
+
+def batch_import_blacklist(
+    db: Session,
+    import_data: schemas.BlacklistBatchImportRequest,
+) -> Dict[str, Any]:
+    success_count = 0
+    failed_count = 0
+    success_numbers = []
+    failures = []
+
+    for i, item in enumerate(import_data.entries):
+        try:
+            blacklist_type = item.blacklist_type.value if hasattr(item.blacklist_type, 'value') else item.blacklist_type
+            if blacklist_type not in models.VALID_BLACKLIST_TYPES:
+                raise ValueError(f"无效的黑名单类型: {blacklist_type}")
+
+            if not item.name or not item.name.strip():
+                raise ValueError("名称不能为空")
+
+            if not item.source_organization or not item.source_organization.strip():
+                raise ValueError("来源机构不能为空")
+
+            if item.expiry_date and item.expiry_date < item.effective_date:
+                raise ValueError("失效日期不能早于生效日期")
+
+            blacklist_number = generate_blacklist_number(db)
+
+            entry = models.BlacklistEntry(
+                blacklist_number=blacklist_number,
+                name=item.name.strip(),
+                name_aliases=[alias.strip() for alias in item.name_aliases if alias.strip()],
+                blacklist_type=blacklist_type,
+                source_organization=item.source_organization.strip(),
+                effective_date=item.effective_date,
+                expiry_date=item.expiry_date,
+                is_active=True,
+                remarks=item.remarks.strip() if item.remarks else None,
+            )
+
+            db.add(entry)
+            db.flush()
+
+            success_count += 1
+            success_numbers.append(blacklist_number)
+
+        except Exception as e:
+            failed_count += 1
+            failures.append({
+                "index": i,
+                "name": item.name,
+                "error": str(e),
+            })
+            db.rollback()
+            continue
+
+    db.commit()
+
+    return {
+        "success_count": success_count,
+        "failed_count": failed_count,
+        "success_numbers": success_numbers,
+        "failures": failures,
+    }
+
+
+def _get_active_blacklist_entries(db: Session) -> List[models.BlacklistEntry]:
+    today = date.today()
+    return db.query(models.BlacklistEntry).filter(
+        models.BlacklistEntry.is_active == True,
+        models.BlacklistEntry.effective_date <= today,
+        (models.BlacklistEntry.expiry_date.is_(None) | (models.BlacklistEntry.expiry_date >= today)),
+        models.BlacklistEntry.name != "",
+        models.BlacklistEntry.name.isnot(None),
+    ).all()
+
+
+def _names_match(party_name: str, blacklist_name: str) -> bool:
+    if not blacklist_name or not blacklist_name.strip():
+        return False
+    if not party_name or not party_name.strip():
+        return False
+    party_lower = party_name.strip().lower()
+    blacklist_lower = blacklist_name.strip().lower()
+    return blacklist_lower in party_lower
+
+
+def screen_party_against_blacklist(
+    db: Session,
+    party_name: str,
+    party_role: str,
+    screening_scene: str,
+    lc_id: Optional[int] = None,
+    lc_number: Optional[str] = None,
+    submission_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    if screening_scene not in models.VALID_SCREENING_SCENES:
+        raise ValueError(f"无效的筛查场景: {screening_scene}，允许值: {', '.join(models.VALID_SCREENING_SCENES)}")
+
+    active_entries = _get_active_blacklist_entries(db)
+
+    hit_details = []
+    hit_blacklist_numbers = []
+
+    for entry in active_entries:
+        matched = False
+        matched_name = None
+        match_type = None
+
+        if _names_match(party_name, entry.name):
+            matched = True
+            matched_name = entry.name
+            match_type = "exact_name_match"
+
+        if not matched:
+            for alias in entry.name_aliases:
+                if _names_match(party_name, alias):
+                    matched = True
+                    matched_name = alias
+                    match_type = "alias_match"
+                    break
+
+        if matched:
+            hit_blacklist_numbers.append(entry.blacklist_number)
+            hit_details.append({
+                "blacklist_number": entry.blacklist_number,
+                "blacklist_name": entry.name,
+                "blacklist_type": entry.blacklist_type,
+                "source_organization": entry.source_organization,
+                "matched_name": matched_name,
+                "match_type": match_type,
+            })
+
+    screening_result = models.SCREENING_RESULT_HIT if hit_details else models.SCREENING_RESULT_CLEAR
+
+    screening_number = generate_screening_number(db)
+
+    screening_record = models.ComplianceScreeningRecord(
+        screening_number=screening_number,
+        screening_time=datetime.utcnow(),
+        party_name=party_name,
+        party_role=party_role,
+        screening_scene=screening_scene,
+        screening_result=screening_result,
+        hit_blacklist_numbers=hit_blacklist_numbers,
+        hit_details=hit_details,
+        lc_id=lc_id,
+        lc_number=lc_number,
+        submission_id=submission_id,
+    )
+
+    db.add(screening_record)
+    db.flush()
+
+    if hit_details:
+        for detail in hit_details:
+            event_number = generate_compliance_event_number(db)
+            event = models.ComplianceEvent(
+                event_number=event_number,
+                event_type="blacklist_hit",
+                lc_id=lc_id,
+                lc_number=lc_number,
+                submission_id=submission_id,
+                party_name=party_name,
+                party_role=party_role,
+                blacklist_type=detail["blacklist_type"],
+                hit_blacklist_numbers=[detail["blacklist_number"]],
+                hit_details=[detail],
+                status=models.COMPLIANCE_EVENT_STATUS_OPEN,
+            )
+            db.add(event)
+            db.flush()
+
+    return {
+        "screening_number": screening_number,
+        "screening_result": screening_result,
+        "hit_details": hit_details,
+        "hit_blacklist_numbers": hit_blacklist_numbers,
+    }
+
+
+def screen_lc_parties_for_creation(
+    db: Session,
+    applicant_name: str,
+    beneficiary_name: str,
+    lc_id: Optional[int] = None,
+    lc_number: Optional[str] = None,
+) -> Dict[str, Any]:
+    applicant_result = screen_party_against_blacklist(
+        db,
+        party_name=applicant_name,
+        party_role="applicant",
+        screening_scene=models.SCREENING_SCENE_LC_CREATION,
+        lc_id=lc_id,
+        lc_number=lc_number,
+    )
+    db.flush()
+
+    beneficiary_result = screen_party_against_blacklist(
+        db,
+        party_name=beneficiary_name,
+        party_role="beneficiary",
+        screening_scene=models.SCREENING_SCENE_LC_CREATION,
+        lc_id=lc_id,
+        lc_number=lc_number,
+    )
+
+    all_hits = []
+    if applicant_result["screening_result"] == models.SCREENING_RESULT_HIT:
+        all_hits.append({
+            "party_name": applicant_name,
+            "party_role": "applicant",
+            "hit_details": applicant_result["hit_details"],
+            "hit_blacklist_numbers": applicant_result["hit_blacklist_numbers"],
+        })
+
+    if beneficiary_result["screening_result"] == models.SCREENING_RESULT_HIT:
+        all_hits.append({
+            "party_name": beneficiary_name,
+            "party_role": "beneficiary",
+            "hit_details": beneficiary_result["hit_details"],
+            "hit_blacklist_numbers": beneficiary_result["hit_blacklist_numbers"],
+        })
+
+    return {
+        "has_hits": len(all_hits) > 0,
+        "hits": all_hits,
+        "applicant_screening": applicant_result,
+        "beneficiary_screening": beneficiary_result,
+    }
+
+
+def screen_submission_parties(
+    db: Session,
+    submission: schemas.SubmissionSubmit,
+    lc: models.LetterOfCredit,
+) -> Dict[str, Any]:
+    compliance_alerts = []
+
+    for doc in submission.documents:
+        if doc.document_type == "invoice":
+            content = doc.content or {}
+
+            invoice_beneficiary = content.get("beneficiary") or content.get("seller") or content.get("exporter")
+            if invoice_beneficiary:
+                result = screen_party_against_blacklist(
+                    db,
+                    party_name=invoice_beneficiary,
+                    party_role="invoice_beneficiary",
+                    screening_scene=models.SCREENING_SCENE_SUBMISSION,
+                    lc_id=lc.id,
+                    lc_number=lc.lc_number,
+                    submission_id=submission.submission_id,
+                )
+                if result["screening_result"] == models.SCREENING_RESULT_HIT:
+                    compliance_alerts.append({
+                        "party_name": invoice_beneficiary,
+                        "party_role": "invoice_beneficiary",
+                        "hit_details": result["hit_details"],
+                        "hit_blacklist_numbers": result["hit_blacklist_numbers"],
+                    })
+
+            invoice_applicant = content.get("applicant") or content.get("buyer") or content.get("importer")
+            if invoice_applicant:
+                result = screen_party_against_blacklist(
+                    db,
+                    party_name=invoice_applicant,
+                    party_role="invoice_applicant",
+                    screening_scene=models.SCREENING_SCENE_SUBMISSION,
+                    lc_id=lc.id,
+                    lc_number=lc.lc_number,
+                    submission_id=submission.submission_id,
+                )
+                if result["screening_result"] == models.SCREENING_RESULT_HIT:
+                    compliance_alerts.append({
+                        "party_name": invoice_applicant,
+                        "party_role": "invoice_applicant",
+                        "hit_details": result["hit_details"],
+                        "hit_blacklist_numbers": result["hit_blacklist_numbers"],
+                    })
+
+    return {
+        "compliance_alerts": compliance_alerts,
+    }
+
+
+def get_screening_records_by_lc(
+    db: Session,
+    lc_number: str,
+    skip: int = 0,
+    limit: int = 100,
+) -> List[models.ComplianceScreeningRecord]:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        raise ValueError(f"信用证 {lc_number} 不存在")
+
+    return db.query(models.ComplianceScreeningRecord).filter(
+        models.ComplianceScreeningRecord.lc_id == lc.id
+    ).order_by(models.ComplianceScreeningRecord.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def get_screening_records_by_submission(
+    db: Session,
+    submission_id: str,
+) -> List[models.ComplianceScreeningRecord]:
+    return db.query(models.ComplianceScreeningRecord).filter(
+        models.ComplianceScreeningRecord.submission_id == submission_id
+    ).order_by(models.ComplianceScreeningRecord.created_at.desc()).all()
+
+
+def get_screening_record_by_number(
+    db: Session,
+    screening_number: str,
+) -> Optional[models.ComplianceScreeningRecord]:
+    return db.query(models.ComplianceScreeningRecord).filter(
+        models.ComplianceScreeningRecord.screening_number == screening_number
+    ).first()
+
+
+def get_hit_statistics(
+    db: Session,
+    start_date: date,
+    end_date: date,
+) -> Dict[str, Any]:
+    if start_date > end_date:
+        raise ValueError("开始日期不能大于结束日期")
+
+    start_dt = datetime.combine(start_date, datetime.min.time())
+    end_dt = datetime.combine(end_date, datetime.max.time())
+
+    hit_records = db.query(models.ComplianceScreeningRecord).filter(
+        models.ComplianceScreeningRecord.screening_result == models.SCREENING_RESULT_HIT,
+        models.ComplianceScreeningRecord.screening_time >= start_dt,
+        models.ComplianceScreeningRecord.screening_time <= end_dt,
+    ).all()
+
+    total_hit_count = len(hit_records)
+
+    type_counts = {}
+    for bl_type in models.VALID_BLACKLIST_TYPES:
+        type_counts[bl_type] = 0
+
+    blacklist_numbers = set()
+    for record in hit_records:
+        for bl_num in record.hit_blacklist_numbers:
+            blacklist_numbers.add(bl_num)
+
+    if blacklist_numbers:
+        blacklist_entries = db.query(models.BlacklistEntry).filter(
+            models.BlacklistEntry.blacklist_number.in_(list(blacklist_numbers))
+        ).all()
+        bl_type_map = {
+            entry.blacklist_number: entry.blacklist_type
+            for entry in blacklist_entries
+        }
+    else:
+        bl_type_map = {}
+
+    for record in hit_records:
+        record_types = set()
+        for bl_num in record.hit_blacklist_numbers:
+            bl_type = bl_type_map.get(bl_num)
+            if bl_type and bl_type in type_counts and bl_type not in record_types:
+                record_types.add(bl_type)
+                type_counts[bl_type] += 1
+
+    by_type = [
+        {"blacklist_type": bl_type, "hit_count": count}
+        for bl_type, count in type_counts.items()
+    ]
+
+    return {
+        "start_date": start_date,
+        "end_date": end_date,
+        "total_hit_count": total_hit_count,
+        "by_type": by_type,
+    }
+
+
+def get_all_compliance_events(
+    db: Session,
+    skip: int = 0,
+    limit: int = 100,
+    status: Optional[str] = None,
+    blacklist_type: Optional[str] = None,
+) -> List[models.ComplianceEvent]:
+    query = db.query(models.ComplianceEvent)
+
+    if status:
+        if status not in models.VALID_COMPLIANCE_EVENT_STATUSES:
+            raise ValueError(f"无效的事件状态: {status}，允许值: {', '.join(models.VALID_COMPLIANCE_EVENT_STATUSES)}")
+        query = query.filter(models.ComplianceEvent.status == status)
+
+    if blacklist_type:
+        if blacklist_type not in models.VALID_BLACKLIST_TYPES:
+            raise ValueError(f"无效的黑名单类型: {blacklist_type}")
+        query = query.filter(models.ComplianceEvent.blacklist_type == blacklist_type)
+
+    return query.order_by(models.ComplianceEvent.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def handle_compliance_event(
+    db: Session,
+    event_number: str,
+    status: str,
+    handled_by: str,
+    remarks: Optional[str] = None,
+) -> models.ComplianceEvent:
+    event = db.query(models.ComplianceEvent).filter(
+        models.ComplianceEvent.event_number == event_number
+    ).first()
+
+    if not event:
+        raise ValueError(f"合规事件 {event_number} 不存在")
+
+    if status not in models.VALID_COMPLIANCE_EVENT_STATUSES:
+        raise ValueError(f"无效的事件状态: {status}，允许值: {', '.join(models.VALID_COMPLIANCE_EVENT_STATUSES)}")
+
+    event.status = status
+    event.handled_by = handled_by
+    event.handled_at = datetime.utcnow()
+    if remarks:
+        event.remarks = remarks.strip()
+
+    db.commit()
+    db.refresh(event)
+    return event
+
+
+def list_blacklist_entries(
+    db: Session,
+    blacklist_type: Optional[str] = None,
+    is_active: Optional[bool] = None,
+    search_name: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+) -> List[models.BlacklistEntry]:
+    query = db.query(models.BlacklistEntry)
+
+    if blacklist_type:
+        query = query.filter(models.BlacklistEntry.blacklist_type == blacklist_type)
+
+    if is_active is not None:
+        query = query.filter(models.BlacklistEntry.is_active == is_active)
+
+    if search_name:
+        search_lower = search_name.lower()
+        query = query.filter(
+            func.lower(models.BlacklistEntry.name).contains(search_lower)
+        )
+
+    return query.order_by(models.BlacklistEntry.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def get_screening_records_by_lc_number(
+    db: Session,
+    lc_number: str,
+) -> List[models.ComplianceScreeningRecord]:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        raise ValueError(f"信用证 {lc_number} 不存在")
+
+    return db.query(models.ComplianceScreeningRecord).filter(
+        models.ComplianceScreeningRecord.lc_number == lc_number
+    ).order_by(models.ComplianceScreeningRecord.created_at.desc()).all()
+
+
+def get_compliance_event_by_number(
+    db: Session,
+    event_number: str,
+) -> Optional[models.ComplianceEvent]:
+    return db.query(models.ComplianceEvent).filter(
+        models.ComplianceEvent.event_number == event_number
+    ).first()
+
+
+def list_compliance_events(
+    db: Session,
+    status: Optional[str] = None,
+    blacklist_type: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 100,
+) -> List[models.ComplianceEvent]:
+    return get_all_compliance_events(
+        db, skip=skip, limit=limit, status=status, blacklist_type=blacklist_type)
+
+
+def update_compliance_event_status(
+    db: Session,
+    event_number: str,
+    status: str,
+    notes: Optional[str] = None,
+) -> models.ComplianceEvent:
+    return handle_compliance_event(
+        db, event_number, status, handled_by="system", remarks=notes)
+
+
+def get_blacklist_hit_statistics(
+    db: Session,
+    start_date: date,
+    end_date: date,
+    group_by_type: bool = True,
+) -> Dict[str, Any]:
+    return get_hit_statistics(db, start_date, end_date)
+
+
+def migrate_compliance_tables(db: Session) -> int:
+    from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+
+    created = 0
+    try:
+        conn = db.connection()
+        try:
+            db.execute(text("SELECT 1 FROM blacklist_entries LIMIT 1"))
+        except OperationalError:
+            models.BlacklistEntry.__table__.create(bind=conn)
+            created += 1
+
+        try:
+            db.execute(text("SELECT 1 FROM compliance_screening_records LIMIT 1"))
+        except OperationalError:
+            models.ComplianceScreeningRecord.__table__.create(bind=conn)
+            created += 1
+
+        try:
+            db.execute(text("SELECT 1 FROM compliance_events LIMIT 1"))
+        except OperationalError:
+            models.ComplianceEvent.__table__.create(bind=conn)
             created += 1
 
         db.commit()

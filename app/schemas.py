@@ -1537,3 +1537,166 @@ class SubmissionSignatureSummaryResponse(BaseModel):
 class LcSignatureSummaryResponse(BaseModel):
     lc_number: str
     submissions: List[SubmissionSignatureSummaryResponse]
+
+
+class BlacklistType(str, Enum):
+    SANCTIONS = "sanctions"
+    PEP = "pep"
+    ADVERSE_MEDIA = "adverse_media"
+
+
+class ScreeningScene(str, Enum):
+    LC_CREATION = "lc_creation"
+    SUBMISSION = "submission"
+
+
+class ScreeningResult(str, Enum):
+    HIT = "hit"
+    CLEAR = "clear"
+
+
+class ComplianceEventStatus(str, Enum):
+    OPEN = "open"
+    INVESTIGATING = "investigating"
+    CLOSED = "closed"
+    REVIEWED = "reviewed"
+
+
+class HitDetail(BaseModel):
+    blacklist_number: str
+    blacklist_name: str
+    blacklist_type: str
+    source_organization: str
+    matched_name: str
+    match_type: str
+
+
+class BlacklistEntryCreate(BaseModel):
+    name: str
+    name_aliases: List[str] = []
+    blacklist_type: BlacklistType
+    source_organization: str
+    effective_date: date
+    expiry_date: Optional[date] = None
+    is_active: bool = True
+    remarks: Optional[str] = None
+
+
+class BlacklistEntryUpdate(BaseModel):
+    name: Optional[str] = None
+    name_aliases: Optional[List[str]] = None
+    blacklist_type: Optional[BlacklistType] = None
+    source_organization: Optional[str] = None
+    effective_date: Optional[date] = None
+    expiry_date: Optional[date] = None
+    is_active: Optional[bool] = None
+    remarks: Optional[str] = None
+
+
+class BlacklistEntryResponse(BaseModel):
+    id: int
+    blacklist_number: str
+    name: str
+    name_aliases: List[str]
+    blacklist_type: str
+    source_organization: str
+    effective_date: date
+    expiry_date: Optional[date] = None
+    is_active: bool
+    remarks: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class BlacklistBatchImportItem(BaseModel):
+    name: str
+    name_aliases: List[str] = []
+    blacklist_type: BlacklistType
+    source_organization: str
+    effective_date: date
+    expiry_date: Optional[date] = None
+    remarks: Optional[str] = None
+
+
+class BlacklistBatchImportRequest(BaseModel):
+    entries: List[BlacklistBatchImportItem]
+
+
+class BlacklistBatchImportResponse(BaseModel):
+    success_count: int
+    failed_count: int
+    success_numbers: List[str]
+    failures: List[Dict[str, Any]]
+
+
+class ComplianceScreeningRecordResponse(BaseModel):
+    id: int
+    screening_number: str
+    screening_time: datetime
+    party_name: str
+    party_role: Optional[str] = None
+    screening_scene: str
+    screening_result: str
+    hit_blacklist_numbers: List[str]
+    hit_details: List[HitDetail]
+    lc_id: Optional[int] = None
+    lc_number: Optional[str] = None
+    submission_id: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ComplianceAlert(BaseModel):
+    party_name: str
+    party_role: str
+    hit_blacklist_numbers: List[str]
+    hit_details: List[HitDetail]
+
+
+class AuditRecordWithComplianceResponse(AuditRecordResponse):
+    compliance_alerts: List[ComplianceAlert] = []
+
+
+class ComplianceEventStatusUpdate(BaseModel):
+    status: ComplianceEventStatus
+    notes: Optional[str] = None
+
+
+class ComplianceEventResponse(BaseModel):
+    id: int
+    event_number: str
+    event_type: str
+    lc_id: Optional[int] = None
+    lc_number: Optional[str] = None
+    submission_id: Optional[str] = None
+    party_name: str
+    party_role: Optional[str] = None
+    blacklist_type: str
+    hit_blacklist_numbers: List[str]
+    hit_details: List[HitDetail]
+    status: str
+    remarks: Optional[str] = None
+    handled_by: Optional[str] = None
+    handled_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class HitStatsByType(BaseModel):
+    blacklist_type: str
+    hit_count: int
+
+
+class ComplianceHitStatisticsResponse(BaseModel):
+    start_date: date
+    end_date: date
+    total_hit_count: int
+    by_type: List[HitStatsByType]

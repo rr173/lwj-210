@@ -179,6 +179,7 @@ class LetterOfCredit(Base):
     freeze_records = relationship("LCFreezeRecord", back_populates="lc", cascade="all, delete-orphan", order_by="LCFreezeRecord.created_at.desc()")
     payments = relationship("Payment", back_populates="lc", cascade="all, delete-orphan", order_by="Payment.created_at.desc()")
     templates = relationship("DocumentTemplate", back_populates="lc", cascade="all, delete-orphan", order_by="DocumentTemplate.created_at.desc()")
+    screening_records = relationship("ComplianceScreeningRecord", back_populates="lc", cascade="all, delete-orphan", order_by="ComplianceScreeningRecord.created_at.desc()")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -974,3 +975,97 @@ class DocumentSignature(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     document = relationship("Document", back_populates="signature")
+
+
+BLACKLIST_TYPE_SANCTIONS = "sanctions"
+BLACKLIST_TYPE_PEP = "pep"
+BLACKLIST_TYPE_ADVERSE_MEDIA = "adverse_media"
+VALID_BLACKLIST_TYPES = [
+    BLACKLIST_TYPE_SANCTIONS,
+    BLACKLIST_TYPE_PEP,
+    BLACKLIST_TYPE_ADVERSE_MEDIA,
+]
+
+SCREENING_SCENE_LC_CREATION = "lc_creation"
+SCREENING_SCENE_SUBMISSION = "submission"
+VALID_SCREENING_SCENES = [
+    SCREENING_SCENE_LC_CREATION,
+    SCREENING_SCENE_SUBMISSION,
+]
+
+SCREENING_RESULT_HIT = "hit"
+SCREENING_RESULT_CLEAR = "clear"
+VALID_SCREENING_RESULTS = [
+    SCREENING_RESULT_HIT,
+    SCREENING_RESULT_CLEAR,
+]
+
+COMPLIANCE_EVENT_STATUS_OPEN = "open"
+COMPLIANCE_EVENT_STATUS_INVESTIGATING = "investigating"
+COMPLIANCE_EVENT_STATUS_CLOSED = "closed"
+COMPLIANCE_EVENT_STATUS_REVIEWED = "reviewed"
+VALID_COMPLIANCE_EVENT_STATUSES = [
+    COMPLIANCE_EVENT_STATUS_OPEN,
+    COMPLIANCE_EVENT_STATUS_INVESTIGATING,
+    COMPLIANCE_EVENT_STATUS_CLOSED,
+    COMPLIANCE_EVENT_STATUS_REVIEWED,
+]
+
+
+class BlacklistEntry(Base):
+    __tablename__ = "blacklist_entries"
+
+    id = Column(Integer, primary_key=True, index=True)
+    blacklist_number = Column(String(100), unique=True, index=True, nullable=False)
+    name = Column(String(255), index=True, nullable=False)
+    name_aliases = Column(JSON, default=list)
+    blacklist_type = Column(String(30), index=True, nullable=False)
+    source_organization = Column(String(255), nullable=False)
+    effective_date = Column(Date, nullable=False)
+    expiry_date = Column(Date, nullable=True)
+    is_active = Column(Boolean, default=True, nullable=False)
+    remarks = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ComplianceScreeningRecord(Base):
+    __tablename__ = "compliance_screening_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    screening_number = Column(String(100), unique=True, index=True, nullable=False)
+    screening_time = Column(DateTime, default=datetime.utcnow, nullable=False)
+    party_name = Column(String(255), index=True, nullable=False)
+    party_role = Column(String(50), nullable=True)
+    screening_scene = Column(String(30), index=True, nullable=False)
+    screening_result = Column(String(20), index=True, nullable=False)
+    hit_blacklist_numbers = Column(JSON, default=list)
+    hit_details = Column(JSON, default=list)
+    lc_id = Column(Integer, ForeignKey("letter_of_credits.id"), nullable=True)
+    lc_number = Column(String(100), index=True, nullable=True)
+    submission_id = Column(String(100), index=True, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    lc = relationship("LetterOfCredit", back_populates="screening_records")
+
+
+class ComplianceEvent(Base):
+    __tablename__ = "compliance_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_number = Column(String(100), unique=True, index=True, nullable=False)
+    event_type = Column(String(50), nullable=False)
+    lc_id = Column(Integer, ForeignKey("letter_of_credits.id"), nullable=True)
+    lc_number = Column(String(100), index=True, nullable=True)
+    submission_id = Column(String(100), index=True, nullable=True)
+    party_name = Column(String(255), nullable=False)
+    party_role = Column(String(50), nullable=True)
+    blacklist_type = Column(String(30), nullable=False)
+    hit_blacklist_numbers = Column(JSON, default=list)
+    hit_details = Column(JSON, default=list)
+    status = Column(String(20), default=COMPLIANCE_EVENT_STATUS_OPEN, nullable=False)
+    remarks = Column(Text, nullable=True)
+    handled_by = Column(String(100), nullable=True)
+    handled_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

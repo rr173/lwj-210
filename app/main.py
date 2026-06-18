@@ -31,6 +31,7 @@ def create_app() -> FastAPI:
         try:
             crud.migrate_fee_split_tables(db)
             crud.migrate_signature_tables(db)
+            crud.migrate_compliance_tables(db)
         finally:
             db.close()
         seed_data()
@@ -96,11 +97,14 @@ def create_app() -> FastAPI:
         crud.delete_letter_of_credit(db, lc.id)
         return {"message": f"信用证 {lc_number} 已删除"}
 
-    @app.post("/api/submission", response_model=schemas.AuditRecordResponse, tags=["单据提交与审核"], status_code=status.HTTP_201_CREATED)
+    @app.post("/api/submission", response_model=schemas.AuditRecordWithComplianceResponse, tags=["单据提交与审核"], status_code=status.HTTP_201_CREATED)
     async def submit_and_audit(submission: schemas.SubmissionSubmit, db: Session = Depends(get_db)):
         try:
-            audit_record = crud.submit_documents_and_audit(db, submission)
-            return audit_record
+            result = crud.submit_documents_and_audit(db, submission)
+            return {
+                **result["audit_record"].__dict__,
+                "compliance_alerts": result["compliance_alerts"],
+            }
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
@@ -137,11 +141,14 @@ def create_app() -> FastAPI:
             "documents": documents
         }
 
-    @app.post("/api/submission/{submission_id}/resubmit", response_model=schemas.AuditRecordResponse, tags=["修改重提"], status_code=status.HTTP_201_CREATED)
+    @app.post("/api/submission/{submission_id}/resubmit", response_model=schemas.AuditRecordWithComplianceResponse, tags=["修改重提"], status_code=status.HTTP_201_CREATED)
     async def resubmit_submission(submission_id: str, resubmit: schemas.SubmissionResubmitRequest, db: Session = Depends(get_db)):
         try:
-            audit_record = crud.resubmit_documents_and_audit(db, submission_id, resubmit)
-            return audit_record
+            result = crud.resubmit_documents_and_audit(db, submission_id, resubmit)
+            return {
+                **result["audit_record"].__dict__,
+                "compliance_alerts": result["compliance_alerts"],
+            }
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
@@ -1378,6 +1385,136 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail=str(e))
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"查询签章状态汇总失败: {str(e)}")
+
+    @app.post("/api/blacklist", response_model=schemas.BlacklistEntryResponse, tags=["黑名单管理"], status_code=status.HTTP_201_CREATED)
+    async def create_blacklist_entry(entry: schemas.BlacklistEntryCreate, db: Session = Depends(get_db)):
+        try:
+            return crud.create_blacklist_entry(db, entry)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"创建黑名单条目失败: {str(e)}")
+
+    @app.get("/api/blacklist", response_model=List[schemas.BlacklistEntryResponse], tags=["黑名单管理"])
+    async def list_blacklist_entries(
+        blacklist_type: Optional[schemas.BlacklistType] = None,
+        is_active: Optional[bool] = None,
+        search_name: Optional[str] = None,
+        skip: int = 0,
+        limit: int = 100,
+        db: Session = Depends(get_db),
+    ):
+        try:
+            return crud.list_blacklist_entries(
+                db,
+                blacklist_type=blacklist_type,
+                is_active=is_active,
+                search_name=search_name,
+                skip=skip,
+                limit=limit,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询黑名单列表失败: {str(e)}")
+
+    @app.get("/api/blacklist/{blacklist_number}", response_model=schemas.BlacklistEntryResponse, tags=["黑名单管理"])
+    async def get_blacklist_entry(blacklist_number: str, db: Session = Depends(get_db)):
+        entry = crud.get_blacklist_entry_by_number(db, blacklist_number)
+        if not entry:
+            raise HTTPException(status_code=404, detail=f"黑名单编号 {blacklist_number} 不存在")
+        return entry
+
+    @app.put("/api/blacklist/{blacklist_number}", response_model=schemas.BlacklistEntryResponse, tags=["黑名单管理"])
+    async def update_blacklist_entry(blacklist_number: str, entry: schemas.BlacklistEntryUpdate, db: Session = Depends(get_db)):
+        try:
+            return crud.update_blacklist_entry(db, blacklist_number, entry)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"更新黑名单条目失败: {str(e)}")
+
+    @app.delete("/api/blacklist/{blacklist_number}", tags=["黑名单管理"])
+    async def delete_blacklist_entry(blacklist_number: str, db: Session = Depends(get_db)):
+        try:
+            crud.delete_blacklist_entry(db, blacklist_number)
+            return {"message": f"黑名单条目 {blacklist_number} 已删除"}
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"删除黑名单条目失败: {str(e)}")
+
+    @app.post("/api/blacklist/batch", response_model=schemas.BlacklistBatchImportResponse, tags=["黑名单管理"], status_code=status.HTTP_201_CREATED)
+    async def batch_import_blacklist(import_req: schemas.BlacklistBatchImportRequest, db: Session = Depends(get_db)):
+        try:
+            return crud.batch_import_blacklist(db, import_req)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"批量导入黑名单失败: {str(e)}")
+
+    @app.get("/api/compliance/screenings/lc/{lc_number}", response_model=List[schemas.ComplianceScreeningRecordResponse], tags=["合规筛查记录"])
+    async def get_screening_records_by_lc(lc_number: str, db: Session = Depends(get_db)):
+        try:
+            return crud.get_screening_records_by_lc_number(db, lc_number)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询筛查记录失败: {str(e)}")
+
+    @app.get("/api/compliance/screenings/{screening_number}", response_model=schemas.ComplianceScreeningRecordResponse, tags=["合规筛查记录"])
+    async def get_screening_record(screening_number: str, db: Session = Depends(get_db)):
+        record = crud.get_screening_record_by_number(db, screening_number)
+        if not record:
+            raise HTTPException(status_code=404, detail=f"筛查编号 {screening_number} 不存在")
+        return record
+
+    @app.get("/api/compliance/events", response_model=List[schemas.ComplianceEventResponse], tags=["合规事件"])
+    async def list_compliance_events(
+        status: Optional[schemas.ComplianceEventStatus] = None,
+        blacklist_type: Optional[schemas.BlacklistType] = None,
+        skip: int = 0,
+        limit: int = 100,
+        db: Session = Depends(get_db),
+    ):
+        try:
+            return crud.list_compliance_events(
+                db,
+                status=status,
+                blacklist_type=blacklist_type,
+                skip=skip,
+                limit=limit,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询合规事件列表失败: {str(e)}")
+
+    @app.get("/api/compliance/events/{event_number}", response_model=schemas.ComplianceEventResponse, tags=["合规事件"])
+    async def get_compliance_event(event_number: str, db: Session = Depends(get_db)):
+        event = crud.get_compliance_event_by_number(db, event_number)
+        if not event:
+            raise HTTPException(status_code=404, detail=f"合规事件编号 {event_number} 不存在")
+        return event
+
+    @app.put("/api/compliance/events/{event_number}/status", response_model=schemas.ComplianceEventResponse, tags=["合规事件"])
+    async def update_compliance_event_status(event_number: str, req: schemas.ComplianceEventStatusUpdate, db: Session = Depends(get_db)):
+        try:
+            return crud.update_compliance_event_status(db, event_number, req.status, req.notes)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"更新合规事件状态失败: {str(e)}")
+
+    @app.get("/api/compliance/stats/hits", response_model=schemas.ComplianceHitStatisticsResponse, tags=["合规统计"])
+    async def get_blacklist_hit_statistics(
+        start_date: date,
+        end_date: date,
+        group_by_type: bool = True,
+        db: Session = Depends(get_db),
+    ):
+        try:
+            if start_date > end_date:
+                raise HTTPException(status_code=400, detail="开始日期不能大于结束日期")
+            return crud.get_blacklist_hit_statistics(db, start_date, end_date, group_by_type)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询命中统计失败: {str(e)}")
 
     return app
 
