@@ -281,9 +281,13 @@ def create_fee_record(
         document_fee_total=fee_details["document_fee_total"],
         total_amount=fee_details["total_amount"],
         status=fee_status,
+        settlement_status=models.FEE_SETTLEMENT_STATUS_PENDING,
     )
     db.add(fee_record)
     db.flush()
+
+    auto_generate_fee_split_details(db, fee_record)
+
     return fee_record
 
 
@@ -4765,3 +4769,552 @@ def get_queue_status(db: Session) -> Dict[str, Any]:
         "total_waiting": len(waiting_entries),
         "by_priority": by_priority,
     }
+
+
+def generate_split_rule_number(db: Session, lc_number: str) -> str:
+    import uuid
+    date_str = datetime.utcnow().strftime("%Y%m%d")
+    suffix = uuid.uuid4().hex[:8].upper()
+    return f"SPLIT-RULE-{lc_number}-{date_str}-{suffix}"
+
+
+def generate_split_number(db: Session, fee_number: str) -> str:
+    import uuid
+    date_str = datetime.utcnow().strftime("%Y%m%d")
+    suffix = uuid.uuid4().hex[:8].upper()
+    return f"SPLIT-{fee_number}-{date_str}-{suffix}"
+
+
+def generate_adjustment_number(db: Session, split_number: str) -> str:
+    import uuid
+    date_str = datetime.utcnow().strftime("%Y%m%d")
+    suffix = uuid.uuid4().hex[:8].upper()
+    return f"ADJ-{split_number}-{date_str}-{suffix}"
+
+
+def _validate_participating_banks(banks_data: List[Dict[str, Any]]) -> None:
+    if not banks_data or len(banks_data) == 0:
+        raise ValueError("至少需要指定一家参与银行")
+
+    seen_roles = set()
+    seen_banks = set()
+    total_ratio = 0.0
+
+    for bank in banks_data:
+        role = bank.get("role")
+        bank_name = bank.get("bank_name")
+        split_ratio = bank.get("split_ratio")
+
+        if role not in models.VALID_FEE_SPLIT_ROLES:
+            raise ValueError(f"无效的银行角色: {role}，允许的值: {', '.join(models.VALID_FEE_SPLIT_ROLES)}")
+        if not bank_name or not bank_name.strip():
+            raise ValueError("银行名称不能为空")
+        if split_ratio is None or split_ratio < 0 or split_ratio > 100:
+            raise ValueError(f"分账比例必须在 0-100 之间，当前值: {split_ratio}")
+        if role in seen_roles:
+            raise ValueError(f"银行角色 '{role}' 重复出现")
+        if bank_name.strip() in seen_banks:
+            raise ValueError(f"银行名称 '{bank_name}' 重复出现")
+
+        seen_roles.add(role)
+        seen_banks.add(bank_name.strip())
+        total_ratio += float(split_ratio)
+
+    if abs(total_ratio - 100.0) > 0.01:
+        raise ValueError(f"所有参与行的分账比例之和必须等于100%，当前总和: {total_ratio:.2f}%")
+
+
+def create_fee_split_rule(
+    db: Session,
+    lc_number: str,
+    participating_banks: List[Dict[str, Any]],
+) -> models.FeeSplitRule:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        raise ValueError(f"信用证 {lc_number} 不存在")
+
+    existing_active = db.query(models.FeeSplitRule).filter(
+        models.FeeSplitRule.lc_id == lc.id,
+        models.FeeSplitRule.status == models.FEE_SPLIT_RULE_STATUS_ACTIVE,
+    ).first()
+    if existing_active:
+        raise ValueError(
+            f"信用证 {lc_number} 已有一条生效的分账规则 (编号: {existing_active.rule_number})，"
+            f"如需修改请先作废现有规则再重新创建"
+        )
+
+    banks_normalized = []
+    for b in participating_banks:
+        role = b["role"].value if hasattr(b["role"], "value") else b["role"]
+        banks_normalized.append({
+            "role": role,
+            "bank_name": b["bank_name"].strip(),
+            "split_ratio": float(b["split_ratio"]),
+        })
+
+    _validate_participating_banks(banks_normalized)
+
+    rule_number = generate_split_rule_number(db, lc_number)
+
+    rule = models.FeeSplitRule(
+        rule_number=rule_number,
+        lc_id=lc.id,
+        lc_number=lc_number,
+        participating_banks=banks_normalized,
+        status=models.FEE_SPLIT_RULE_STATUS_ACTIVE,
+    )
+    db.add(rule)
+    db.flush()
+
+    existing_fees = db.query(models.FeeRecord).filter(
+        models.FeeRecord.lc_id == lc.id,
+    ).all()
+    for fee in existing_fees:
+        existing_splits = db.query(models.FeeSplitDetail).filter(
+            models.FeeSplitDetail.fee_record_id == fee.id,
+        ).first()
+        if not existing_splits:
+            auto_generate_fee_split_details_for_rule(db, fee, rule)
+
+    db.commit()
+    db.refresh(rule)
+    return rule
+
+
+def get_fee_split_rule_by_id(db: Session, rule_id: int) -> Optional[models.FeeSplitRule]:
+    return db.query(models.FeeSplitRule).filter(models.FeeSplitRule.id == rule_id).first()
+
+
+def get_fee_split_rule_by_number(db: Session, rule_number: str) -> Optional[models.FeeSplitRule]:
+    return db.query(models.FeeSplitRule).filter(models.FeeSplitRule.rule_number == rule_number).first()
+
+
+def get_active_fee_split_rule_by_lc(db: Session, lc_number: str) -> Optional[models.FeeSplitRule]:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        return None
+    return db.query(models.FeeSplitRule).filter(
+        models.FeeSplitRule.lc_id == lc.id,
+        models.FeeSplitRule.status == models.FEE_SPLIT_RULE_STATUS_ACTIVE,
+    ).first()
+
+
+def get_all_fee_split_rules_by_lc(db: Session, lc_number: str) -> List[models.FeeSplitRule]:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        return []
+    return db.query(models.FeeSplitRule).filter(
+        models.FeeSplitRule.lc_id == lc.id,
+    ).order_by(models.FeeSplitRule.created_at.desc()).all()
+
+
+def void_fee_split_rule(
+    db: Session,
+    rule_number: str,
+    void_reason: str,
+    voided_by: str,
+) -> models.FeeSplitRule:
+    rule = get_fee_split_rule_by_number(db, rule_number)
+    if not rule:
+        raise ValueError(f"分账规则 {rule_number} 不存在")
+    if rule.status == models.FEE_SPLIT_RULE_STATUS_VOID:
+        raise ValueError(f"分账规则 {rule_number} 已经是作废状态")
+
+    rule.status = models.FEE_SPLIT_RULE_STATUS_VOID
+    rule.void_reason = void_reason
+    rule.voided_at = datetime.utcnow()
+    rule.voided_by = voided_by
+
+    db.commit()
+    db.refresh(rule)
+    return rule
+
+
+def auto_generate_fee_split_details(db: Session, fee_record: models.FeeRecord) -> None:
+    rule = db.query(models.FeeSplitRule).filter(
+        models.FeeSplitRule.lc_id == fee_record.lc_id,
+        models.FeeSplitRule.status == models.FEE_SPLIT_RULE_STATUS_ACTIVE,
+    ).first()
+    if not rule:
+        return
+
+    auto_generate_fee_split_details_for_rule(db, fee_record, rule)
+
+
+def auto_generate_fee_split_details_for_rule(
+    db: Session,
+    fee_record: models.FeeRecord,
+    rule: models.FeeSplitRule,
+) -> None:
+    total_amount = fee_record.total_amount
+    banks = rule.participating_banks
+
+    allocated = 0.0
+    split_details = []
+
+    for i, bank in enumerate(banks):
+        ratio = float(bank["split_ratio"])
+        if i == len(banks) - 1:
+            amount = round(total_amount - allocated, 2)
+        else:
+            amount = round(total_amount * ratio / 100.0, 2)
+            allocated += amount
+
+        split_number = generate_split_number(db, fee_record.fee_number)
+
+        detail = models.FeeSplitDetail(
+            split_number=split_number,
+            split_rule_id=rule.id,
+            fee_record_id=fee_record.id,
+            fee_number=fee_record.fee_number,
+            lc_id=fee_record.lc_id,
+            lc_number=rule.lc_number,
+            receiving_bank_name=bank["bank_name"],
+            receiving_bank_role=bank["role"],
+            split_ratio=ratio,
+            original_amount=amount,
+            current_amount=amount,
+            status=models.FEE_SPLIT_DETAIL_STATUS_PENDING,
+        )
+        db.add(detail)
+        split_details.append(detail)
+
+    db.flush()
+
+
+def get_fee_split_detail_by_number(db: Session, split_number: str) -> Optional[models.FeeSplitDetail]:
+    return db.query(models.FeeSplitDetail).filter(models.FeeSplitDetail.split_number == split_number).first()
+
+
+def get_fee_split_details_by_fee(db: Session, fee_record_id: int) -> List[models.FeeSplitDetail]:
+    return db.query(models.FeeSplitDetail).filter(
+        models.FeeSplitDetail.fee_record_id == fee_record_id,
+    ).order_by(models.FeeSplitDetail.created_at.asc()).all()
+
+
+def get_fee_split_details_by_lc(db: Session, lc_number: str) -> List[models.FeeSplitDetail]:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        return []
+    return db.query(models.FeeSplitDetail).filter(
+        models.FeeSplitDetail.lc_id == lc.id,
+    ).order_by(models.FeeSplitDetail.created_at.desc()).all()
+
+
+def confirm_fee_split_detail(
+    db: Session,
+    split_number: str,
+    confirmed_by: str,
+) -> models.FeeSplitDetail:
+    detail = get_fee_split_detail_by_number(db, split_number)
+    if not detail:
+        raise ValueError(f"分账明细 {split_number} 不存在")
+
+    if detail.status == models.FEE_SPLIT_DETAIL_STATUS_CONFIRMED:
+        raise ValueError(f"分账明细 {split_number} 已经是已确认状态")
+    if detail.status == models.FEE_SPLIT_DETAIL_STATUS_DISPUTED:
+        raise ValueError(f"分账明细 {split_number} 处于争议状态，无法直接确认，请先处理争议")
+
+    detail.status = models.FEE_SPLIT_DETAIL_STATUS_CONFIRMED
+    detail.confirmed_at = datetime.utcnow()
+    detail.confirmed_by = confirmed_by
+
+    db.flush()
+    _check_and_update_fee_settlement(db, detail.fee_record_id)
+
+    db.commit()
+    db.refresh(detail)
+    return detail
+
+
+def dispute_fee_split_detail(
+    db: Session,
+    split_number: str,
+    dispute_reason: str,
+) -> models.FeeSplitDetail:
+    detail = get_fee_split_detail_by_number(db, split_number)
+    if not detail:
+        raise ValueError(f"分账明细 {split_number} 不存在")
+
+    if detail.status == models.FEE_SPLIT_DETAIL_STATUS_CONFIRMED:
+        raise ValueError(f"分账明细 {split_number} 已经确认，无法标记为争议")
+
+    if not dispute_reason or not dispute_reason.strip():
+        raise ValueError("争议原因不能为空")
+
+    detail.status = models.FEE_SPLIT_DETAIL_STATUS_DISPUTED
+    detail.dispute_reason = dispute_reason.strip()
+    detail.disputed_at = datetime.utcnow()
+
+    db.commit()
+    db.refresh(detail)
+    return detail
+
+
+def adjust_fee_split_detail(
+    db: Session,
+    split_number: str,
+    new_amount: float,
+    adjustment_reason: str,
+    adjusted_by: str,
+) -> models.FeeSplitDetail:
+    detail = get_fee_split_detail_by_number(db, split_number)
+    if not detail:
+        raise ValueError(f"分账明细 {split_number} 不存在")
+
+    if detail.status != models.FEE_SPLIT_DETAIL_STATUS_DISPUTED:
+        raise ValueError(
+            f"只有争议状态的分账明细才能调整金额，当前状态: {detail.status}"
+        )
+
+    if new_amount is None or new_amount < 0:
+        raise ValueError("调整后的金额不能为负数")
+
+    if not adjustment_reason or not adjustment_reason.strip():
+        raise ValueError("调整原因不能为空")
+
+    amount_before = detail.current_amount
+    amount_after = round(float(new_amount), 2)
+    amount_diff = round(amount_after - amount_before, 2)
+
+    adjustment_number = generate_adjustment_number(db, split_number)
+    adjustment = models.FeeSplitAdjustment(
+        adjustment_number=adjustment_number,
+        split_detail_id=detail.id,
+        split_number=split_number,
+        amount_before=amount_before,
+        amount_after=amount_after,
+        amount_diff=amount_diff,
+        adjusted_by=adjusted_by,
+        adjustment_reason=adjustment_reason.strip(),
+    )
+    db.add(adjustment)
+
+    detail.current_amount = amount_after
+    detail.status = models.FEE_SPLIT_DETAIL_STATUS_PENDING
+    detail.dispute_reason = None
+    detail.disputed_at = None
+    detail.confirmed_at = None
+    detail.confirmed_by = None
+
+    fee_record = db.query(models.FeeRecord).filter(models.FeeRecord.id == detail.fee_record_id).first()
+    if fee_record and fee_record.settlement_status == models.FEE_SETTLEMENT_STATUS_SETTLED:
+        fee_record.settlement_status = models.FEE_SETTLEMENT_STATUS_PENDING
+        fee_record.settled_at = None
+
+    db.commit()
+    db.refresh(detail)
+    return detail
+
+
+def _check_and_update_fee_settlement(db: Session, fee_record_id: int) -> None:
+    fee_record = db.query(models.FeeRecord).filter(models.FeeRecord.id == fee_record_id).first()
+    if not fee_record:
+        return
+
+    split_details = get_fee_split_details_by_fee(db, fee_record_id)
+    if not split_details:
+        return
+
+    all_confirmed = all(
+        d.status == models.FEE_SPLIT_DETAIL_STATUS_CONFIRMED for d in split_details
+    )
+
+    if all_confirmed and fee_record.settlement_status != models.FEE_SETTLEMENT_STATUS_SETTLED:
+        fee_record.settlement_status = models.FEE_SETTLEMENT_STATUS_SETTLED
+        fee_record.settled_at = datetime.utcnow()
+    elif not all_confirmed and fee_record.settlement_status == models.FEE_SETTLEMENT_STATUS_SETTLED:
+        fee_record.settlement_status = models.FEE_SETTLEMENT_STATUS_PENDING
+        fee_record.settled_at = None
+
+
+def get_lc_fee_split_summary(db: Session, lc_number: str) -> Dict[str, Any]:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        raise ValueError(f"信用证 {lc_number} 不存在")
+
+    split_rule = get_active_fee_split_rule_by_lc(db, lc_number)
+
+    fee_records = db.query(models.FeeRecord).filter(
+        models.FeeRecord.lc_id == lc.id,
+    ).order_by(models.FeeRecord.created_at.desc()).all()
+
+    fee_records_with_splits = []
+    for fee in fee_records:
+        splits = get_fee_split_details_by_fee(db, fee.id)
+        fee_records_with_splits.append({
+            "fee_record": fee,
+            "settlement_status": fee.settlement_status,
+            "settled_at": fee.settled_at,
+            "split_details": splits,
+        })
+
+    return {
+        "lc_number": lc_number,
+        "split_rule": split_rule,
+        "fee_records_with_splits": fee_records_with_splits,
+    }
+
+
+def get_monthly_reconciliation(
+    db: Session,
+    year: int,
+    month: int,
+) -> Dict[str, Any]:
+    if year < 2000 or year > 2100:
+        raise ValueError(f"无效的年份: {year}")
+    if month < 1 or month > 12:
+        raise ValueError(f"无效的月份: {month}")
+
+    import calendar
+    last_day = calendar.monthrange(year, month)[1]
+    start_date = date(year, month, 1)
+    end_date = date(year, month, last_day)
+
+    start_dt = datetime.combine(start_date, datetime.min.time())
+    end_dt = datetime.combine(end_date, datetime.max.time())
+
+    all_splits = db.query(models.FeeSplitDetail).filter(
+        models.FeeSplitDetail.created_at >= start_dt,
+        models.FeeSplitDetail.created_at <= end_dt,
+    ).all()
+
+    total_amount = sum(d.current_amount for d in all_splits)
+    total_confirmed = sum(d.current_amount for d in all_splits if d.status == models.FEE_SPLIT_DETAIL_STATUS_CONFIRMED)
+    total_disputed = sum(d.current_amount for d in all_splits if d.status == models.FEE_SPLIT_DETAIL_STATUS_DISPUTED)
+    total_pending = sum(d.current_amount for d in all_splits if d.status == models.FEE_SPLIT_DETAIL_STATUS_PENDING)
+
+    bank_agg = {}
+    for d in all_splits:
+        key = (d.receiving_bank_name, d.receiving_bank_role)
+        if key not in bank_agg:
+            bank_agg[key] = {
+                "bank_name": d.receiving_bank_name,
+                "bank_role": d.receiving_bank_role,
+                "total_receivable": 0.0,
+                "confirmed_amount": 0.0,
+                "disputed_amount": 0.0,
+                "pending_amount": 0.0,
+                "detail_count": 0,
+                "confirmed_count": 0,
+                "disputed_count": 0,
+                "pending_count": 0,
+            }
+        agg = bank_agg[key]
+        agg["total_receivable"] += d.current_amount
+        agg["detail_count"] += 1
+        if d.status == models.FEE_SPLIT_DETAIL_STATUS_CONFIRMED:
+            agg["confirmed_amount"] += d.current_amount
+            agg["confirmed_count"] += 1
+        elif d.status == models.FEE_SPLIT_DETAIL_STATUS_DISPUTED:
+            agg["disputed_amount"] += d.current_amount
+            agg["disputed_count"] += 1
+        else:
+            agg["pending_amount"] += d.current_amount
+            agg["pending_count"] += 1
+
+    by_bank = []
+    for key in sorted(bank_agg.keys()):
+        agg = bank_agg[key]
+        by_bank.append({
+            "bank_name": agg["bank_name"],
+            "bank_role": agg["bank_role"],
+            "total_receivable": round(agg["total_receivable"], 2),
+            "confirmed_amount": round(agg["confirmed_amount"], 2),
+            "disputed_amount": round(agg["disputed_amount"], 2),
+            "pending_amount": round(agg["pending_amount"], 2),
+            "detail_count": agg["detail_count"],
+            "confirmed_count": agg["confirmed_count"],
+            "disputed_count": agg["disputed_count"],
+            "pending_count": agg["pending_count"],
+        })
+
+    year_month_str = f"{year:04d}-{month:02d}"
+
+    return {
+        "year_month": year_month_str,
+        "total_split_count": len(all_splits),
+        "total_amount": round(float(total_amount), 2),
+        "total_confirmed_amount": round(float(total_confirmed), 2),
+        "total_disputed_amount": round(float(total_disputed), 2),
+        "total_pending_amount": round(float(total_pending), 2),
+        "by_bank": by_bank,
+    }
+
+
+def get_fee_split_adjustments(db: Session, split_number: str) -> List[models.FeeSplitAdjustment]:
+    detail = get_fee_split_detail_by_number(db, split_number)
+    if not detail:
+        raise ValueError(f"分账明细 {split_number} 不存在")
+    return db.query(models.FeeSplitAdjustment).filter(
+        models.FeeSplitAdjustment.split_detail_id == detail.id,
+    ).order_by(models.FeeSplitAdjustment.created_at.desc()).all()
+
+
+def get_fee_split_detail_with_adjustments(db: Session, split_number: str) -> Dict[str, Any]:
+    detail = get_fee_split_detail_by_number(db, split_number)
+    if not detail:
+        raise ValueError(f"分账明细 {split_number} 不存在")
+    adjustments = get_fee_split_adjustments(db, split_number)
+    return {
+        "id": detail.id,
+        "split_number": detail.split_number,
+        "split_rule_id": detail.split_rule_id,
+        "fee_record_id": detail.fee_record_id,
+        "fee_number": detail.fee_number,
+        "lc_id": detail.lc_id,
+        "lc_number": detail.lc_number,
+        "receiving_bank_name": detail.receiving_bank_name,
+        "receiving_bank_role": detail.receiving_bank_role,
+        "split_ratio": detail.split_ratio,
+        "original_amount": detail.original_amount,
+        "current_amount": detail.current_amount,
+        "status": detail.status,
+        "dispute_reason": detail.dispute_reason,
+        "disputed_at": detail.disputed_at,
+        "confirmed_at": detail.confirmed_at,
+        "confirmed_by": detail.confirmed_by,
+        "created_at": detail.created_at,
+        "adjustments": adjustments,
+    }
+
+
+def migrate_fee_split_tables(db: Session) -> int:
+    from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+
+    created = 0
+    try:
+        conn = db.connection()
+        try:
+            db.execute(text("SELECT 1 FROM fee_split_rules LIMIT 1"))
+        except OperationalError:
+            models.FeeSplitRule.__table__.create(bind=conn)
+            created += 1
+
+        try:
+            db.execute(text("SELECT 1 FROM fee_split_details LIMIT 1"))
+        except OperationalError:
+            models.FeeSplitDetail.__table__.create(bind=conn)
+            created += 1
+
+        try:
+            db.execute(text("SELECT 1 FROM fee_split_adjustments LIMIT 1"))
+        except OperationalError:
+            models.FeeSplitAdjustment.__table__.create(bind=conn)
+            created += 1
+
+        columns_added_fee = False
+        try:
+            db.execute(text("SELECT settlement_status FROM fee_records LIMIT 1"))
+        except OperationalError:
+            db.execute(text("ALTER TABLE fee_records ADD COLUMN settlement_status VARCHAR(20) DEFAULT 'pending'"))
+            db.execute(text("ALTER TABLE fee_records ADD COLUMN settled_at DATETIME"))
+            db.commit()
+            columns_added_fee = True
+            created += 2
+
+        db.commit()
+    except Exception as e:
+        db.rollback()
+    return created

@@ -1285,3 +1285,162 @@ class QueuePriorityCount(BaseModel):
 class QueueStatusResponse(BaseModel):
     total_waiting: int
     by_priority: List[QueuePriorityCount]
+
+
+class FeeSplitRole(str, Enum):
+    ISSUING_BANK = "issuing_bank"
+    ADVISING_BANK = "advising_bank"
+    NEGOTIATING_BANK = "negotiating_bank"
+    CONFIRMING_BANK = "confirming_bank"
+    REIMBURSING_BANK = "reimbursing_bank"
+
+
+class FeeSplitRuleStatus(str, Enum):
+    ACTIVE = "active"
+    VOID = "void"
+
+
+class FeeSplitDetailStatus(str, Enum):
+    PENDING = "pending"
+    CONFIRMED = "confirmed"
+    DISPUTED = "disputed"
+
+
+class FeeSettlementStatus(str, Enum):
+    PENDING = "pending"
+    SETTLED = "settled"
+
+
+class ParticipatingBankCreate(BaseModel):
+    role: FeeSplitRole
+    bank_name: str
+    split_ratio: float = Field(..., ge=0, le=100, description="分账比例，0-100之间")
+
+
+class FeeSplitRuleCreate(BaseModel):
+    lc_number: str
+    participating_banks: List[ParticipatingBankCreate]
+
+
+class FeeSplitRuleVoidRequest(BaseModel):
+    void_reason: str
+    voided_by: str
+
+
+class ParticipatingBankResponse(BaseModel):
+    role: str
+    bank_name: str
+    split_ratio: float
+
+
+class FeeSplitRuleResponse(BaseModel):
+    id: int
+    rule_number: str
+    lc_id: int
+    lc_number: str
+    participating_banks: List[ParticipatingBankResponse]
+    status: str
+    void_reason: Optional[str] = None
+    voided_at: Optional[datetime] = None
+    voided_by: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class FeeSplitDetailResponse(BaseModel):
+    id: int
+    split_number: str
+    split_rule_id: int
+    fee_record_id: int
+    fee_number: str
+    lc_id: int
+    lc_number: str
+    receiving_bank_name: str
+    receiving_bank_role: str
+    split_ratio: float
+    original_amount: float
+    current_amount: float
+    status: str
+    dispute_reason: Optional[str] = None
+    disputed_at: Optional[datetime] = None
+    confirmed_at: Optional[datetime] = None
+    confirmed_by: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class FeeSplitDetailWithAdjustmentsResponse(FeeSplitDetailResponse):
+    adjustments: List["FeeSplitAdjustmentResponse"] = []
+
+
+class FeeSplitAdjustmentResponse(BaseModel):
+    id: int
+    adjustment_number: str
+    split_detail_id: int
+    split_number: str
+    amount_before: float
+    amount_after: float
+    amount_diff: float
+    adjusted_by: str
+    adjustment_reason: str
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class FeeSplitDetailConfirmRequest(BaseModel):
+    confirmed_by: str
+
+
+class FeeSplitDetailDisputeRequest(BaseModel):
+    dispute_reason: str
+
+
+class FeeSplitDetailAdjustRequest(BaseModel):
+    new_amount: float
+    adjustment_reason: str
+    adjusted_by: str
+
+
+class FeeRecordWithSplitsResponse(BaseModel):
+    fee_record: FeeRecordResponse
+    settlement_status: str
+    settled_at: Optional[datetime] = None
+    split_details: List[FeeSplitDetailResponse]
+
+
+class LcFeeSplitSummaryResponse(BaseModel):
+    lc_number: str
+    split_rule: Optional[FeeSplitRuleResponse] = None
+    fee_records_with_splits: List[FeeRecordWithSplitsResponse]
+
+
+class BankMonthlyReconciliationItem(BaseModel):
+    bank_name: str
+    bank_role: str
+    total_receivable: float
+    confirmed_amount: float
+    disputed_amount: float
+    pending_amount: float
+    detail_count: int
+    confirmed_count: int
+    disputed_count: int
+    pending_count: int
+
+
+class MonthlyReconciliationResponse(BaseModel):
+    year_month: str
+    total_split_count: int
+    total_amount: float
+    total_confirmed_amount: float
+    total_disputed_amount: float
+    total_pending_amount: float
+    by_bank: List[BankMonthlyReconciliationItem]
+
+
+FeeSplitDetailWithAdjustmentsResponse.model_rebuild()

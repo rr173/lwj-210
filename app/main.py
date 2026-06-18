@@ -27,6 +27,11 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def startup_event():
         init_db()
+        db = next(get_db())
+        try:
+            crud.migrate_fee_split_tables(db)
+        finally:
+            db.close()
         seed_data()
 
     @app.get("/", tags=["系统"])
@@ -1214,6 +1219,101 @@ def create_app() -> FastAPI:
             return crud.get_queue_status(db)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"查询队列状态失败: {str(e)}")
+
+    @app.post("/api/fee-split/rules", response_model=schemas.FeeSplitRuleResponse, tags=["银行间手续费分账"], status_code=status.HTTP_201_CREATED)
+    async def create_split_rule(rule_data: schemas.FeeSplitRuleCreate, db: Session = Depends(get_db)):
+        try:
+            banks = [b.model_dump() for b in rule_data.participating_banks]
+            return crud.create_fee_split_rule(db, rule_data.lc_number, banks)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"创建分账规则失败: {str(e)}")
+
+    @app.get("/api/fee-split/rules/{rule_number}", response_model=schemas.FeeSplitRuleResponse, tags=["银行间手续费分账"])
+    async def get_split_rule(rule_number: str, db: Session = Depends(get_db)):
+        rule = crud.get_fee_split_rule_by_number(db, rule_number)
+        if not rule:
+            raise HTTPException(status_code=404, detail=f"分账规则 {rule_number} 不存在")
+        return rule
+
+    @app.get("/api/fee-split/rules/lc/{lc_number}", response_model=List[schemas.FeeSplitRuleResponse], tags=["银行间手续费分账"])
+    async def get_split_rules_by_lc(lc_number: str, db: Session = Depends(get_db)):
+        lc = crud.get_letter_of_credit_by_number(db, lc_number)
+        if not lc:
+            raise HTTPException(status_code=404, detail=f"信用证 {lc_number} 不存在")
+        return crud.get_all_fee_split_rules_by_lc(db, lc_number)
+
+    @app.post("/api/fee-split/rules/{rule_number}/void", response_model=schemas.FeeSplitRuleResponse, tags=["银行间手续费分账"])
+    async def void_split_rule(rule_number: str, req: schemas.FeeSplitRuleVoidRequest, db: Session = Depends(get_db)):
+        try:
+            return crud.void_fee_split_rule(db, rule_number, req.void_reason, req.voided_by)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"作废分账规则失败: {str(e)}")
+
+    @app.get("/api/fee-split/details/{split_number}", response_model=schemas.FeeSplitDetailWithAdjustmentsResponse, tags=["银行间手续费分账"])
+    async def get_split_detail(split_number: str, db: Session = Depends(get_db)):
+        try:
+            return crud.get_fee_split_detail_with_adjustments(db, split_number)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    @app.get("/api/fee-split/lc/{lc_number}", response_model=schemas.LcFeeSplitSummaryResponse, tags=["银行间手续费分账"])
+    async def get_lc_fee_split_summary(lc_number: str, db: Session = Depends(get_db)):
+        try:
+            return crud.get_lc_fee_split_summary(db, lc_number)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询信用证分账明细失败: {str(e)}")
+
+    @app.post("/api/fee-split/details/{split_number}/confirm", response_model=schemas.FeeSplitDetailResponse, tags=["银行间手续费分账"])
+    async def confirm_split_detail(split_number: str, req: schemas.FeeSplitDetailConfirmRequest, db: Session = Depends(get_db)):
+        try:
+            return crud.confirm_fee_split_detail(db, split_number, req.confirmed_by)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"确认分账明细失败: {str(e)}")
+
+    @app.post("/api/fee-split/details/{split_number}/dispute", response_model=schemas.FeeSplitDetailResponse, tags=["银行间手续费分账"])
+    async def dispute_split_detail(split_number: str, req: schemas.FeeSplitDetailDisputeRequest, db: Session = Depends(get_db)):
+        try:
+            return crud.dispute_fee_split_detail(db, split_number, req.dispute_reason)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"标记分账争议失败: {str(e)}")
+
+    @app.post("/api/fee-split/details/{split_number}/adjust", response_model=schemas.FeeSplitDetailResponse, tags=["银行间手续费分账"])
+    async def adjust_split_detail(split_number: str, req: schemas.FeeSplitDetailAdjustRequest, db: Session = Depends(get_db)):
+        try:
+            return crud.adjust_fee_split_detail(
+                db,
+                split_number,
+                req.new_amount,
+                req.adjustment_reason,
+                req.adjusted_by,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"调整分账金额失败: {str(e)}")
+
+    @app.get("/api/fee-split/reconciliation/monthly", response_model=schemas.MonthlyReconciliationResponse, tags=["银行间手续费分账"])
+    async def get_monthly_reconciliation(
+        year: int,
+        month: int,
+        db: Session = Depends(get_db),
+    ):
+        try:
+            return crud.get_monthly_reconciliation(db, year, month)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"月度对账查询失败: {str(e)}")
 
     return app
 

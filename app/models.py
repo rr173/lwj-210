@@ -50,6 +50,42 @@ FEE_TYPE_RESUBMISSION = "resubmission"
 FEE_STATUS_CONFIRMED = "confirmed"
 FEE_STATUS_PENDING = "pending"
 
+FEE_SETTLEMENT_STATUS_PENDING = "pending"
+FEE_SETTLEMENT_STATUS_SETTLED = "settled"
+VALID_FEE_SETTLEMENT_STATUSES = [
+    FEE_SETTLEMENT_STATUS_PENDING,
+    FEE_SETTLEMENT_STATUS_SETTLED,
+]
+
+FEE_SPLIT_ROLE_ISSUING_BANK = "issuing_bank"
+FEE_SPLIT_ROLE_ADVISING_BANK = "advising_bank"
+FEE_SPLIT_ROLE_NEGOTIATING_BANK = "negotiating_bank"
+FEE_SPLIT_ROLE_CONFIRMING_BANK = "confirming_bank"
+FEE_SPLIT_ROLE_REIMBURSING_BANK = "reimbursing_bank"
+VALID_FEE_SPLIT_ROLES = [
+    FEE_SPLIT_ROLE_ISSUING_BANK,
+    FEE_SPLIT_ROLE_ADVISING_BANK,
+    FEE_SPLIT_ROLE_NEGOTIATING_BANK,
+    FEE_SPLIT_ROLE_CONFIRMING_BANK,
+    FEE_SPLIT_ROLE_REIMBURSING_BANK,
+]
+
+FEE_SPLIT_RULE_STATUS_ACTIVE = "active"
+FEE_SPLIT_RULE_STATUS_VOID = "void"
+VALID_FEE_SPLIT_RULE_STATUSES = [
+    FEE_SPLIT_RULE_STATUS_ACTIVE,
+    FEE_SPLIT_RULE_STATUS_VOID,
+]
+
+FEE_SPLIT_DETAIL_STATUS_PENDING = "pending"
+FEE_SPLIT_DETAIL_STATUS_CONFIRMED = "confirmed"
+FEE_SPLIT_DETAIL_STATUS_DISPUTED = "disputed"
+VALID_FEE_SPLIT_DETAIL_STATUSES = [
+    FEE_SPLIT_DETAIL_STATUS_PENDING,
+    FEE_SPLIT_DETAIL_STATUS_CONFIRMED,
+    FEE_SPLIT_DETAIL_STATUS_DISPUTED,
+]
+
 
 AMENDMENT_STATUS_PENDING = "pending"
 AMENDMENT_STATUS_ACCEPTED = "accepted"
@@ -294,10 +330,13 @@ class FeeRecord(Base):
     document_fee_total = Column(Float, default=0, nullable=False)
     total_amount = Column(Float, nullable=False)
     status = Column(String(20), nullable=False)
+    settlement_status = Column(String(20), default=FEE_SETTLEMENT_STATUS_PENDING, nullable=False)
+    settled_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     lc = relationship("LetterOfCredit", back_populates="fee_records")
     audit_record = relationship("AuditRecord")
+    split_details = relationship("FeeSplitDetail", back_populates="fee_record")
 
 
 class Reviewer(Base):
@@ -820,3 +859,65 @@ class DocumentTemplate(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     lc = relationship("LetterOfCredit", back_populates="templates")
+
+
+class FeeSplitRule(Base):
+    __tablename__ = "fee_split_rules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    rule_number = Column(String(150), unique=True, index=True, nullable=False)
+    lc_id = Column(Integer, ForeignKey("letter_of_credits.id"), nullable=False)
+    lc_number = Column(String(100), index=True, nullable=False)
+    participating_banks = Column(JSON, nullable=False)
+    status = Column(String(20), default=FEE_SPLIT_RULE_STATUS_ACTIVE, nullable=False)
+    void_reason = Column(Text, nullable=True)
+    voided_at = Column(DateTime, nullable=True)
+    voided_by = Column(String(100), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    lc = relationship("LetterOfCredit")
+    split_details = relationship("FeeSplitDetail", back_populates="split_rule", cascade="all, delete-orphan")
+
+
+class FeeSplitDetail(Base):
+    __tablename__ = "fee_split_details"
+
+    id = Column(Integer, primary_key=True, index=True)
+    split_number = Column(String(150), unique=True, index=True, nullable=False)
+    split_rule_id = Column(Integer, ForeignKey("fee_split_rules.id"), nullable=False)
+    fee_record_id = Column(Integer, ForeignKey("fee_records.id"), nullable=False)
+    fee_number = Column(String(100), index=True, nullable=False)
+    lc_id = Column(Integer, ForeignKey("letter_of_credits.id"), nullable=False)
+    lc_number = Column(String(100), index=True, nullable=False)
+    receiving_bank_name = Column(String(255), nullable=False)
+    receiving_bank_role = Column(String(30), nullable=False)
+    split_ratio = Column(Float, nullable=False)
+    original_amount = Column(Float, nullable=False)
+    current_amount = Column(Float, nullable=False)
+    status = Column(String(20), default=FEE_SPLIT_DETAIL_STATUS_PENDING, nullable=False)
+    dispute_reason = Column(Text, nullable=True)
+    disputed_at = Column(DateTime, nullable=True)
+    confirmed_at = Column(DateTime, nullable=True)
+    confirmed_by = Column(String(100), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    split_rule = relationship("FeeSplitRule", back_populates="split_details")
+    fee_record = relationship("FeeRecord")
+    adjustments = relationship("FeeSplitAdjustment", back_populates="split_detail", cascade="all, delete-orphan")
+
+
+class FeeSplitAdjustment(Base):
+    __tablename__ = "fee_split_adjustments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    adjustment_number = Column(String(150), unique=True, index=True, nullable=False)
+    split_detail_id = Column(Integer, ForeignKey("fee_split_details.id"), nullable=False)
+    split_number = Column(String(150), index=True, nullable=False)
+    amount_before = Column(Float, nullable=False)
+    amount_after = Column(Float, nullable=False)
+    amount_diff = Column(Float, nullable=False)
+    adjusted_by = Column(String(100), nullable=False)
+    adjustment_reason = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    split_detail = relationship("FeeSplitDetail", back_populates="adjustments")
