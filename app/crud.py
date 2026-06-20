@@ -130,6 +130,8 @@ def create_letter_of_credit(db: Session, lc_data: schemas.LetterOfCreditCreate) 
 
     db.flush()
 
+    _create_initial_margin_record(db, db_lc)
+
     associate_lc_parties(db, db_lc)
     dispatch_notifications(db, db_lc, models.EVENT_TYPE_LC_CREATED)
 
@@ -395,6 +397,10 @@ def submit_documents_and_audit(db: Session, submission: schemas.SubmissionSubmit
     if freeze_reason:
         raise ValueError(f"信用证已被冻结，无法提交新交单：{freeze_reason}")
 
+    margin_block_reason = get_lc_margin_block_reason(db, lc.id)
+    if margin_block_reason:
+        raise ValueError(margin_block_reason)
+
     existing_submission = db.query(models.AuditRecord).filter(
         models.AuditRecord.submission_id == submission.submission_id
     ).first()
@@ -555,6 +561,10 @@ def resubmit_documents_and_audit(db: Session, original_submission_id: str, resub
     freeze_reason = check_lc_frozen_for_resubmission(db, lc.id)
     if freeze_reason:
         raise ValueError(f"信用证已被冻结，无法修改重提：{freeze_reason}")
+
+    margin_block_reason = get_lc_margin_block_reason(db, lc.id)
+    if margin_block_reason:
+        raise ValueError(margin_block_reason)
 
     documents = []
     doc_signatures = []
@@ -903,6 +913,10 @@ def create_amendment(db: Session, amendment_data: schemas.AmendmentCreate) -> mo
     if has_pending_amendment(db, lc.id):
         raise ValueError(f"信用证 {amendment_data.lc_number} 已有一个待处理的修改，请先处理后再发起新修改")
 
+    margin_block_reason = get_lc_margin_block_reason(db, lc.id)
+    if margin_block_reason:
+        raise ValueError(margin_block_reason)
+
     field_changes_dict = [change.model_dump() for change in amendment_data.field_changes]
     validate_field_changes(field_changes_dict, lc)
 
@@ -1165,6 +1179,13 @@ def accept_amendment(db: Session, amendment_number: str) -> models.LCAmendment:
         adjust_credit_line_for_amendment(
             db, lc, old_amount, new_amount, amendment.amendment_number
         )
+
+        if new_amount > old_amount:
+            initial_margin = get_initial_margin_record_by_lc(db, lc.id)
+            if initial_margin:
+                _create_supplement_margin_record(
+                    db, lc, old_amount, new_amount, initial_margin
+                )
 
     check_back_to_back_conflicts(db, amendment.lc_id, amendment.field_changes)
 
@@ -3833,6 +3854,9 @@ def settle_payment(
 
     db.commit()
     db.refresh(payment)
+
+    trigger_margin_releasable_check(db, payment.lc_id)
+
     return payment
 
 
@@ -4219,6 +4243,12 @@ def create_credit_line(db: Session, credit_line_data: schemas.CreditLineCreate) 
     if credit_line_data.total_amount <= 0:
         raise ValueError("授信总额度必须大于0")
 
+    credit_rating_value = credit_line_data.credit_rating.value if hasattr(credit_line_data.credit_rating, 'value') else credit_line_data.credit_rating
+    if credit_rating_value not in models.VALID_CREDIT_RATINGS:
+        raise ValueError(
+            f"无效的信用等级: {credit_rating_value}，允许的值: {', '.join(models.VALID_CREDIT_RATINGS)}"
+        )
+
     existing = db.query(models.CreditLine).filter(
         models.CreditLine.applicant_name == credit_line_data.applicant_name,
         models.CreditLine.currency == currency_value
@@ -4233,11 +4263,50 @@ def create_credit_line(db: Session, credit_line_data: schemas.CreditLineCreate) 
         applicant_name=credit_line_data.applicant_name,
         currency=currency_value,
         total_amount=credit_line_data.total_amount,
+        credit_rating=credit_rating_value,
     )
     db.add(credit_line)
     db.commit()
     db.refresh(credit_line)
     return credit_line
+
+
+def update_credit_rating(
+    db: Session,
+    applicant_name: str,
+    currency: str,
+    new_credit_rating: str,
+) -> models.CreditLine:
+    if new_credit_rating not in models.VALID_CREDIT_RATINGS:
+        raise ValueError(
+            f"无效的信用等级: {new_credit_rating}，允许的值: {', '.join(models.VALID_CREDIT_RATINGS)}"
+        )
+
+    credit_line = get_credit_line_by_applicant_and_currency(db, applicant_name, currency)
+    if not credit_line:
+        raise ValueError(
+            f"申请人 {applicant_name} 在 {currency} 币种下不存在授信额度记录"
+        )
+
+    old_rating = credit_line.credit_rating
+    if old_rating == new_credit_rating:
+        return credit_line
+
+    credit_line.credit_rating = new_credit_rating
+    db.commit()
+    db.refresh(credit_line)
+    return credit_line
+
+
+def get_applicant_credit_rating(
+    db: Session,
+    applicant_name: str,
+    currency: str,
+) -> Optional[str]:
+    credit_line = get_credit_line_by_applicant_and_currency(db, applicant_name, currency)
+    if credit_line:
+        return credit_line.credit_rating
+    return models.CREDIT_RATING_B
 
 
 def get_credit_line_by_id(db: Session, credit_line_id: int) -> Optional[models.CreditLine]:
@@ -6335,6 +6404,548 @@ def migrate_compliance_tables(db: Session) -> int:
         except OperationalError:
             models.ComplianceEvent.__table__.create(bind=conn)
             created += 1
+
+        db.commit()
+    except Exception as e:
+        db.rollback()
+    return created
+
+
+def _generate_margin_number(db: Session, lc_number: str, record_type: str) -> str:
+    from sqlalchemy import func
+    prefix = f"{lc_number}-MGN-"
+    if record_type == models.MARGIN_RECORD_TYPE_SUPPLEMENT:
+        prefix = f"{lc_number}-MGN-SUP-"
+    count = db.query(func.count(models.MarginRecord.id)).filter(
+        models.MarginRecord.margin_number.startswith(prefix)
+    ).scalar() or 0
+    return f"{prefix}{count + 1:04d}"
+
+
+def _create_initial_margin_record(db: Session, lc: models.LetterOfCredit) -> models.MarginRecord:
+    credit_rating = get_applicant_credit_rating(db, lc.applicant_name, lc.currency)
+    margin_ratio = models.MARGIN_RATIO_BY_RATING[credit_rating]
+    required_amount = round(lc.amount * margin_ratio, 2)
+
+    margin_record = models.MarginRecord(
+        margin_number=_generate_margin_number(db, lc.lc_number, models.MARGIN_RECORD_TYPE_INITIAL),
+        lc_id=lc.id,
+        lc_number=lc.lc_number,
+        applicant_name=lc.applicant_name,
+        credit_rating=credit_rating,
+        margin_ratio=margin_ratio,
+        record_type=models.MARGIN_RECORD_TYPE_INITIAL,
+        related_margin_id=None,
+        base_lc_amount=lc.amount,
+        required_amount=required_amount,
+        actual_paid_amount=0.0,
+        status=models.MARGIN_STATUS_PENDING_PAYMENT,
+        currency=lc.currency,
+    )
+    db.add(margin_record)
+    db.flush()
+    return margin_record
+
+
+def _create_supplement_margin_record(
+    db: Session,
+    lc: models.LetterOfCredit,
+    old_lc_amount: float,
+    new_lc_amount: float,
+    initial_margin: models.MarginRecord,
+) -> Optional[models.MarginRecord]:
+    if new_lc_amount <= old_lc_amount:
+        return None
+
+    increase_amount = new_lc_amount - old_lc_amount
+    credit_rating = initial_margin.credit_rating
+    margin_ratio = initial_margin.margin_ratio
+    required_supplement = round(increase_amount * margin_ratio, 2)
+
+    if required_supplement <= 0:
+        return None
+
+    supplement = models.MarginRecord(
+        margin_number=_generate_margin_number(db, lc.lc_number, models.MARGIN_RECORD_TYPE_SUPPLEMENT),
+        lc_id=lc.id,
+        lc_number=lc.lc_number,
+        applicant_name=lc.applicant_name,
+        credit_rating=credit_rating,
+        margin_ratio=margin_ratio,
+        record_type=models.MARGIN_RECORD_TYPE_SUPPLEMENT,
+        related_margin_id=initial_margin.id,
+        base_lc_amount=new_lc_amount,
+        required_amount=required_supplement,
+        actual_paid_amount=0.0,
+        status=models.MARGIN_STATUS_PENDING_PAYMENT,
+        currency=lc.currency,
+    )
+    db.add(supplement)
+    db.flush()
+    return supplement
+
+
+def get_initial_margin_record_by_lc(db: Session, lc_id: int) -> Optional[models.MarginRecord]:
+    return db.query(models.MarginRecord).filter(
+        models.MarginRecord.lc_id == lc_id,
+        models.MarginRecord.record_type == models.MARGIN_RECORD_TYPE_INITIAL
+    ).first()
+
+
+def get_all_margin_records_by_lc(db: Session, lc_id: int) -> List[models.MarginRecord]:
+    return db.query(models.MarginRecord).filter(
+        models.MarginRecord.lc_id == lc_id
+    ).order_by(models.MarginRecord.created_at.asc()).all()
+
+
+def get_margin_record_by_number(db: Session, margin_number: str) -> Optional[models.MarginRecord]:
+    return db.query(models.MarginRecord).filter(
+        models.MarginRecord.margin_number == margin_number
+    ).first()
+
+
+def check_lc_margin_fully_paid(db: Session, lc_id: int) -> bool:
+    margin_records = get_all_margin_records_by_lc(db, lc_id)
+    if not margin_records:
+        return True
+
+    for mr in margin_records:
+        if mr.status not in [
+            models.MARGIN_STATUS_PAID,
+            models.MARGIN_STATUS_RELEASABLE,
+            models.MARGIN_STATUS_RELEASED,
+            models.MARGIN_STATUS_PENALTY_PENDING,
+            models.MARGIN_STATUS_PENALIZED,
+        ]:
+            return False
+        if mr.status == models.MARGIN_STATUS_PENDING_PAYMENT:
+            return False
+        if mr.actual_paid_amount + models.EPSILON < mr.required_amount:
+            return False
+    return True
+
+
+def get_lc_margin_block_reason(db: Session, lc_id: int) -> Optional[str]:
+    margin_records = get_all_margin_records_by_lc(db, lc_id)
+    if not margin_records:
+        return None
+
+    pending_records = []
+    for mr in margin_records:
+        if mr.status == models.MARGIN_STATUS_PENDING_PAYMENT:
+            pending_records.append(mr)
+        elif mr.actual_paid_amount + models.EPSILON < mr.required_amount:
+            if mr.status not in [models.MARGIN_STATUS_RELEASED, models.MARGIN_STATUS_PENALIZED]:
+                pending_records.append(mr)
+
+    if pending_records:
+        details = []
+        for pr in pending_records:
+            shortfall = round(pr.required_amount - pr.actual_paid_amount, 2)
+            details.append(
+                f"保证金编号 {pr.margin_number} (应缴 {pr.required_amount}, 实缴 {pr.actual_paid_amount}, 差额 {shortfall})"
+            )
+        return "信用证保证金未缴清，无法进行此操作。未缴明细: " + "; ".join(details)
+    return None
+
+
+def pay_margin(
+    db: Session,
+    margin_number: str,
+    actual_paid_amount: float,
+    paid_by: Optional[str] = None,
+) -> models.MarginRecord:
+    margin = get_margin_record_by_number(db, margin_number)
+    if not margin:
+        raise ValueError(f"保证金记录 {margin_number} 不存在")
+
+    if margin.status in [models.MARGIN_STATUS_RELEASED, models.MARGIN_STATUS_PENALIZED]:
+        raise ValueError(
+            f"保证金记录 {margin_number} 当前状态为 {margin.status}，无法缴纳"
+        )
+
+    if margin.status == models.MARGIN_STATUS_PAID:
+        raise ValueError(f"保证金记录 {margin_number} 已缴纳，无需重复缴纳")
+
+    if actual_paid_amount + models.EPSILON < margin.required_amount:
+        raise ValueError(
+            f"实际缴纳金额 {actual_paid_amount} 低于应缴金额 {margin.required_amount}，"
+            f"缴纳金额必须不低于应缴金额"
+        )
+
+    margin.actual_paid_amount = actual_paid_amount
+    margin.status = models.MARGIN_STATUS_PAID
+    margin.paid_at = datetime.utcnow()
+    margin.paid_by = paid_by
+
+    db.commit()
+    db.refresh(margin)
+    return margin
+
+
+def _check_all_payments_paid(db: Session, lc_id: int) -> bool:
+    payments = db.query(models.Payment).filter(models.Payment.lc_id == lc_id).all()
+    if not payments:
+        return False
+    for p in payments:
+        if p.status != models.PAYMENT_STATUS_PAID:
+            return False
+    return True
+
+
+def check_and_update_margin_releasable(db: Session, lc_id: int) -> Optional[List[models.MarginRecord]]:
+    if not _check_all_payments_paid(db, lc_id):
+        return None
+
+    margin_records = get_all_margin_records_by_lc(db, lc_id)
+    updated = []
+    for mr in margin_records:
+        if mr.status == models.MARGIN_STATUS_PAID:
+            mr.status = models.MARGIN_STATUS_RELEASABLE
+            updated.append(mr)
+        elif mr.status == models.MARGIN_STATUS_PENALTY_PENDING:
+            pass
+
+    if updated:
+        db.commit()
+        for mr in updated:
+            db.refresh(mr)
+    return updated if updated else None
+
+
+def trigger_margin_releasable_check(db: Session, lc_id: int):
+    check_and_update_margin_releasable(db, lc_id)
+
+
+def release_margin(
+    db: Session,
+    margin_number: str,
+    released_by: str,
+    release_remark: str,
+) -> models.MarginRecord:
+    margin = get_margin_record_by_number(db, margin_number)
+    if not margin:
+        raise ValueError(f"保证金记录 {margin_number} 不存在")
+
+    releasable_statuses = [models.MARGIN_STATUS_RELEASABLE, models.MARGIN_STATUS_PENALTY_PENDING]
+    if margin.status not in releasable_statuses:
+        raise ValueError(
+            f"保证金记录 {margin_number} 当前状态为 {margin.status}，"
+            f"仅 releasable 或 penalty_pending 状态可释放"
+        )
+
+    if not released_by or not released_by.strip():
+        raise ValueError("必须指定释放操作人")
+
+    if not release_remark or not release_remark.strip():
+        raise ValueError("必须填写释放备注")
+
+    margin.status = models.MARGIN_STATUS_RELEASED
+    margin.released_at = datetime.utcnow()
+    margin.released_by = released_by.strip()
+    margin.release_remark = release_remark.strip()
+
+    db.commit()
+    db.refresh(margin)
+    return margin
+
+
+def check_and_process_expired_lc_margins(db: Session) -> Dict[str, Any]:
+    today = date.today()
+    expired_lcs = db.query(models.LetterOfCredit).filter(
+        models.LetterOfCredit.expiry_date < today
+    ).all()
+
+    processed_count = 0
+    detail_list = []
+
+    for lc in expired_lcs:
+        has_unpaid = db.query(models.Payment).filter(
+            models.Payment.lc_id == lc.id,
+            models.Payment.status != models.PAYMENT_STATUS_PAID
+        ).first()
+
+        if not has_unpaid:
+            continue
+
+        margin_records = get_all_margin_records_by_lc(db, lc.id)
+        for mr in margin_records:
+            if mr.status == models.MARGIN_STATUS_PAID:
+                old_status = mr.status
+                mr.status = models.MARGIN_STATUS_PENALTY_PENDING
+                detail_list.append({
+                    "margin_number": mr.margin_number,
+                    "lc_number": lc.lc_number,
+                    "from_status": old_status,
+                    "to_status": models.MARGIN_STATUS_PENALTY_PENDING,
+                })
+                processed_count += 1
+
+    if processed_count > 0:
+        db.commit()
+
+    return {
+        "processed_count": processed_count,
+        "details": detail_list,
+    }
+
+
+def penalize_margin(
+    db: Session,
+    margin_number: str,
+    penalized_amount: float,
+    penalty_reason: str,
+    penalized_by: Optional[str] = None,
+) -> models.MarginRecord:
+    margin = get_margin_record_by_number(db, margin_number)
+    if not margin:
+        raise ValueError(f"保证金记录 {margin_number} 不存在")
+
+    if margin.status != models.MARGIN_STATUS_PENALTY_PENDING:
+        raise ValueError(
+            f"保证金记录 {margin_number} 当前状态为 {margin.status}，"
+            f"仅 penalty_pending 状态可扣罚"
+        )
+
+    if penalized_amount <= 0:
+        raise ValueError("扣罚金额必须大于0")
+
+    available_amount = margin.actual_paid_amount - margin.penalized_amount
+    if penalized_amount + models.EPSILON > available_amount:
+        raise ValueError(
+            f"扣罚金额 {penalized_amount} 超过可用金额 {round(available_amount, 2)}"
+        )
+
+    if not penalty_reason or not penalty_reason.strip():
+        raise ValueError("必须填写扣罚原因")
+
+    margin.penalized_amount = round(margin.penalized_amount + penalized_amount, 2)
+    margin.penalty_reason = penalty_reason.strip()
+    margin.penalty_at = datetime.utcnow()
+
+    remaining = margin.actual_paid_amount - margin.penalized_amount
+    if remaining + models.EPSILON <= 0:
+        margin.status = models.MARGIN_STATUS_PENALIZED
+
+    db.commit()
+    db.refresh(margin)
+    return margin
+
+
+def get_margin_records_by_applicant(
+    db: Session,
+    applicant_name: str,
+    currency: Optional[str] = None,
+    status_filter: Optional[str] = None,
+) -> Dict[str, Any]:
+    query = db.query(models.MarginRecord).filter(
+        models.MarginRecord.applicant_name == applicant_name
+    )
+
+    if currency:
+        query = query.filter(models.MarginRecord.currency == currency)
+
+    if status_filter:
+        query = query.filter(models.MarginRecord.status == status_filter)
+
+    records = query.order_by(models.MarginRecord.created_at.desc()).all()
+
+    total_paid = 0.0
+    total_held = 0.0
+    total_penalized = 0.0
+    record_currency = None
+
+    for r in records:
+        if record_currency is None:
+            record_currency = r.currency
+        if r.status not in [models.MARGIN_STATUS_RELEASED]:
+            total_held += r.actual_paid_amount - r.penalized_amount
+        total_paid += r.actual_paid_amount
+        total_penalized += r.penalized_amount
+
+    return {
+        "applicant_name": applicant_name,
+        "total_records": len(records),
+        "total_held_amount": round(total_held, 2),
+        "total_paid_amount": round(total_paid, 2),
+        "total_penalized_amount": round(total_penalized, 2),
+        "currency": record_currency or "",
+        "records": records,
+    }
+
+
+def get_margin_detail_by_lc(db: Session, lc_number: str) -> Dict[str, Any]:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        raise ValueError(f"信用证 {lc_number} 不存在")
+
+    margin_records = get_all_margin_records_by_lc(db, lc.id)
+
+    initial_margin = None
+    supplement_map = {}
+    for mr in margin_records:
+        if mr.record_type == models.MARGIN_RECORD_TYPE_INITIAL:
+            initial_margin = mr
+        elif mr.record_type == models.MARGIN_RECORD_TYPE_SUPPLEMENT:
+            parent_id = mr.related_margin_id
+            if parent_id not in supplement_map:
+                supplement_map[parent_id] = []
+            supplement_map[parent_id].append(mr)
+
+    total_required = 0.0
+    total_paid = 0.0
+    total_penalized = 0.0
+
+    for mr in margin_records:
+        if mr.status != models.MARGIN_STATUS_RELEASED:
+            total_required += mr.required_amount
+            total_paid += mr.actual_paid_amount
+            total_penalized += mr.penalized_amount
+
+    overall_status = "no_margin"
+    if margin_records:
+        all_paid = all(
+            mr.status in [
+                models.MARGIN_STATUS_PAID,
+                models.MARGIN_STATUS_RELEASABLE,
+                models.MARGIN_STATUS_PENALTY_PENDING,
+                models.MARGIN_STATUS_RELEASED,
+                models.MARGIN_STATUS_PENALIZED,
+            ] or mr.actual_paid_amount + models.EPSILON >= mr.required_amount
+            for mr in margin_records
+        )
+        any_pending = any(mr.status == models.MARGIN_STATUS_PENDING_PAYMENT for mr in margin_records)
+        any_released = any(mr.status == models.MARGIN_STATUS_RELEASED for mr in margin_records)
+        all_released = all(
+            mr.status in [models.MARGIN_STATUS_RELEASED, models.MARGIN_STATUS_PENALIZED]
+            for mr in margin_records
+        )
+
+        if all_released:
+            overall_status = "all_released"
+        elif any_released:
+            overall_status = "partially_released"
+        elif all_paid and not any_pending:
+            has_penalty = any(mr.status == models.MARGIN_STATUS_PENALTY_PENDING for mr in margin_records)
+            has_releasable = any(mr.status == models.MARGIN_STATUS_RELEASABLE for mr in margin_records)
+            if has_penalty:
+                overall_status = "penalty_pending"
+            elif has_releasable:
+                overall_status = "releasable"
+            else:
+                overall_status = "paid"
+        else:
+            overall_status = "pending_payment"
+
+    records_with_supplements = []
+    if initial_margin:
+        supplements = supplement_map.get(initial_margin.id, [])
+        records_with_supplements.append({
+            **initial_margin.__dict__,
+            "supplements": supplements,
+        })
+
+    return {
+        "lc_number": lc.lc_number,
+        "applicant_name": lc.applicant_name,
+        "credit_rating": initial_margin.credit_rating if initial_margin else "",
+        "lc_current_amount": lc.amount,
+        "currency": lc.currency,
+        "total_required_amount": round(total_required, 2),
+        "total_actual_paid_amount": round(total_paid, 2),
+        "total_penalized_amount": round(total_penalized, 2),
+        "net_held_amount": round(total_paid - total_penalized, 2),
+        "overall_status": overall_status,
+        "records": records_with_supplements,
+    }
+
+
+def get_margin_overall_stats(db: Session) -> Dict[str, Any]:
+    from sqlalchemy import func
+
+    all_records = db.query(models.MarginRecord).filter(
+        models.MarginRecord.status.in_([
+            models.MARGIN_STATUS_PAID,
+            models.MARGIN_STATUS_RELEASABLE,
+            models.MARGIN_STATUS_PENALTY_PENDING,
+        ])
+    ).all()
+
+    total_required = 0.0
+    total_paid = 0.0
+    total_penalized = 0.0
+    total_net_held = 0.0
+    total_count = len(all_records)
+
+    by_rating_data = {}
+    for rating in models.VALID_CREDIT_RATINGS:
+        by_rating_data[rating] = {
+            "credit_rating": rating,
+            "record_count": 0,
+            "initial_count": 0,
+            "supplement_count": 0,
+            "total_required_amount": 0.0,
+            "total_actual_paid_amount": 0.0,
+            "total_penalized_amount": 0.0,
+            "net_held_amount": 0.0,
+        }
+
+    for mr in all_records:
+        total_required += mr.required_amount
+        total_paid += mr.actual_paid_amount
+        total_penalized += mr.penalized_amount
+        net_held = mr.actual_paid_amount - mr.penalized_amount
+        total_net_held += net_held
+
+        rating = mr.credit_rating if mr.credit_rating in by_rating_data else models.CREDIT_RATING_B
+        rd = by_rating_data[rating]
+        rd["record_count"] += 1
+        if mr.record_type == models.MARGIN_RECORD_TYPE_INITIAL:
+            rd["initial_count"] += 1
+        elif mr.record_type == models.MARGIN_RECORD_TYPE_SUPPLEMENT:
+            rd["supplement_count"] += 1
+        rd["total_required_amount"] += mr.required_amount
+        rd["total_actual_paid_amount"] += mr.actual_paid_amount
+        rd["total_penalized_amount"] += mr.penalized_amount
+        rd["net_held_amount"] += net_held
+
+    for rd in by_rating_data.values():
+        rd["total_required_amount"] = round(rd["total_required_amount"], 2)
+        rd["total_actual_paid_amount"] = round(rd["total_actual_paid_amount"], 2)
+        rd["total_penalized_amount"] = round(rd["total_penalized_amount"], 2)
+        rd["net_held_amount"] = round(rd["net_held_amount"], 2)
+
+    return {
+        "total_records": total_count,
+        "total_required_amount": round(total_required, 2),
+        "total_actual_paid_amount": round(total_paid, 2),
+        "total_penalized_amount": round(total_penalized, 2),
+        "total_net_held_amount": round(total_net_held, 2),
+        "by_rating": list(by_rating_data.values()),
+    }
+
+
+def migrate_margin_tables(db: Session) -> int:
+    from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+
+    created = 0
+    try:
+        conn = db.connection()
+        try:
+            db.execute(text("SELECT 1 FROM margin_records LIMIT 1"))
+        except OperationalError:
+            models.MarginRecord.__table__.create(bind=conn)
+            created += 1
+
+        try:
+            db.execute(text("SELECT credit_rating FROM credit_lines LIMIT 1"))
+        except OperationalError:
+            try:
+                db.execute(text("ALTER TABLE credit_lines ADD COLUMN credit_rating VARCHAR(5) DEFAULT 'B' NOT NULL"))
+                db.commit()
+            except Exception:
+                db.rollback()
 
         db.commit()
     except Exception as e:

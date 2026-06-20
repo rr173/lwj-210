@@ -180,6 +180,7 @@ class LetterOfCredit(Base):
     payments = relationship("Payment", back_populates="lc", cascade="all, delete-orphan", order_by="Payment.created_at.desc()")
     templates = relationship("DocumentTemplate", back_populates="lc", cascade="all, delete-orphan", order_by="DocumentTemplate.created_at.desc()")
     screening_records = relationship("ComplianceScreeningRecord", back_populates="lc", cascade="all, delete-orphan", order_by="ComplianceScreeningRecord.created_at.desc()")
+    margin_records = relationship("MarginRecord", back_populates="lc", cascade="all, delete-orphan", order_by="MarginRecord.created_at.asc()")
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -782,6 +783,37 @@ VALID_CREDIT_LINE_TRANSACTION_TYPES = [
 ]
 
 
+CREDIT_RATING_A = "A"
+CREDIT_RATING_B = "B"
+CREDIT_RATING_C = "C"
+VALID_CREDIT_RATINGS = [CREDIT_RATING_A, CREDIT_RATING_B, CREDIT_RATING_C]
+
+MARGIN_RATIO_BY_RATING = {
+    CREDIT_RATING_A: 0.20,
+    CREDIT_RATING_B: 0.50,
+    CREDIT_RATING_C: 1.00,
+}
+
+MARGIN_STATUS_PENDING_PAYMENT = "pending_payment"
+MARGIN_STATUS_PAID = "paid"
+MARGIN_STATUS_RELEASABLE = "releasable"
+MARGIN_STATUS_PENALTY_PENDING = "penalty_pending"
+MARGIN_STATUS_RELEASED = "released"
+MARGIN_STATUS_PENALIZED = "penalized"
+VALID_MARGIN_STATUSES = [
+    MARGIN_STATUS_PENDING_PAYMENT,
+    MARGIN_STATUS_PAID,
+    MARGIN_STATUS_RELEASABLE,
+    MARGIN_STATUS_PENALTY_PENDING,
+    MARGIN_STATUS_RELEASED,
+    MARGIN_STATUS_PENALIZED,
+]
+
+MARGIN_RECORD_TYPE_INITIAL = "initial"
+MARGIN_RECORD_TYPE_SUPPLEMENT = "supplement"
+VALID_MARGIN_RECORD_TYPES = [MARGIN_RECORD_TYPE_INITIAL, MARGIN_RECORD_TYPE_SUPPLEMENT]
+
+
 class CreditLine(Base):
     __tablename__ = "credit_lines"
 
@@ -789,6 +821,7 @@ class CreditLine(Base):
     applicant_name = Column(String(255), nullable=False, index=True)
     currency = Column(String(10), nullable=False, index=True)
     total_amount = Column(Float, nullable=False)
+    credit_rating = Column(String(5), default=CREDIT_RATING_B, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -1069,3 +1102,34 @@ class ComplianceEvent(Base):
     handled_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class MarginRecord(Base):
+    __tablename__ = "margin_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    margin_number = Column(String(150), unique=True, index=True, nullable=False)
+    lc_id = Column(Integer, ForeignKey("letter_of_credits.id"), nullable=False)
+    lc_number = Column(String(100), index=True, nullable=False)
+    applicant_name = Column(String(255), index=True, nullable=False)
+    credit_rating = Column(String(5), nullable=False)
+    margin_ratio = Column(Float, nullable=False)
+    record_type = Column(String(20), default=MARGIN_RECORD_TYPE_INITIAL, nullable=False)
+    related_margin_id = Column(Integer, ForeignKey("margin_records.id"), nullable=True)
+    base_lc_amount = Column(Float, nullable=False)
+    required_amount = Column(Float, nullable=False)
+    actual_paid_amount = Column(Float, default=0.0, nullable=False)
+    status = Column(String(30), default=MARGIN_STATUS_PENDING_PAYMENT, nullable=False)
+    currency = Column(String(10), nullable=False)
+    paid_at = Column(DateTime, nullable=True)
+    paid_by = Column(String(100), nullable=True)
+    released_at = Column(DateTime, nullable=True)
+    released_by = Column(String(100), nullable=True)
+    release_remark = Column(Text, nullable=True)
+    penalized_amount = Column(Float, default=0.0, nullable=False)
+    penalty_reason = Column(Text, nullable=True)
+    penalty_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    lc = relationship("LetterOfCredit", back_populates="margin_records")
+    parent_margin = relationship("MarginRecord", remote_side=[id], backref="supplements")

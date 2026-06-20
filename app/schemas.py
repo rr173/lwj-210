@@ -1111,10 +1111,17 @@ class PaymentStatsResponse(BaseModel):
     total_paid_amount: float
 
 
+class CreditRating(str, Enum):
+    A = "A"
+    B = "B"
+    C = "C"
+
+
 class CreditLineCreate(BaseModel):
     applicant_name: str
     total_amount: float
     currency: Currency
+    credit_rating: CreditRating = CreditRating.B
 
 
 class CreditLineResponse(BaseModel):
@@ -1122,11 +1129,136 @@ class CreditLineResponse(BaseModel):
     applicant_name: str
     currency: str
     total_amount: float
+    credit_rating: str
     created_at: datetime
     updated_at: datetime
 
     class Config:
         from_attributes = True
+
+
+class CreditRatingUpdateRequest(BaseModel):
+    credit_rating: CreditRating
+
+
+class MarginStatus(str, Enum):
+    PENDING_PAYMENT = "pending_payment"
+    PAID = "paid"
+    RELEASABLE = "releasable"
+    PENALTY_PENDING = "penalty_pending"
+    RELEASED = "released"
+    PENALIZED = "penalized"
+
+
+class MarginRecordType(str, Enum):
+    INITIAL = "initial"
+    SUPPLEMENT = "supplement"
+
+
+class MarginPayRequest(BaseModel):
+    actual_paid_amount: float = Field(..., gt=0, description="实际缴纳的保证金金额")
+    paid_by: Optional[str] = None
+
+
+class MarginReleaseRequest(BaseModel):
+    released_by: str
+    release_remark: str
+
+
+class MarginPenaltyRequest(BaseModel):
+    penalized_amount: float = Field(..., gt=0, description="扣罚的金额")
+    penalty_reason: str
+    penalized_by: Optional[str] = None
+
+
+class MarginRecordResponse(BaseModel):
+    id: int
+    margin_number: str
+    lc_id: int
+    lc_number: str
+    applicant_name: str
+    credit_rating: str
+    margin_ratio: float
+    record_type: str
+    related_margin_id: Optional[int] = None
+    base_lc_amount: float
+    required_amount: float
+    actual_paid_amount: float
+    status: str
+    currency: str
+    paid_at: Optional[datetime] = None
+    paid_by: Optional[str] = None
+    released_at: Optional[datetime] = None
+    released_by: Optional[str] = None
+    release_remark: Optional[str] = None
+    penalized_amount: float
+    penalty_reason: Optional[str] = None
+    penalty_at: Optional[datetime] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class MarginRecordWithSupplementsResponse(MarginRecordResponse):
+    supplements: List[MarginRecordResponse] = []
+
+
+class LcMarginDetailResponse(BaseModel):
+    lc_number: str
+    applicant_name: str
+    credit_rating: str
+    lc_current_amount: float
+    currency: str
+    total_required_amount: float
+    total_actual_paid_amount: float
+    total_penalized_amount: float
+    net_held_amount: float
+    overall_status: str
+    records: List[MarginRecordWithSupplementsResponse]
+
+
+class ApplicantMarginSummaryItem(BaseModel):
+    margin_number: str
+    lc_number: str
+    record_type: str
+    credit_rating: str
+    margin_ratio: float
+    required_amount: float
+    actual_paid_amount: float
+    status: str
+    currency: str
+    created_at: datetime
+
+
+class ApplicantMarginSummaryResponse(BaseModel):
+    applicant_name: str
+    total_records: int
+    total_held_amount: float
+    total_paid_amount: float
+    total_penalized_amount: float
+    currency: str
+    records: List[ApplicantMarginSummaryItem]
+
+
+class MarginStatsByRatingItem(BaseModel):
+    credit_rating: str
+    record_count: int
+    initial_count: int
+    supplement_count: int
+    total_required_amount: float
+    total_actual_paid_amount: float
+    total_penalized_amount: float
+    net_held_amount: float
+
+
+class MarginOverallStatsResponse(BaseModel):
+    total_records: int
+    total_required_amount: float
+    total_actual_paid_amount: float
+    total_penalized_amount: float
+    total_net_held_amount: float
+    by_rating: List[MarginStatsByRatingItem]
 
 
 class CreditLineTransactionType(str, Enum):

@@ -32,6 +32,7 @@ def create_app() -> FastAPI:
             crud.migrate_fee_split_tables(db)
             crud.migrate_signature_tables(db)
             crud.migrate_compliance_tables(db)
+            crud.migrate_margin_tables(db)
         finally:
             db.close()
         seed_data()
@@ -1515,6 +1516,141 @@ def create_app() -> FastAPI:
             raise
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"查询命中统计失败: {str(e)}")
+
+    @app.put("/api/credit-line/rating", response_model=schemas.CreditLineResponse, tags=["信用等级与保证金管理"])
+    async def update_applicant_credit_rating(
+        applicant_name: str,
+        currency: str,
+        req: schemas.CreditRatingUpdateRequest,
+        db: Session = Depends(get_db),
+    ):
+        try:
+            new_rating = req.credit_rating.value if hasattr(req.credit_rating, 'value') else req.credit_rating
+            return crud.update_credit_rating(db, applicant_name, currency, new_rating)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"更新信用等级失败: {str(e)}")
+
+    @app.get("/api/margin/record/{margin_number}", response_model=schemas.MarginRecordResponse, tags=["信用等级与保证金管理"])
+    async def get_margin_record(margin_number: str, db: Session = Depends(get_db)):
+        margin = crud.get_margin_record_by_number(db, margin_number)
+        if not margin:
+            raise HTTPException(status_code=404, detail=f"保证金记录 {margin_number} 不存在")
+        return margin
+
+    @app.post("/api/margin/record/{margin_number}/pay", response_model=schemas.MarginRecordResponse, tags=["信用等级与保证金管理"])
+    async def pay_margin_record(
+        margin_number: str,
+        pay_req: schemas.MarginPayRequest,
+        db: Session = Depends(get_db),
+    ):
+        try:
+            return crud.pay_margin(db, margin_number, pay_req.actual_paid_amount, pay_req.paid_by)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"缴纳保证金失败: {str(e)}")
+
+    @app.post("/api/margin/record/{margin_number}/release", response_model=schemas.MarginRecordResponse, tags=["信用等级与保证金管理"])
+    async def release_margin_record(
+        margin_number: str,
+        release_req: schemas.MarginReleaseRequest,
+        db: Session = Depends(get_db),
+    ):
+        try:
+            return crud.release_margin(
+                db, margin_number, release_req.released_by, release_req.release_remark
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"释放保证金失败: {str(e)}")
+
+    @app.post("/api/margin/record/{margin_number}/penalize", response_model=schemas.MarginRecordResponse, tags=["信用等级与保证金管理"])
+    async def penalize_margin_record(
+        margin_number: str,
+        penalty_req: schemas.MarginPenaltyRequest,
+        db: Session = Depends(get_db),
+    ):
+        try:
+            return crud.penalize_margin(
+                db,
+                margin_number,
+                penalty_req.penalized_amount,
+                penalty_req.penalty_reason,
+                penalty_req.penalized_by,
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"扣罚保证金失败: {str(e)}")
+
+    @app.get("/api/margin/applicant/{applicant_name}", tags=["信用等级与保证金管理"])
+    async def get_margin_records_by_applicant(
+        applicant_name: str,
+        currency: Optional[str] = None,
+        status: Optional[str] = None,
+        db: Session = Depends(get_db),
+    ):
+        try:
+            if status and status not in models.VALID_MARGIN_STATUSES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"无效的状态: {status}，允许值: {', '.join(models.VALID_MARGIN_STATUSES)}"
+                )
+            result = crud.get_margin_records_by_applicant(db, applicant_name, currency, status)
+            return schemas.ApplicantMarginSummaryResponse(**result)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询申请人保证金失败: {str(e)}")
+
+    @app.get("/api/margin/lc/{lc_number}", tags=["信用等级与保证金管理"])
+    async def get_margin_detail_by_lc(lc_number: str, db: Session = Depends(get_db)):
+        try:
+            result = crud.get_margin_detail_by_lc(db, lc_number)
+            return schemas.LcMarginDetailResponse(**result)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询信用证保证金明细失败: {str(e)}")
+
+    @app.get("/api/margin/stats/overall", response_model=schemas.MarginOverallStatsResponse, tags=["信用等级与保证金管理"])
+    async def get_margin_overall_statistics(db: Session = Depends(get_db)):
+        try:
+            return crud.get_margin_overall_stats(db)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询保证金统计失败: {str(e)}")
+
+    @app.post("/api/margin/expire-check", tags=["信用等级与保证金管理"])
+    async def margin_expire_check(db: Session = Depends(get_db)):
+        try:
+            result = crud.check_and_process_expired_lc_margins(db)
+            return {
+                "processed_count": result["processed_count"],
+                "message": f"已将 {result['processed_count']} 条到期未结清的保证金记录标记为 penalty_pending",
+                "details": result["details"],
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"到期保证金检查失败: {str(e)}")
+
+    @app.post("/api/margin/lc/{lc_id}/check-releasable", tags=["信用等级与保证金管理"])
+    async def check_lc_margin_releasable(lc_id: int, db: Session = Depends(get_db)):
+        try:
+            updated = crud.check_and_update_margin_releasable(db, lc_id)
+            if updated:
+                return {
+                    "updated_count": len(updated),
+                    "message": f"已将 {len(updated)} 条保证金记录标记为 releasable",
+                    "margin_numbers": [m.margin_number for m in updated],
+                }
+            return {
+                "updated_count": 0,
+                "message": "当前信用证付款未全部结清，或保证金状态已更新",
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"保证金可释放检查失败: {str(e)}")
 
     return app
 
