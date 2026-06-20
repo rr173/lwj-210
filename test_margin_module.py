@@ -675,9 +675,12 @@ def test_margin_module():
             print(f"    累计扣罚: {result['total_penalized_amount']} USD")
             print(f"    记录明细:")
             for r in result["records"]:
-                print(f"      - {r.margin_number} | {r.record_type} | "
-                      f"等级{r.credit_rating}({r.margin_ratio * 100:.0f}%) | "
-                      f"应缴{r.required_amount} | 实缴{r.actual_paid_amount} | {r.status}")
+                print(f"      - {r['margin_number']} | {r['record_type']} | "
+                      f"等级{r['credit_rating']}({r['margin_ratio'] * 100:.0f}%) | "
+                      f"应缴{r['required_amount']} | 实缴{r['actual_paid_amount']} | {r['status']}")
+                for sup in r.get("supplements", []):
+                    print(f"        └─补缴: {sup['margin_number']} | "
+                          f"应缴{sup['required_amount']} | 实缴{sup['actual_paid_amount']} | {sup['status']}")
 
         print("\n" + "-" * 80)
         print("测试16: 查询接口 - 按信用证查询保证金明细（含补缴关联）")

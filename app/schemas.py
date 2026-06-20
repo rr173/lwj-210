@@ -1229,6 +1229,7 @@ class ApplicantMarginSummaryItem(BaseModel):
     status: str
     currency: str
     created_at: datetime
+    supplements: List["ApplicantMarginSummaryItem"] = []
 
 
 class ApplicantMarginSummaryResponse(BaseModel):
@@ -1239,6 +1240,9 @@ class ApplicantMarginSummaryResponse(BaseModel):
     total_penalized_amount: float
     currency: str
     records: List[ApplicantMarginSummaryItem]
+
+
+ApplicantMarginSummaryItem.model_rebuild()
 
 
 class MarginStatsByRatingItem(BaseModel):

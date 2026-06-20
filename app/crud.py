@@ -6748,14 +6748,14 @@ def get_margin_records_by_applicant(
     if status_filter:
         query = query.filter(models.MarginRecord.status == status_filter)
 
-    records = query.order_by(models.MarginRecord.created_at.desc()).all()
+    all_records = query.order_by(models.MarginRecord.created_at.desc()).all()
 
     total_paid = 0.0
     total_held = 0.0
     total_penalized = 0.0
     record_currency = None
 
-    for r in records:
+    for r in all_records:
         if record_currency is None:
             record_currency = r.currency
         if r.status not in [models.MARGIN_STATUS_RELEASED]:
@@ -6763,14 +6763,47 @@ def get_margin_records_by_applicant(
         total_paid += r.actual_paid_amount
         total_penalized += r.penalized_amount
 
+    initial_records = [r for r in all_records if r.record_type == models.MARGIN_RECORD_TYPE_INITIAL]
+    supplement_records = [r for r in all_records if r.record_type == models.MARGIN_RECORD_TYPE_SUPPLEMENT]
+
+    supplement_map = {}
+    for sup in supplement_records:
+        parent_id = sup.related_margin_id
+        if parent_id not in supplement_map:
+            supplement_map[parent_id] = []
+        supplement_map[parent_id].append(sup)
+
+    def _to_item(record: models.MarginRecord) -> Dict[str, Any]:
+        return {
+            "margin_number": record.margin_number,
+            "lc_number": record.lc_number,
+            "record_type": record.record_type,
+            "credit_rating": record.credit_rating,
+            "margin_ratio": record.margin_ratio,
+            "required_amount": record.required_amount,
+            "actual_paid_amount": record.actual_paid_amount,
+            "status": record.status,
+            "currency": record.currency,
+            "created_at": record.created_at,
+            "supplements": [],
+        }
+
+    result_records = []
+    for init_rec in initial_records:
+        item = _to_item(init_rec)
+        if init_rec.id in supplement_map:
+            for sup_rec in supplement_map[init_rec.id]:
+                item["supplements"].append(_to_item(sup_rec))
+        result_records.append(item)
+
     return {
         "applicant_name": applicant_name,
-        "total_records": len(records),
+        "total_records": len(all_records),
         "total_held_amount": round(total_held, 2),
         "total_paid_amount": round(total_paid, 2),
         "total_penalized_amount": round(total_penalized, 2),
         "currency": record_currency or "",
-        "records": records,
+        "records": result_records,
     }
 
 
