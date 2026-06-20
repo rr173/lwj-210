@@ -7178,15 +7178,22 @@ def applicant_partial_waiver(db: Session, disposition_number: str, waiver_item_i
     for item_id in waiver_item_ids:
         if item_id not in item_map:
             raise ValueError(f"豁免项 {item_id} 不属于处置单 {disposition_number}")
-        item_map[item_id].waiver_status = models.WAIVER_STATUS_WAIVED
-        item_map[item_id].waived_at = datetime.utcnow()
-        item_map[item_id].waived_by = waived_by
+        item = item_map[item_id]
+        if item.waiver_status == models.WAIVER_STATUS_WAIVED:
+            continue
+        item.waiver_status = models.WAIVER_STATUS_WAIVED
+        item.waived_at = datetime.utcnow()
+        item.waived_by = waived_by
 
-    for item in disposition.waiver_items:
-        if item.waiver_status == models.WAIVER_STATUS_PENDING:
-            item.waiver_status = models.WAIVER_STATUS_NOT_WAIVED
+    all_waived = all(
+        item.waiver_status == models.WAIVER_STATUS_WAIVED
+        for item in disposition.waiver_items
+    )
+    if all_waived:
+        disposition.status = models.REFUSAL_STATUS_ACCEPT_ALL
+    else:
+        disposition.status = models.REFUSAL_STATUS_PARTIAL_WAIVER
 
-    disposition.status = models.REFUSAL_STATUS_PARTIAL_WAIVER
     disposition.applicant_action_at = datetime.utcnow()
 
     db.flush()
