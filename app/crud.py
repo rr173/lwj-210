@@ -493,6 +493,9 @@ def submit_documents_and_audit(db: Session, submission: schemas.SubmissionSubmit
     db.commit()
     db.refresh(audit_record)
 
+    if audit_record.conclusion == "discrepant":
+        auto_create_refusal_disposition(db, audit_record, lc)
+
     return {
         "audit_record": audit_record,
         "compliance_alerts": compliance_result["compliance_alerts"],
@@ -683,6 +686,9 @@ def resubmit_documents_and_audit(db: Session, original_submission_id: str, resub
 
     db.commit()
     db.refresh(audit_record)
+
+    if audit_record.conclusion == "discrepant":
+        auto_create_refusal_disposition(db, audit_record, lc)
 
     return {
         "audit_record": audit_record,
@@ -2561,7 +2567,8 @@ def check_lc_frozen_for_submission(db: Session, lc_id: int) -> Optional[str]:
     for freeze in active_freezes:
         if freeze.freeze_type in [
             models.FREEZE_TYPE_EXPIRY_EXPIRED,
-            models.FREEZE_TYPE_SHIPMENT_EXPIRED
+            models.FREEZE_TYPE_SHIPMENT_EXPIRED,
+            models.FREEZE_TYPE_REFUSAL_OVERDUE,
         ]:
             return freeze.reason
 
@@ -3673,6 +3680,10 @@ def create_payment_application(db: Session, submission_id: str) -> models.Paymen
     lc = get_letter_of_credit_by_id(db, audit_record.lc_id)
     if not lc:
         raise ValueError(f"信用证不存在")
+
+    disposition_block = check_disposition_blocks_payment(db, lc.id)
+    if disposition_block:
+        raise ValueError(disposition_block)
 
     existing_payment = db.query(models.Payment).filter(
         models.Payment.submission_id == submission_id,
@@ -6979,6 +6990,428 @@ def migrate_margin_tables(db: Session) -> int:
                 db.commit()
             except Exception:
                 db.rollback()
+
+        db.commit()
+    except Exception as e:
+        db.rollback()
+    return created
+
+
+def generate_disposition_number(db: Session, lc_number: str) -> str:
+    from sqlalchemy import func
+    date_str = datetime.utcnow().strftime("%Y%m%d")
+    prefix = f"REF-{lc_number}-{date_str}-"
+    count = db.query(func.count(models.RefusalDisposition.id)).filter(
+        models.RefusalDisposition.disposition_number.like(f"{prefix}%")
+    ).scalar() or 0
+    return f"{prefix}{count + 1:04d}"
+
+
+def check_existing_disposition(db: Session, audit_record_id: int) -> Optional[models.RefusalDisposition]:
+    return db.query(models.RefusalDisposition).filter(
+        models.RefusalDisposition.audit_record_id == audit_record_id,
+    ).order_by(models.RefusalDisposition.created_at.desc()).first()
+
+
+def check_active_disposition_for_submission(db: Session, submission_id: str) -> Optional[models.RefusalDisposition]:
+    return db.query(models.RefusalDisposition).filter(
+        models.RefusalDisposition.submission_id == submission_id,
+        models.RefusalDisposition.status.notin_(models.REFUSAL_FINAL_STATUSES),
+    ).first()
+
+
+def auto_create_refusal_disposition(db: Session, audit_record: models.AuditRecord, lc: models.LetterOfCredit) -> Optional[models.RefusalDisposition]:
+    existing = check_existing_disposition(db, audit_record.id)
+    if existing:
+        return existing
+
+    if audit_record.conclusion != "discrepant":
+        return None
+
+    discrepancies = audit_record.discrepancies
+    if not discrepancies:
+        return None
+
+    snapshot = []
+    for d in discrepancies:
+        if d.is_removed:
+            continue
+        snapshot.append({
+            "discrepancy_id": d.id,
+            "discrepancy_type": d.discrepancy_type,
+            "severity": d.severity,
+            "document_type": d.document_type,
+            "description": d.description,
+            "lc_clause_reference": d.lc_clause_reference,
+            "is_critical": d.severity == "critical",
+        })
+
+    if not snapshot:
+        return None
+
+    disposition_number = generate_disposition_number(db, lc.lc_number)
+    notice_deadline = datetime.utcnow() + timedelta(days=models.REFUSAL_TIMEOUT_DAYS)
+
+    disposition = models.RefusalDisposition(
+        disposition_number=disposition_number,
+        lc_id=lc.id,
+        lc_number=lc.lc_number,
+        submission_id=audit_record.submission_id,
+        audit_record_id=audit_record.id,
+        applicant_name=lc.applicant_name,
+        status=models.REFUSAL_STATUS_PENDING_APPLICANT,
+        discrepancy_snapshot=snapshot,
+        notice_deadline=notice_deadline,
+    )
+    db.add(disposition)
+    db.flush()
+
+    for disc_data in snapshot:
+        waiver_item = models.DiscrepancyWaiverItem(
+            disposition_id=disposition.id,
+            discrepancy_id=disc_data["discrepancy_id"],
+            discrepancy_type=disc_data["discrepancy_type"],
+            severity=disc_data["severity"],
+            description=disc_data["description"],
+            is_critical=disc_data["is_critical"],
+            waiver_status=models.WAIVER_STATUS_PENDING,
+        )
+        db.add(waiver_item)
+
+    db.flush()
+    dispatch_notifications(db, lc, models.EVENT_TYPE_REFUSAL_CREATED, event_ref_id=disposition_number)
+
+    db.commit()
+    db.refresh(disposition)
+    return disposition
+
+
+def get_disposition_by_number(db: Session, disposition_number: str) -> Optional[models.RefusalDisposition]:
+    return db.query(models.RefusalDisposition).filter(
+        models.RefusalDisposition.disposition_number == disposition_number
+    ).first()
+
+
+def get_dispositions_by_lc(db: Session, lc_number: str) -> List[models.RefusalDisposition]:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        return []
+    return db.query(models.RefusalDisposition).filter(
+        models.RefusalDisposition.lc_id == lc.id
+    ).order_by(models.RefusalDisposition.created_at.desc()).all()
+
+
+def get_disposition_detail(db: Session, disposition_number: str) -> Optional[Dict[str, Any]]:
+    disposition = get_disposition_by_number(db, disposition_number)
+    if not disposition:
+        return None
+    check_and_process_overdue_dispositions(db)
+    db.refresh(disposition)
+    return disposition
+
+
+def _validate_status_transition(current_status: str, target_status: str) -> None:
+    allowed = models.REFUSAL_STATUS_TRANSITIONS.get(current_status, [])
+    if target_status not in allowed:
+        raise ValueError(
+            f"状态不可从 '{current_status}' 转为 '{target_status}'，"
+            f"允许的目标状态: {', '.join(allowed) if allowed else '无(终态不可变更)'}"
+        )
+
+
+def applicant_accept_all(db: Session, disposition_number: str, accepted_by: Optional[str] = None) -> models.RefusalDisposition:
+    disposition = get_disposition_by_number(db, disposition_number)
+    if not disposition:
+        raise ValueError(f"处置单 {disposition_number} 不存在")
+
+    _validate_status_transition(disposition.status, models.REFUSAL_STATUS_ACCEPT_ALL)
+
+    for item in disposition.waiver_items:
+        item.waiver_status = models.WAIVER_STATUS_WAIVED
+        item.waived_at = datetime.utcnow()
+        item.waived_by = accepted_by
+
+    disposition.status = models.REFUSAL_STATUS_ACCEPT_ALL
+    disposition.applicant_action_at = datetime.utcnow()
+
+    db.flush()
+    lc = get_letter_of_credit_by_id(db, disposition.lc_id)
+    if lc:
+        dispatch_notifications(db, lc, models.EVENT_TYPE_REFUSAL_APPLICANT_ACTION, event_ref_id=disposition_number)
+
+    db.commit()
+    db.refresh(disposition)
+    return disposition
+
+
+def applicant_reject_all(db: Session, disposition_number: str, rejected_by: Optional[str] = None) -> models.RefusalDisposition:
+    disposition = get_disposition_by_number(db, disposition_number)
+    if not disposition:
+        raise ValueError(f"处置单 {disposition_number} 不存在")
+
+    _validate_status_transition(disposition.status, models.REFUSAL_STATUS_REJECT_ALL)
+
+    for item in disposition.waiver_items:
+        item.waiver_status = models.WAIVER_STATUS_NOT_WAIVED
+
+    disposition.status = models.REFUSAL_STATUS_REJECT_ALL
+    disposition.applicant_action_at = datetime.utcnow()
+
+    db.flush()
+    lc = get_letter_of_credit_by_id(db, disposition.lc_id)
+    if lc:
+        dispatch_notifications(db, lc, models.EVENT_TYPE_REFUSAL_APPLICANT_ACTION, event_ref_id=disposition_number)
+
+    db.commit()
+    db.refresh(disposition)
+    return disposition
+
+
+def applicant_partial_waiver(db: Session, disposition_number: str, waiver_item_ids: List[int], waived_by: Optional[str] = None) -> models.RefusalDisposition:
+    disposition = get_disposition_by_number(db, disposition_number)
+    if not disposition:
+        raise ValueError(f"处置单 {disposition_number} 不存在")
+
+    _validate_status_transition(disposition.status, models.REFUSAL_STATUS_PARTIAL_WAIVER)
+
+    item_map = {item.id: item for item in disposition.waiver_items}
+    for item_id in waiver_item_ids:
+        if item_id not in item_map:
+            raise ValueError(f"豁免项 {item_id} 不属于处置单 {disposition_number}")
+        item_map[item_id].waiver_status = models.WAIVER_STATUS_WAIVED
+        item_map[item_id].waived_at = datetime.utcnow()
+        item_map[item_id].waived_by = waived_by
+
+    for item in disposition.waiver_items:
+        if item.waiver_status == models.WAIVER_STATUS_PENDING:
+            item.waiver_status = models.WAIVER_STATUS_NOT_WAIVED
+
+    disposition.status = models.REFUSAL_STATUS_PARTIAL_WAIVER
+    disposition.applicant_action_at = datetime.utcnow()
+
+    db.flush()
+    lc = get_letter_of_credit_by_id(db, disposition.lc_id)
+    if lc:
+        dispatch_notifications(db, lc, models.EVENT_TYPE_REFUSAL_APPLICANT_ACTION, event_ref_id=disposition_number)
+
+    db.commit()
+    db.refresh(disposition)
+    return disposition
+
+
+def check_disposition_blocks_payment(db: Session, lc_id: int) -> Optional[str]:
+    active_overdue = db.query(models.RefusalDisposition).filter(
+        models.RefusalDisposition.lc_id == lc_id,
+        models.RefusalDisposition.status == models.REFUSAL_STATUS_OVERDUE_NOTICE,
+    ).first()
+    if active_overdue:
+        return f"拒付处置超时冻结中，处置单: {active_overdue.disposition_number}，付款动作被冻结"
+    return None
+
+
+def bank_register_final_result(db: Session, disposition_number: str, final_result: str, confirmed_by: Optional[str] = None) -> models.RefusalDisposition:
+    disposition = get_disposition_by_number(db, disposition_number)
+    if not disposition:
+        raise ValueError(f"处置单 {disposition_number} 不存在")
+
+    if final_result not in models.REFUSAL_FINAL_STATUSES:
+        raise ValueError(f"无效的最终处置结果: {final_result}，允许值: {', '.join(models.REFUSAL_FINAL_STATUSES)}")
+
+    _validate_status_transition(disposition.status, final_result)
+
+    previous_status = disposition.status
+    disposition.status = final_result
+    disposition.bank_final_result_at = datetime.utcnow()
+
+    if final_result == models.REFUSAL_STATUS_WAIVED_ACCEPT:
+        if previous_status == models.REFUSAL_STATUS_OVERDUE_NOTICE:
+            for item in disposition.waiver_items:
+                if item.waiver_status != models.WAIVER_STATUS_WAIVED:
+                    item.waiver_status = models.WAIVER_STATUS_WAIVED
+                    item.waived_at = datetime.utcnow()
+                    item.waived_by = confirmed_by or "bank_auto"
+
+        has_unwaived_critical = any(
+            item.is_critical and item.waiver_status != models.WAIVER_STATUS_WAIVED
+            for item in disposition.waiver_items
+        )
+        if has_unwaived_critical:
+            raise ValueError("仍有关键不符点未被豁免，不能登记为 waived_accept")
+
+        overdue_freeze = db.query(models.LCFreezeRecord).filter(
+            models.LCFreezeRecord.lc_id == disposition.lc_id,
+            models.LCFreezeRecord.freeze_type == models.FREEZE_TYPE_REFUSAL_OVERDUE,
+            models.LCFreezeRecord.status == models.FREEZE_STATUS_ACTIVE,
+        ).first()
+        if overdue_freeze:
+            overdue_freeze.status = models.FREEZE_STATUS_RELEASED
+            overdue_freeze.released_at = datetime.utcnow()
+            overdue_freeze.released_by = confirmed_by or "system"
+            overdue_freeze.release_reason = f"拒付处置最终结果为豁免接受({disposition_number})，自动解除冻结"
+            dispatch_notifications(
+                db,
+                get_letter_of_credit_by_id(db, disposition.lc_id),
+                models.EVENT_TYPE_FREEZE_RELEASED,
+                event_ref_id=overdue_freeze.freeze_number,
+            )
+
+    elif final_result in [models.REFUSAL_STATUS_REFUSAL, models.REFUSAL_STATUS_RETURN_DOCUMENTS]:
+        overdue_freeze = db.query(models.LCFreezeRecord).filter(
+            models.LCFreezeRecord.lc_id == disposition.lc_id,
+            models.LCFreezeRecord.freeze_type == models.FREEZE_TYPE_REFUSAL_OVERDUE,
+            models.LCFreezeRecord.status == models.FREEZE_STATUS_ACTIVE,
+        ).first()
+        if overdue_freeze:
+            overdue_freeze.status = models.FREEZE_STATUS_RELEASED
+            overdue_freeze.released_at = datetime.utcnow()
+            overdue_freeze.released_by = confirmed_by or "system"
+            overdue_freeze.release_reason = f"拒付处置最终结果为{final_result}({disposition_number})，解除超时冻结"
+            dispatch_notifications(
+                db,
+                get_letter_of_credit_by_id(db, disposition.lc_id),
+                models.EVENT_TYPE_FREEZE_RELEASED,
+                event_ref_id=overdue_freeze.freeze_number,
+            )
+
+    db.flush()
+    lc = get_letter_of_credit_by_id(db, disposition.lc_id)
+    if lc:
+        dispatch_notifications(db, lc, models.EVENT_TYPE_REFUSAL_FINALIZED, event_ref_id=disposition_number)
+
+    db.commit()
+    db.refresh(disposition)
+    return disposition
+
+
+def check_and_process_overdue_dispositions(db: Session) -> Dict[str, Any]:
+    now = datetime.utcnow()
+    overdue_dispositions = db.query(models.RefusalDisposition).filter(
+        models.RefusalDisposition.status.notin_(models.REFUSAL_FINAL_STATUSES),
+        models.RefusalDisposition.notice_deadline < now,
+    ).all()
+
+    processed = 0
+    frozen = 0
+    for disposition in overdue_dispositions:
+        if disposition.status == models.REFUSAL_STATUS_OVERDUE_NOTICE:
+            continue
+
+        disposition.status = models.REFUSAL_STATUS_OVERDUE_NOTICE
+        processed += 1
+
+        lc = get_letter_of_credit_by_id(db, disposition.lc_id)
+        if not lc:
+            continue
+
+        if not has_active_freeze(db, lc.id, models.FREEZE_TYPE_REFUSAL_OVERDUE):
+            freeze_record = create_freeze_record(
+                db, lc,
+                models.FREEZE_TYPE_REFUSAL_OVERDUE,
+                f"拒付处置单 {disposition.disposition_number} 超过{models.REFUSAL_TIMEOUT_DAYS}自然日未完成处置，自动冻结付款"
+            )
+            disposition.freeze_record_id = freeze_record.id
+            frozen += 1
+            dispatch_notifications(db, lc, models.EVENT_TYPE_REFUSAL_OVERDUE, event_ref_id=disposition.disposition_number)
+
+    if processed > 0:
+        db.commit()
+
+    return {
+        "processed_count": processed,
+        "frozen_count": frozen,
+    }
+
+
+def get_refusal_history_by_lc(db: Session, lc_number: str) -> Dict[str, Any]:
+    lc = get_letter_of_credit_by_number(db, lc_number)
+    if not lc:
+        raise ValueError(f"信用证 {lc_number} 不存在")
+
+    check_and_process_overdue_dispositions(db)
+
+    dispositions = get_dispositions_by_lc(db, lc_number)
+    return {
+        "lc_number": lc_number,
+        "total_dispositions": len(dispositions),
+        "dispositions": dispositions,
+    }
+
+
+def get_applicant_waiver_stats(db: Session, applicant_name: str) -> Dict[str, Any]:
+    dispositions = db.query(models.RefusalDisposition).filter(
+        models.RefusalDisposition.applicant_name == applicant_name,
+    ).all()
+
+    total = len(dispositions)
+    accept_all_count = sum(1 for d in dispositions if d.status in [
+        models.REFUSAL_STATUS_ACCEPT_ALL, models.REFUSAL_STATUS_WAIVED_ACCEPT
+    ])
+    reject_all_count = sum(1 for d in dispositions if d.status in [
+        models.REFUSAL_STATUS_REJECT_ALL, models.REFUSAL_STATUS_REFUSAL,
+        models.REFUSAL_STATUS_RETURN_DOCUMENTS,
+    ])
+    partial_waiver_count = sum(1 for d in dispositions if d.status == models.REFUSAL_STATUS_PARTIAL_WAIVER)
+
+    if total > 0:
+        waiver_rate = (accept_all_count + partial_waiver_count) / total
+        rejection_rate = reject_all_count / total
+    else:
+        waiver_rate = 0.0
+        rejection_rate = 0.0
+
+    return {
+        "applicant_name": applicant_name,
+        "total_dispositions": total,
+        "accept_all_count": accept_all_count,
+        "reject_all_count": reject_all_count,
+        "partial_waiver_count": partial_waiver_count,
+        "waiver_rate": round(waiver_rate, 4),
+        "rejection_rate": round(rejection_rate, 4),
+    }
+
+
+def get_overdue_disposition_stats(db: Session, start_date: Optional[date] = None, end_date: Optional[date] = None) -> Dict[str, Any]:
+    query = db.query(models.RefusalDisposition).filter(
+        models.RefusalDisposition.status == models.REFUSAL_STATUS_OVERDUE_NOTICE,
+    )
+
+    if start_date:
+        start_dt = datetime.combine(start_date, datetime.min.time())
+        query = query.filter(models.RefusalDisposition.notice_deadline >= start_dt)
+    if end_date:
+        end_dt = datetime.combine(end_date, datetime.max.time())
+        query = query.filter(models.RefusalDisposition.notice_deadline <= end_dt)
+
+    overdue_records = query.all()
+
+    active_count = sum(1 for d in overdue_records if d.freeze_record_id is not None)
+    released_count = len(overdue_records) - active_count
+
+    return {
+        "total_overdue_count": len(overdue_records),
+        "active_overdue_count": active_count,
+        "released_overdue_count": released_count,
+    }
+
+
+def migrate_refusal_disposition_tables(db: Session) -> int:
+    from sqlalchemy import text
+    from sqlalchemy.exc import OperationalError
+
+    created = 0
+    try:
+        conn = db.connection()
+        try:
+            db.execute(text("SELECT 1 FROM refusal_dispositions LIMIT 1"))
+        except OperationalError:
+            models.RefusalDisposition.__table__.create(bind=conn)
+            created += 1
+
+        try:
+            db.execute(text("SELECT 1 FROM discrepancy_waiver_items LIMIT 1"))
+        except OperationalError:
+            models.DiscrepancyWaiverItem.__table__.create(bind=conn)
+            created += 1
 
         db.commit()
     except Exception as e:

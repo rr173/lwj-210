@@ -1836,3 +1836,102 @@ class ComplianceHitStatisticsResponse(BaseModel):
     end_date: date
     total_hit_count: int
     by_type: List[HitStatsByType]
+
+
+class RefusalStatus(str, Enum):
+    PENDING_APPLICANT = "pending_applicant_action"
+    ACCEPT_ALL = "accept_all"
+    REJECT_ALL = "reject_all"
+    PARTIAL_WAIVER = "partial_waiver"
+    OVERDUE_NOTICE = "overdue_notice"
+    REFUSAL = "refusal"
+    WAIVED_ACCEPT = "waived_accept"
+    RETURN_DOCUMENTS = "return_documents"
+
+
+class WaiverStatus(str, Enum):
+    PENDING = "pending"
+    WAIVED = "waived"
+    NOT_WAIVED = "not_waived"
+
+
+class DiscrepancyWaiverItemResponse(BaseModel):
+    id: int
+    disposition_id: int
+    discrepancy_id: int
+    discrepancy_type: str
+    severity: str
+    description: str
+    is_critical: bool
+    waiver_status: str
+    waived_at: Optional[datetime] = None
+    waived_by: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class RefusalDispositionResponse(BaseModel):
+    id: int
+    disposition_number: str
+    lc_id: int
+    lc_number: str
+    submission_id: str
+    audit_record_id: int
+    applicant_name: str
+    status: str
+    discrepancy_snapshot: List[Dict[str, Any]]
+    notice_deadline: datetime
+    applicant_action_at: Optional[datetime] = None
+    bank_final_result_at: Optional[datetime] = None
+    freeze_record_id: Optional[int] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class RefusalDispositionDetailResponse(RefusalDispositionResponse):
+    waiver_items: List[DiscrepancyWaiverItemResponse] = []
+
+
+class ApplicantAcceptAllRequest(BaseModel):
+    accepted_by: Optional[str] = None
+
+
+class ApplicantRejectAllRequest(BaseModel):
+    rejected_by: Optional[str] = None
+
+
+class ApplicantPartialWaiverRequest(BaseModel):
+    waiver_item_ids: List[int]
+    waived_by: Optional[str] = None
+
+
+class BankFinalResultRequest(BaseModel):
+    final_result: str
+    confirmed_by: Optional[str] = None
+
+
+class RefusalOverdueStatsResponse(BaseModel):
+    total_overdue_count: int
+    active_overdue_count: int
+    released_overdue_count: int
+
+
+class ApplicantWaiverStatsResponse(BaseModel):
+    applicant_name: str
+    total_dispositions: int
+    accept_all_count: int
+    reject_all_count: int
+    partial_waiver_count: int
+    waiver_rate: float
+    rejection_rate: float
+
+
+class LcRefusalHistoryResponse(BaseModel):
+    lc_number: str
+    total_dispositions: int
+    dispositions: List[RefusalDispositionDetailResponse]

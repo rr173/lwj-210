@@ -510,11 +510,13 @@ FREEZE_TYPE_SHIPMENT_EXPIRED = "shipment_expired"
 FREEZE_TYPE_PRESENTATION_EXPIRED = "presentation_expired"
 FREEZE_TYPE_EXPIRY_EXPIRED = "expiry_expired"
 FREEZE_TYPE_MANUAL = "manual"
+FREEZE_TYPE_REFUSAL_OVERDUE = "refusal_overdue"
 VALID_FREEZE_TYPES = [
     FREEZE_TYPE_SHIPMENT_EXPIRED,
     FREEZE_TYPE_PRESENTATION_EXPIRED,
     FREEZE_TYPE_EXPIRY_EXPIRED,
-    FREEZE_TYPE_MANUAL
+    FREEZE_TYPE_MANUAL,
+    FREEZE_TYPE_REFUSAL_OVERDUE,
 ]
 
 FREEZE_STATUS_ACTIVE = "active"
@@ -587,6 +589,10 @@ EVENT_TYPE_FREEZE_CREATED = "freeze_created"
 EVENT_TYPE_FREEZE_RELEASED = "freeze_released"
 EVENT_TYPE_TRANSFER_CREATED = "transfer_created"
 EVENT_TYPE_BACK_TO_BACK_CREATED = "back_to_back_created"
+EVENT_TYPE_REFUSAL_CREATED = "refusal_created"
+EVENT_TYPE_REFUSAL_APPLICANT_ACTION = "refusal_applicant_action"
+EVENT_TYPE_REFUSAL_FINALIZED = "refusal_finalized"
+EVENT_TYPE_REFUSAL_OVERDUE = "refusal_overdue"
 VALID_EVENT_TYPES = [
     EVENT_TYPE_LC_CREATED,
     EVENT_TYPE_SUBMISSION_CREATED,
@@ -599,6 +605,10 @@ VALID_EVENT_TYPES = [
     EVENT_TYPE_FREEZE_RELEASED,
     EVENT_TYPE_TRANSFER_CREATED,
     EVENT_TYPE_BACK_TO_BACK_CREATED,
+    EVENT_TYPE_REFUSAL_CREATED,
+    EVENT_TYPE_REFUSAL_APPLICANT_ACTION,
+    EVENT_TYPE_REFUSAL_FINALIZED,
+    EVENT_TYPE_REFUSAL_OVERDUE,
 ]
 
 DEFAULT_SUBSCRIPTIONS = {
@@ -633,6 +643,9 @@ DEFAULT_SUBSCRIPTIONS = {
         EVENT_TYPE_AMENDMENT_CREATED,
         EVENT_TYPE_AMENDMENT_ACCEPTED,
         EVENT_TYPE_ALERT_GENERATED,
+        EVENT_TYPE_REFUSAL_CREATED,
+        EVENT_TYPE_REFUSAL_FINALIZED,
+        EVENT_TYPE_REFUSAL_OVERDUE,
     ],
 }
 
@@ -1102,6 +1115,110 @@ class ComplianceEvent(Base):
     handled_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+REFUSAL_STATUS_PENDING_APPLICANT = "pending_applicant_action"
+REFUSAL_STATUS_ACCEPT_ALL = "accept_all"
+REFUSAL_STATUS_REJECT_ALL = "reject_all"
+REFUSAL_STATUS_PARTIAL_WAIVER = "partial_waiver"
+REFUSAL_STATUS_OVERDUE_NOTICE = "overdue_notice"
+REFUSAL_STATUS_REFUSAL = "refusal"
+REFUSAL_STATUS_WAIVED_ACCEPT = "waived_accept"
+REFUSAL_STATUS_RETURN_DOCUMENTS = "return_documents"
+
+VALID_REFUSAL_STATUSES = [
+    REFUSAL_STATUS_PENDING_APPLICANT,
+    REFUSAL_STATUS_ACCEPT_ALL,
+    REFUSAL_STATUS_REJECT_ALL,
+    REFUSAL_STATUS_PARTIAL_WAIVER,
+    REFUSAL_STATUS_OVERDUE_NOTICE,
+    REFUSAL_STATUS_REFUSAL,
+    REFUSAL_STATUS_WAIVED_ACCEPT,
+    REFUSAL_STATUS_RETURN_DOCUMENTS,
+]
+
+REFUSAL_FINAL_STATUSES = [
+    REFUSAL_STATUS_REFUSAL,
+    REFUSAL_STATUS_WAIVED_ACCEPT,
+    REFUSAL_STATUS_RETURN_DOCUMENTS,
+]
+
+REFUSAL_STATUS_TRANSITIONS = {
+    REFUSAL_STATUS_PENDING_APPLICANT: [
+        REFUSAL_STATUS_ACCEPT_ALL,
+        REFUSAL_STATUS_REJECT_ALL,
+        REFUSAL_STATUS_PARTIAL_WAIVER,
+        REFUSAL_STATUS_OVERDUE_NOTICE,
+    ],
+    REFUSAL_STATUS_ACCEPT_ALL: [REFUSAL_STATUS_WAIVED_ACCEPT],
+    REFUSAL_STATUS_REJECT_ALL: [REFUSAL_STATUS_REFUSAL, REFUSAL_STATUS_RETURN_DOCUMENTS],
+    REFUSAL_STATUS_PARTIAL_WAIVER: [
+        REFUSAL_STATUS_WAIVED_ACCEPT,
+        REFUSAL_STATUS_REFUSAL,
+        REFUSAL_STATUS_RETURN_DOCUMENTS,
+        REFUSAL_STATUS_OVERDUE_NOTICE,
+    ],
+    REFUSAL_STATUS_OVERDUE_NOTICE: [REFUSAL_STATUS_WAIVED_ACCEPT, REFUSAL_STATUS_REFUSAL],
+}
+
+REFUSAL_TIMEOUT_DAYS = 5
+
+WAIVER_STATUS_PENDING = "pending"
+WAIVER_STATUS_WAIVED = "waived"
+WAIVER_STATUS_NOT_WAIVED = "not_waived"
+VALID_WAIVER_STATUSES = [WAIVER_STATUS_PENDING, WAIVER_STATUS_WAIVED, WAIVER_STATUS_NOT_WAIVED]
+
+FREEZE_TYPE_REFUSAL_OVERDUE = "refusal_overdue"
+
+
+class RefusalDisposition(Base):
+    __tablename__ = "refusal_dispositions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    disposition_number = Column(String(150), unique=True, index=True, nullable=False)
+    lc_id = Column(Integer, ForeignKey("letter_of_credits.id"), nullable=False)
+    lc_number = Column(String(100), index=True, nullable=False)
+    submission_id = Column(String(100), index=True, nullable=False)
+    audit_record_id = Column(Integer, ForeignKey("audit_records.id"), nullable=False)
+    applicant_name = Column(String(255), index=True, nullable=False)
+    status = Column(String(30), default=REFUSAL_STATUS_PENDING_APPLICANT, nullable=False)
+    discrepancy_snapshot = Column(JSON, nullable=False)
+    notice_deadline = Column(DateTime, nullable=False)
+    applicant_action_at = Column(DateTime, nullable=True)
+    bank_final_result_at = Column(DateTime, nullable=True)
+    freeze_record_id = Column(Integer, ForeignKey("lc_freeze_records.id"), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    lc = relationship("LetterOfCredit")
+    audit_record = relationship("AuditRecord")
+    freeze_record = relationship("LCFreezeRecord")
+    waiver_items = relationship("DiscrepancyWaiverItem", back_populates="disposition", cascade="all, delete-orphan")
+
+    def is_final(self) -> bool:
+        return self.status in REFUSAL_FINAL_STATUSES
+
+    def is_overdue(self) -> bool:
+        return datetime.utcnow() > self.notice_deadline and self.status not in REFUSAL_FINAL_STATUSES
+
+
+class DiscrepancyWaiverItem(Base):
+    __tablename__ = "discrepancy_waiver_items"
+
+    id = Column(Integer, primary_key=True, index=True)
+    disposition_id = Column(Integer, ForeignKey("refusal_dispositions.id"), nullable=False)
+    discrepancy_id = Column(Integer, ForeignKey("discrepancies.id"), nullable=False)
+    discrepancy_type = Column(String(50), nullable=False)
+    severity = Column(String(20), nullable=False)
+    description = Column(Text, nullable=False)
+    is_critical = Column(Boolean, nullable=False)
+    waiver_status = Column(String(20), default=WAIVER_STATUS_PENDING, nullable=False)
+    waived_at = Column(DateTime, nullable=True)
+    waived_by = Column(String(100), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    disposition = relationship("RefusalDisposition", back_populates="waiver_items")
+    discrepancy = relationship("Discrepancy")
 
 
 class MarginRecord(Base):

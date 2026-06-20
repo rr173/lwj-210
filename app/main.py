@@ -33,6 +33,7 @@ def create_app() -> FastAPI:
             crud.migrate_signature_tables(db)
             crud.migrate_compliance_tables(db)
             crud.migrate_margin_tables(db)
+            crud.migrate_refusal_disposition_tables(db)
         finally:
             db.close()
         seed_data()
@@ -1651,6 +1652,108 @@ def create_app() -> FastAPI:
             }
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"保证金可释放检查失败: {str(e)}")
+
+    @app.get("/api/refusal/{disposition_number}", response_model=schemas.RefusalDispositionDetailResponse, tags=["拒付通知与不符点豁免"])
+    async def get_refusal_disposition(disposition_number: str, db: Session = Depends(get_db)):
+        disposition = crud.get_disposition_detail(db, disposition_number)
+        if not disposition:
+            raise HTTPException(status_code=404, detail=f"处置单 {disposition_number} 不存在")
+        return disposition
+
+    @app.get("/api/refusal/lc/{lc_number}", response_model=schemas.LcRefusalHistoryResponse, tags=["拒付通知与不符点豁免"])
+    async def get_refusal_history_by_lc(lc_number: str, db: Session = Depends(get_db)):
+        try:
+            return crud.get_refusal_history_by_lc(db, lc_number)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询拒付处置历史失败: {str(e)}")
+
+    @app.post("/api/refusal/{disposition_number}/accept-all", response_model=schemas.RefusalDispositionDetailResponse, tags=["拒付通知与不符点豁免"])
+    async def applicant_accept_all_discrepancies(
+        disposition_number: str,
+        req: schemas.ApplicantAcceptAllRequest,
+        db: Session = Depends(get_db),
+    ):
+        try:
+            return crud.applicant_accept_all(db, disposition_number, req.accepted_by)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"接受全部不符点失败: {str(e)}")
+
+    @app.post("/api/refusal/{disposition_number}/reject-all", response_model=schemas.RefusalDispositionDetailResponse, tags=["拒付通知与不符点豁免"])
+    async def applicant_reject_all_discrepancies(
+        disposition_number: str,
+        req: schemas.ApplicantRejectAllRequest,
+        db: Session = Depends(get_db),
+    ):
+        try:
+            return crud.applicant_reject_all(db, disposition_number, req.rejected_by)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"拒绝全部不符点失败: {str(e)}")
+
+    @app.post("/api/refusal/{disposition_number}/partial-waiver", response_model=schemas.RefusalDispositionDetailResponse, tags=["拒付通知与不符点豁免"])
+    async def applicant_partial_waiver_discrepancies(
+        disposition_number: str,
+        req: schemas.ApplicantPartialWaiverRequest,
+        db: Session = Depends(get_db),
+    ):
+        try:
+            return crud.applicant_partial_waiver(db, disposition_number, req.waiver_item_ids, req.waived_by)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"部分豁免不符点失败: {str(e)}")
+
+    @app.post("/api/refusal/{disposition_number}/bank-finalize", response_model=schemas.RefusalDispositionDetailResponse, tags=["拒付通知与不符点豁免"])
+    async def bank_finalize_disposition(
+        disposition_number: str,
+        req: schemas.BankFinalResultRequest,
+        db: Session = Depends(get_db),
+    ):
+        try:
+            return crud.bank_register_final_result(db, disposition_number, req.final_result, req.confirmed_by)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"登记最终处置结果失败: {str(e)}")
+
+    @app.post("/api/refusal/overdue-check", tags=["拒付通知与不符点豁免"])
+    async def check_overdue_dispositions(db: Session = Depends(get_db)):
+        try:
+            result = crud.check_and_process_overdue_dispositions(db)
+            return {
+                "processed_count": result["processed_count"],
+                "frozen_count": result["frozen_count"],
+                "message": f"已处理 {result['processed_count']} 笔超时处置，新增 {result['frozen_count']} 个冻结",
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"超时处置检查失败: {str(e)}")
+
+    @app.get("/api/refusal/stats/applicant/{applicant_name}", response_model=schemas.ApplicantWaiverStatsResponse, tags=["拒付通知与不符点豁免"])
+    async def get_applicant_waiver_stats(applicant_name: str, db: Session = Depends(get_db)):
+        try:
+            return crud.get_applicant_waiver_stats(db, applicant_name)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询申请人豁免统计失败: {str(e)}")
+
+    @app.get("/api/refusal/stats/overdue", response_model=schemas.RefusalOverdueStatsResponse, tags=["拒付通知与不符点豁免"])
+    async def get_overdue_disposition_stats(
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        db: Session = Depends(get_db),
+    ):
+        try:
+            if start_date and end_date and start_date > end_date:
+                raise HTTPException(status_code=400, detail="开始日期不能大于结束日期")
+            return crud.get_overdue_disposition_stats(db, start_date, end_date)
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"查询超时处置统计失败: {str(e)}")
 
     return app
 
